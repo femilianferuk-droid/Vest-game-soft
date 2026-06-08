@@ -32,7 +32,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
 
-ADMIN_IDS = [123456789]  # ID администраторов
+ADMIN_IDS = [7973988177]  # ID администраторов
 
 # --- Инициализация бота и диспетчера ---
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
