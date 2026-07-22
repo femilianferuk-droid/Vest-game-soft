@@ -66,13 +66,13 @@ MSK_TZ = pytz.timezone('Europe/Moscow')
 # --- LLM (AI-генератор текста) ---
 LLM_API_URL = (
     os.getenv('LLM_API_URL')
-    or 'https://51-20-184-130.sslip.io:8443'
+    or 'https://forge-gateway-api.fly.dev/v1'
 )
 LLM_API_KEY = (
     os.getenv('LLM_API_KEY')
-    or 'sk-myapi_7gatQ26pXc_mI5H8FUyS0jZfzHx_NRl6jERiI-K8NisaucvlKlo3zA'
+    or 'fg-16e9f179b8404567a3f119ac6875865d'
 )
-LLM_MODEL = os.getenv('LLM_MODEL') or 'claude-sonnet-5'
+LLM_MODEL = os.getenv('LLM_MODEL') or 'deepseek-v4-flash'
 LLM_TIMEOUT = int(os.getenv('LLM_TIMEOUT') or '60')
 LLM_MAX_TOKENS = int(os.getenv('LLM_MAX_TOKENS') or '2048')
 
