@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import re
+import tempfile
 import time
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
@@ -22,8 +23,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, 
-    InlineKeyboardButton, FSInputFile
+    Message, CallbackQuery, InlineKeyboardMarkup,
+    InlineKeyboardButton, FSInputFile, BufferedInputFile
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from telethon import TelegramClient, events
@@ -35,8 +36,12 @@ from telethon.tl.functions.messages import (
     ImportChatInviteRequest, DeleteHistoryRequest, SendReactionRequest
 )
 from telethon.tl.functions.account import (
-    UpdateStatusRequest, GetPrivacyRequest
+    UpdateStatusRequest, GetPrivacyRequest, UpdateProfileRequest
 )
+from telethon.tl.functions.photos import (
+    DeletePhotosRequest, GetUserPhotosRequest, UploadProfilePhotoRequest
+)
+from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.functions.messages import (
     ReadHistoryRequest, ReadReactionsRequest, GetDialogsRequest,
     GetHistoryRequest, GetMessagesViewsRequest,
@@ -291,6 +296,15 @@ class LLMStates(StatesGroup):
     choosing_model = State()      # выбор модели перед вводом промта
     waiting_for_prompt = State()  # ждём текст задачи
     choosing_variant = State()    # показаны 3 варианта, ждём выбор/реген
+
+
+class ProfileEditStates(StatesGroup):
+    editing = State()
+    waiting_for_first_name = State()
+    waiting_for_last_name = State()
+    waiting_for_about = State()
+    waiting_for_avatar = State()
+    waiting_for_ai_prompt = State()
 
 # ============================================================
 #  Per-account AI-автоответчик (живёт на аккаунте, а не в боте)
@@ -1161,7 +1175,7 @@ def _format_warming_plan_message(plan: dict, narrative: str) -> str:
         f"Волн: <b>~{total}</b> · "
         f"Паузы: <b>{imin}–{imax} мин</b>\n",
         f"{emoji('CHART')} <b>Распределение действий:</b>\n"
-        f" • Чтение диалогов — <b>{pct(d.get('read_dialogs', 0))}%</b>\n"
+        f" • Чтение ��иалогов — <b>{pct(d.get('read_dialogs', 0))}%</b>\n"
         f" • Сторис — <b>{pct(d.get('view_stories', 0))}%</b>\n"
         f" • Реакции — <b>{pct(d.get('react', 0))}%</b>\n"
         f" • Заметки в Избранном — <b>{pct(d.get('saved_note', 0))}%</b>\n"
@@ -2040,7 +2054,7 @@ WARMING_PLAN_SYSTEM_PROMPT = """Ты — эксперт по безопасно�
 Твоя задача — составить ДЕТАЛЬНЫЙ ПЛАН прогрева на заданное окно часов (по умолчанию 12). Цель — сделать аккаунт «живым» в глазах Telegram, избегая FloodWait.
 
 Что НЕЛЬЗЯ планировать:
-  • массовые рассылки, инвайты, спам
+  • массовы�� рассылки, инвайты, спам
   • резкие пики активности (все волны — плавные)
   • сообщения в чужие чаты (только self-PM, реакции, чтение, просмотр сторис)
 
@@ -3158,7 +3172,7 @@ def _build_weighted_pool(distribution: Dict[str, float]) -> List[str]:
         pool.extend([kind] * n)
         total += n
     if not pool:
-        # фолбек — равные веса для безопасных действий
+        # фолбек — равные веса д��я безопасных действий
         return ['read_dialogs', 'view_stories', 'react']
     return pool
 
@@ -3492,7 +3506,7 @@ async def warming_worker(account_id: int, user_id: int) -> None:
             if not account or not account.get('warming_enabled'):
                 return
 
-            # Проверка окончания плана (если был запущен с duration)
+            # ��роверка окончания плана (если был запущен с duration)
             if (
                 plan is not None
                 and plan_start_ts is not None
@@ -5460,6 +5474,12 @@ def get_account_actions_keyboard(
         callback_data=f"acct_ar:home:{account_id}",
         style='primary',
         icon_custom_emoji_id=get_icon("AI")
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Изменить профиль",
+        callback_data=f"edit_profile_{account_id}",
+        style='primary',
+        icon_custom_emoji_id=get_icon("PROFILE")
     ))
     builder.row(InlineKeyboardButton(
         text="Анализ риска бана",
@@ -7823,6 +7843,678 @@ async def analyze_risk_handler(callback: CallbackQuery):
         await callback.message.answer(extra)
 
 
+# ============================================================
+#  Редактирование профиля Telegram-аккаунта
+# ============================================================
+# Профиль (аватар, имя, фамилия, описание) хранится в самом
+# Telegram, а не в нашей БД. Поэтому:
+#   - при открытии редактора читаем актуальные данные из Telegram;
+#   - все правки складываем в черновик внутри FSM;
+#   - применяем к аккаунту только по кнопке «Сохранить».
+# Текстовые поля можно сгенерировать через DeepSeek (модель
+# deepseek-v4-flash), аватар генерацией не затрагивается.
+
+PROFILE_FIRST_NAME_LIMIT = 64
+PROFILE_LAST_NAME_LIMIT = 64
+PROFILE_ABOUT_LIMIT = 70
+PROFILE_AI_MODEL = 'deepseek-v4-flash'
+
+
+def _profile_display(value: Optional[str], empty: str = "—") -> str:
+    value = (value or '').strip()
+    if not value:
+        return empty
+    return escape(value)
+
+
+def _profile_editor_keyboard(account_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="Имя",
+            callback_data=f"profedit_field_first:{account_id}",
+            style='default',
+            icon_custom_emoji_id=get_icon("WRITE"),
+        ),
+        InlineKeyboardButton(
+            text="Фамилия",
+            callback_data=f"profedit_field_last:{account_id}",
+            style='default',
+            icon_custom_emoji_id=get_icon("WRITE"),
+        ),
+    )
+    builder.row(InlineKeyboardButton(
+        text="Описание",
+        callback_data=f"profedit_field_about:{account_id}",
+        style='default',
+        icon_custom_emoji_id=get_icon("ADD_TEXT"),
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Аватарка",
+        callback_data=f"profedit_field_avatar:{account_id}",
+        style='default',
+        icon_custom_emoji_id=get_icon("MEDIA"),
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Сгенерировать через ИИ",
+        callback_data=f"profedit_ai:{account_id}",
+        style='primary',
+        icon_custom_emoji_id=get_icon("AI"),
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Сохранить",
+        callback_data=f"profedit_save:{account_id}",
+        style='success',
+        icon_custom_emoji_id=get_icon("CHECK"),
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Назад",
+        callback_data=f"profedit_cancel:{account_id}",
+        style='default',
+        icon_custom_emoji_id=get_icon("BACK"),
+    ))
+    return builder.as_markup()
+
+
+def _profile_editor_text(data: Dict[str, Any]) -> str:
+    avatar_note = (
+        "новая (будет заменена при сохранении)"
+        if data.get('draft_avatar') else "без изменений"
+    )
+    changed = []
+    if (data.get('draft_first_name') or '') != (data.get('orig_first_name') or ''):
+        changed.append("имя")
+    if (data.get('draft_last_name') or '') != (data.get('orig_last_name') or ''):
+        changed.append("фамилия")
+    if (data.get('draft_about') or '') != (data.get('orig_about') or ''):
+        changed.append("описание")
+    if data.get('draft_avatar'):
+        changed.append("аватар")
+    changed_line = (
+        f"\n{emoji('WRITE')} Не сохранено: <b>{', '.join(changed)}</b>"
+        if changed else ""
+    )
+    return (
+        f"{emoji('PROFILE')} <b>Изменение профиля</b>\n"
+        f"{emoji('PHONE')} <code>{escape(data.get('phone') or '—')}</code>\n\n"
+        f"{emoji('ID')} Имя: <b>{_profile_display(data.get('draft_first_name'))}</b>\n"
+        f"{emoji('ID')} Фамилия: <b>{_profile_display(data.get('draft_last_name'))}</b>\n"
+        f"{emoji('ADD_TEXT')} Описание: "
+        f"{_profile_display(data.get('draft_about'), 'пусто')}\n"
+        f"{emoji('MEDIA')} Аватарка: {avatar_note}"
+        f"{changed_line}\n\n"
+        f"{emoji('INFO')} Отредактируйте поля вручную или сгенерируйте "
+        f"текст через ИИ, затем нажмите «Сохранить»."
+    )
+
+
+async def _fetch_profile_from_telegram(
+    account_id: int,
+) -> Optional[Dict[str, Optional[str]]]:
+    """Читает актуальные имя/фамилию/описание из Telegram.
+
+    Возвращает None, если аккаунт не авторизован / не подключается.
+    """
+    client = await get_client_for_account(account_id)
+    if not client:
+        return None
+    me = await client.get_me()
+    about = ''
+    try:
+        full = await client(GetFullUserRequest(id='me'))
+        about = getattr(full.full_user, 'about', '') or ''
+    except Exception as ex:
+        logger.warning("GetFullUserRequest failed: %s", ex)
+    avatar = None
+    try:
+        avatar = await client.download_profile_photo('me', file=bytes)
+    except Exception as ex:
+        logger.warning("download_profile_photo failed: %s", ex)
+    return {
+        'first_name': getattr(me, 'first_name', '') or '',
+        'last_name': getattr(me, 'last_name', '') or '',
+        'about': about,
+        'avatar': avatar,
+    }
+
+
+async def _render_profile_editor(
+    target: Any, state: FSMContext, edit: bool = True
+) -> None:
+    data = await state.get_data()
+    account_id = data.get('profile_account_id')
+    text = _profile_editor_text(data)
+    markup = _profile_editor_keyboard(account_id)
+    await state.set_state(ProfileEditStates.editing)
+    if edit and isinstance(target, CallbackQuery):
+        try:
+            await target.message.edit_text(text, reply_markup=markup)
+            return
+        except Exception:
+            await target.message.answer(text, reply_markup=markup)
+            return
+    msg = target.message if isinstance(target, CallbackQuery) else target
+    await msg.answer(text, reply_markup=markup)
+
+
+@dp.callback_query(F.data.startswith("edit_profile_"))
+async def edit_profile_open(callback: CallbackQuery, state: FSMContext):
+    account_id = int(callback.data.split("_")[2])
+    account = await get_account(account_id)
+    if not account or account['user_id'] != callback.from_user.id:
+        await callback.answer("Аккаунт не найден", show_alert=True)
+        return
+
+    await callback.answer()
+    try:
+        await callback.message.edit_text(
+            f"{emoji('LOADING')} <b>Загружаю профиль из Telegram…</b>",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
+    profile = await _fetch_profile_from_telegram(account_id)
+    if profile is None:
+        await callback.message.edit_text(
+            f"{emoji('CROSS')} Не удалось подключиться к аккаунту. "
+            f"Возможно, сессия недействительна.",
+            reply_markup=InlineKeyboardBuilder().row(InlineKeyboardButton(
+                text="Назад",
+                callback_data=f"manage_account_{account_id}",
+                style='default',
+                icon_custom_emoji_id=get_icon("BACK"),
+            )).as_markup(),
+        )
+        return
+
+    await state.set_state(ProfileEditStates.editing)
+    await state.update_data(
+        profile_account_id=account_id,
+        phone=account.get('phone'),
+        orig_first_name=profile['first_name'],
+        orig_last_name=profile['last_name'],
+        orig_about=profile['about'],
+        draft_first_name=profile['first_name'],
+        draft_last_name=profile['last_name'],
+        draft_about=profile['about'],
+        draft_avatar=None,
+    )
+    if profile.get('avatar'):
+        try:
+            await callback.message.answer_photo(
+                BufferedInputFile(
+                    profile['avatar'], filename=f"profile_{account_id}.jpg"
+                ),
+                caption=f"{emoji('MEDIA')} Текущая аватарка аккаунта",
+            )
+        except Exception as ex:
+            logger.warning("send current profile photo failed: %s", ex)
+    await _render_profile_editor(callback, state, edit=True)
+
+
+async def _guard_profile_owner(
+    event: Any, state: FSMContext
+) -> Optional[int]:
+    """Проверяет, что аккаунт из FSM всё ещё принадлежит юзеру."""
+    data = await state.get_data()
+    account_id = data.get('profile_account_id')
+    user_id = (
+        event.from_user.id if isinstance(event, (CallbackQuery, Message))
+        else None
+    )
+    if not account_id:
+        return None
+    account = await get_account(account_id)
+    if not account or account['user_id'] != user_id:
+        return None
+    return account_id
+
+
+@dp.callback_query(
+    ProfileEditStates.editing, F.data.startswith("profedit_field_")
+)
+async def profile_edit_field(callback: CallbackQuery, state: FSMContext):
+    account_id = await _guard_profile_owner(callback, state)
+    if account_id is None:
+        await callback.answer("Аккаунт не найден", show_alert=True)
+        await state.clear()
+        return
+
+    field = callback.data.split("_")[2].split(":")[0]
+    prompts = {
+        'first': (
+            ProfileEditStates.waiting_for_first_name,
+            f"{emoji('WRITE')} Отправьте новое <b>имя</b> "
+            f"(до {PROFILE_FIRST_NAME_LIMIT} символов).",
+        ),
+        'last': (
+            ProfileEditStates.waiting_for_last_name,
+            f"{emoji('WRITE')} Отправьте новую <b>фамилию</b> "
+            f"(до {PROFILE_LAST_NAME_LIMIT} символов). "
+            f"Отправьте «-», чтобы очистить.",
+        ),
+        'about': (
+            ProfileEditStates.waiting_for_about,
+            f"{emoji('ADD_TEXT')} Отправьте новое <b>описание</b> "
+            f"(до {PROFILE_ABOUT_LIMIT} символов). "
+            f"Отправьте «-», чтобы очистить.",
+        ),
+        'avatar': (
+            ProfileEditStates.waiting_for_avatar,
+            f"{emoji('MEDIA')} Отправьте <b>изображение</b> для новой "
+            f"аватарки. Старые фото профиля будут удалены при сохранении.",
+        ),
+    }
+    if field not in prompts:
+        await callback.answer("Неизвестное поле", show_alert=True)
+        return
+
+    new_state, prompt = prompts[field]
+    await state.set_state(new_state)
+    cancel_kb = InlineKeyboardBuilder().row(InlineKeyboardButton(
+        text="Отмена",
+        callback_data=f"profedit_back:{account_id}",
+        style='default',
+        icon_custom_emoji_id=get_icon("BACK"),
+    )).as_markup()
+    await callback.message.edit_text(prompt, reply_markup=cancel_kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("profedit_cancel:"))
+async def profile_edit_cancel(callback: CallbackQuery, state: FSMContext):
+    account_id = await _guard_profile_owner(callback, state)
+    if account_id is None:
+        await callback.answer("Аккаунт не найден", show_alert=True)
+        await state.clear()
+        return
+    await state.clear()
+    callback.data = f"manage_account_{account_id}"
+    await manage_account(callback)
+
+
+@dp.callback_query(F.data.startswith("profedit_back:"))
+async def profile_edit_back(callback: CallbackQuery, state: FSMContext):
+    account_id = await _guard_profile_owner(callback, state)
+    if account_id is None:
+        await callback.answer("Аккаунт не найден", show_alert=True)
+        await state.clear()
+        return
+    await callback.answer()
+    await _render_profile_editor(callback, state, edit=True)
+
+
+@dp.message(ProfileEditStates.waiting_for_first_name)
+async def profile_set_first_name(message: Message, state: FSMContext):
+    account_id = await _guard_profile_owner(message, state)
+    if account_id is None:
+        await message.answer("Аккаунт не найден.")
+        await state.clear()
+        return
+    name = (message.text or '').strip()
+    if not name:
+        await message.answer(
+            f"{emoji('CROSS')} Имя не может быть пустым. Отправьте текст."
+        )
+        return
+    if len(name) > PROFILE_FIRST_NAME_LIMIT:
+        await message.answer(
+            f"{emoji('CROSS')} Слишком длинное имя "
+            f"(макс. {PROFILE_FIRST_NAME_LIMIT})."
+        )
+        return
+    await state.update_data(draft_first_name=name)
+    await _render_profile_editor(message, state, edit=False)
+
+
+@dp.message(ProfileEditStates.waiting_for_last_name)
+async def profile_set_last_name(message: Message, state: FSMContext):
+    account_id = await _guard_profile_owner(message, state)
+    if account_id is None:
+        await message.answer("Аккаунт не найден.")
+        await state.clear()
+        return
+    text = (message.text or '').strip()
+    value = '' if text == '-' else text
+    if len(value) > PROFILE_LAST_NAME_LIMIT:
+        await message.answer(
+            f"{emoji('CROSS')} Слишком длинная фамилия "
+            f"(макс. {PROFILE_LAST_NAME_LIMIT})."
+        )
+        return
+    await state.update_data(draft_last_name=value)
+    await _render_profile_editor(message, state, edit=False)
+
+
+@dp.message(ProfileEditStates.waiting_for_about)
+async def profile_set_about(message: Message, state: FSMContext):
+    account_id = await _guard_profile_owner(message, state)
+    if account_id is None:
+        await message.answer("Аккаунт не найден.")
+        await state.clear()
+        return
+    text = (message.text or '').strip()
+    value = '' if text == '-' else text
+    if len(value) > PROFILE_ABOUT_LIMIT:
+        await message.answer(
+            f"{emoji('CROSS')} Слишком длинное описание "
+            f"(макс. {PROFILE_ABOUT_LIMIT})."
+        )
+        return
+    await state.update_data(draft_about=value)
+    await _render_profile_editor(message, state, edit=False)
+
+
+@dp.message(ProfileEditStates.waiting_for_avatar)
+async def profile_set_avatar(message: Message, state: FSMContext):
+    account_id = await _guard_profile_owner(message, state)
+    if account_id is None:
+        await message.answer("Аккаунт не найден.")
+        await state.clear()
+        return
+
+    file_id = None
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif (
+        message.document and (message.document.mime_type or '').startswith('image/')
+    ):
+        file_id = message.document.file_id
+
+    if not file_id:
+        await message.answer(
+            f"{emoji('CROSS')} Пришлите изображение (фото или картинку-файл)."
+        )
+        return
+
+    try:
+        file = await bot.get_file(file_id)
+        buffer = await bot.download_file(file.file_path)
+        avatar_bytes = buffer.read()
+    except Exception as ex:
+        logger.warning("avatar download failed: %s", ex)
+        await message.answer(
+            f"{emoji('CROSS')} Не удалось загрузить изображение. Попробуйте ещё раз."
+        )
+        return
+
+    await state.update_data(draft_avatar=avatar_bytes)
+    await message.answer(f"{emoji('CHECK')} Аватарка загружена в черновик.")
+    await _render_profile_editor(message, state, edit=False)
+
+
+def _parse_ai_profile_json(content: str) -> Optional[Dict[str, str]]:
+    """Достаёт {first_name,last_name,about} из ответа LLM."""
+    if not content:
+        return None
+    text = content.strip()
+    # Вырезаем markdown-ограждение ```json ... ```
+    fence = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if fence:
+        text = fence.group(1)
+    else:
+        brace = re.search(r'\{.*\}', text, re.DOTALL)
+        if brace:
+            text = brace.group(0)
+    try:
+        data = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {
+        'first_name': str(data.get('first_name') or '').strip(),
+        'last_name': str(data.get('last_name') or '').strip(),
+        'about': str(data.get('about') or '').strip(),
+    }
+
+
+async def _generate_profile_with_ai(prompt: str) -> Optional[Dict[str, str]]:
+    """Генерирует имя/фамилию/описание через DeepSeek (deepseek-v4-flash)."""
+    system = (
+        "Ты помогаешь оформить профиль Telegram-аккаунта. "
+        "На основе запроса пользователя придумай реалистичные имя, "
+        "фамилию и короткое описание (about). "
+        f"Имя — до {PROFILE_FIRST_NAME_LIMIT} символов, фамилия — до "
+        f"{PROFILE_LAST_NAME_LIMIT} символов, описание — до "
+        f"{PROFILE_ABOUT_LIMIT} символов. "
+        "Верни СТРОГО JSON без пояснений и без markdown в формате: "
+        '{"first_name": "...", "last_name": "...", "about": "..."}'
+    )
+    client = anthropic.AsyncAnthropic(
+        api_key=LLM_API_KEY,
+        base_url=LLM_BASE_URL,
+        timeout=LLM_TIMEOUT,
+    )
+    response = await client.messages.create(
+        model=PROFILE_AI_MODEL,
+        max_tokens=512,
+        system=system,
+        messages=[{'role': 'user', 'content': prompt}],
+    )
+    content = ''
+    try:
+        for block in (response.content or []):
+            if getattr(block, 'type', None) == 'text':
+                content = getattr(block, 'text', '') or content
+    except Exception:
+        content = ''
+    parsed = _parse_ai_profile_json(content)
+    if not parsed or not parsed.get('first_name'):
+        return None
+    parsed['first_name'] = parsed['first_name'][:PROFILE_FIRST_NAME_LIMIT]
+    parsed['last_name'] = parsed['last_name'][:PROFILE_LAST_NAME_LIMIT]
+    parsed['about'] = parsed['about'][:PROFILE_ABOUT_LIMIT]
+    return parsed
+
+
+@dp.callback_query(
+    ProfileEditStates.editing, F.data.startswith("profedit_ai:")
+)
+async def profile_ai_prompt(callback: CallbackQuery, state: FSMContext):
+    account_id = await _guard_profile_owner(callback, state)
+    if account_id is None:
+        await callback.answer("Аккаунт не найден", show_alert=True)
+        await state.clear()
+        return
+    await state.set_state(ProfileEditStates.waiting_for_ai_prompt)
+    cancel_kb = InlineKeyboardBuilder().row(InlineKeyboardButton(
+        text="Отмена",
+        callback_data=f"profedit_back:{account_id}",
+        style='default',
+        icon_custom_emoji_id=get_icon("BACK"),
+    )).as_markup()
+    await callback.message.edit_text(
+        f"{emoji('AI')} <b>Генерация профиля через ИИ</b>\n\n"
+        f"Опишите желаемый образ (например: «серьёзный юрист из Москвы» "
+        f"или «весёлый геймер-стример»). ИИ придумает имя, фамилию и "
+        f"описание. Аватарку ИИ не меняет.",
+        reply_markup=cancel_kb,
+    )
+    await callback.answer()
+
+
+@dp.message(ProfileEditStates.waiting_for_ai_prompt)
+async def profile_ai_generate(message: Message, state: FSMContext):
+    account_id = await _guard_profile_owner(message, state)
+    if account_id is None:
+        await message.answer("Аккаунт не найден.")
+        await state.clear()
+        return
+    prompt = (message.text or '').strip()
+    if not prompt:
+        await message.answer(
+            f"{emoji('CROSS')} Опишите желаемый образ текстом."
+        )
+        return
+
+    thinking = await message.answer(
+        f"{emoji('LOADING')} Генерирую профиль через DeepSeek…"
+    )
+    try:
+        result = await _generate_profile_with_ai(prompt)
+    except Exception as ex:
+        logger.exception("profile AI generation failed")
+        await thinking.edit_text(
+            f"{emoji('CROSS')} Ошибка генерации: "
+            f"<code>{escape(str(ex)[:200])}</code>"
+        )
+        await _render_profile_editor(message, state, edit=False)
+        return
+
+    if not result:
+        await thinking.edit_text(
+            f"{emoji('CROSS')} ИИ вернул некорректный ответ. Попробуйте ещё раз."
+        )
+        await _render_profile_editor(message, state, edit=False)
+        return
+
+    await state.update_data(
+        draft_first_name=result['first_name'],
+        draft_last_name=result['last_name'],
+        draft_about=result['about'],
+    )
+    try:
+        await thinking.delete()
+    except Exception:
+        pass
+    await message.answer(f"{emoji('CHECK')} Профиль сгенерирован в черновик.")
+    await _render_profile_editor(message, state, edit=False)
+
+
+@dp.callback_query(
+    ProfileEditStates.editing, F.data.startswith("profedit_save:")
+)
+async def profile_edit_save(callback: CallbackQuery, state: FSMContext):
+    account_id = await _guard_profile_owner(callback, state)
+    if account_id is None:
+        await callback.answer("Аккаунт не найден", show_alert=True)
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    first_name = (data.get('draft_first_name') or '').strip()
+    last_name = (data.get('draft_last_name') or '').strip()
+    about = (data.get('draft_about') or '').strip()
+    avatar_bytes = data.get('draft_avatar')
+
+    if not first_name:
+        await callback.answer(
+            "Имя не может быть пустым", show_alert=True
+        )
+        return
+
+    await callback.answer()
+    try:
+        await callback.message.edit_text(
+            f"{emoji('LOADING')} <b>Применяю изменения профиля…</b>",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
+    client = await get_client_for_account(account_id)
+    if not client:
+        await callback.message.edit_text(
+            f"{emoji('CROSS')} Не удалось подключиться к аккаунту. "
+            f"Изменения не применены.",
+            reply_markup=InlineKeyboardBuilder().row(InlineKeyboardButton(
+                text="Назад",
+                callback_data=f"manage_account_{account_id}",
+                style='default',
+                icon_custom_emoji_id=get_icon("BACK"),
+            )).as_markup(),
+        )
+        return
+
+    tmp_path = None
+    try:
+        await client(UpdateProfileRequest(
+            first_name=first_name,
+            last_name=last_name,
+            about=about,
+        ))
+
+        if avatar_bytes:
+            # Сначала загружаем файл, чтобы не удалить старые фото, если
+            # новая картинка оказалась непригодной для Telegram.
+            with tempfile.NamedTemporaryFile(
+                suffix='.jpg', delete=False
+            ) as tmp:
+                tmp.write(avatar_bytes)
+                tmp_path = tmp.name
+            uploaded = await client.upload_file(tmp_path)
+
+            # После успешной загрузки удаляем историю и ставим новое фото.
+            try:
+                photos = await client(GetUserPhotosRequest(
+                    user_id='me', offset=0, max_id=0, limit=100
+                ))
+                if getattr(photos, 'photos', None):
+                    await client(DeletePhotosRequest(id=photos.photos))
+            except Exception as ex:
+                logger.warning("delete old photos failed: %s", ex)
+            await client(UploadProfilePhotoRequest(file=uploaded))
+
+    except FloodWaitError as ex:
+        await callback.message.edit_text(
+            f"{emoji('CLOCK')} Telegram просит подождать "
+            f"<b>{ex.seconds} сек</b> перед изменением профиля. "
+            f"Попробуйте позже.",
+            reply_markup=InlineKeyboardBuilder().row(InlineKeyboardButton(
+                text="Назад",
+                callback_data=f"manage_account_{account_id}",
+                style='default',
+                icon_custom_emoji_id=get_icon("BACK"),
+            )).as_markup(),
+        )
+        return
+    except Exception as ex:
+        logger.exception("profile save failed")
+        await callback.message.edit_text(
+            f"{emoji('CROSS')} Ошибка при сохранении: "
+            f"<code>{escape(str(ex)[:200])}</code>",
+            reply_markup=InlineKeyboardBuilder().row(InlineKeyboardButton(
+                text="Назад",
+                callback_data=f"manage_account_{account_id}",
+                style='default',
+                icon_custom_emoji_id=get_icon("BACK"),
+            )).as_markup(),
+        )
+        return
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    await state.clear()
+
+    # Заново читаем профиль из Telegram, чтобы показать применённые данные.
+    fresh = await _fetch_profile_from_telegram(account_id) or {
+        'first_name': first_name,
+        'last_name': last_name,
+        'about': about,
+    }
+    await callback.message.edit_text(
+        f"{emoji('CHECK')} <b>Профиль обновлён</b>\n\n"
+        f"{emoji('ID')} Имя: <b>{_profile_display(fresh['first_name'])}</b>\n"
+        f"{emoji('ID')} Фамилия: <b>{_profile_display(fresh['last_name'])}</b>\n"
+        f"{emoji('ADD_TEXT')} Описание: "
+        f"{_profile_display(fresh['about'], 'пусто')}\n"
+        f"{emoji('MEDIA')} Аватарка: "
+        f"{'обновлена' if avatar_bytes else 'без изменений'}",
+        reply_markup=InlineKeyboardBuilder().row(InlineKeyboardButton(
+            text="Назад к аккаунту",
+            callback_data=f"manage_account_{account_id}",
+            style='default',
+            icon_custom_emoji_id=get_icon("BACK"),
+        )).as_markup(),
+    )
+
+
 @dp.callback_query(F.data.startswith("toggle_warming_"))
 async def toggle_warming(callback: CallbackQuery):
     """Включение/выключение прогрева. При включении — сначала
@@ -8122,7 +8814,7 @@ async def broadcast(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "scheduled_broadcast")
 async def scheduled_broadcast_menu(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
-        f"{emoji('CLOCK')} <b>Отложенная рассылка</b>\n\n"
+        f"{emoji('CLOCK')} <b>Отл��женная рассылка</b>\n\n"
         f"Выберите режим рассылки:",
         reply_markup=get_broadcast_mode_keyboard()
     )
@@ -8660,7 +9352,7 @@ async def scheduled_process_message(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "broadcast_messages_done",
                    ScheduledBroadcastStates.waiting_for_message)
 async def scheduled_messages_done(callback: CallbackQuery, state: FSMContext):
-    """Завершаем набор сообщений для отложенной рассылки."""
+    """Завершаем набор сообщений для отложенной рассы��ки."""
     data = await state.get_data()
     variants = list(data.get('message_texts') or [])
     if not variants:
