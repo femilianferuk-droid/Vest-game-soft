@@ -640,7 +640,7 @@ async def init_db():
             pass
         # Список сообщений для рандомной рассылки (JSONB-массив объектов
         # {text, media}). Если заполнен — execute_*_broadcast будет
-        # случайно выбирать одно из сообщений при каждой отправке.
+        # случайно выбират�� одно из сообщений при каждой отправке.
         try:
             await conn.execute(
                 "ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS message_texts JSONB DEFAULT '[]'::jsonb"
@@ -6301,7 +6301,7 @@ async def help_handler(callback: CallbackQuery):
         f"{emoji('SWEEP')} <b>Удаление сообщений</b> — очистка истории.\n"
         f"{emoji('USERS')} <b>Парсинг чата</b> — сбор пользователей.\n"
         f"{emoji('PLAY')} <b>Скрипты</b> — запуск бота и нажатие сохранённой кнопки.\n"
-        f"{emoji('AI')} <b>AI Генератор</b> — 3 варианта текста на выбор.\n\n"
+        f"{emoji('AI')} <b>AI Генератор</b> — 3 варианта т��кста на выбор.\n\n"
         f"{emoji('SUPPORT')} <b>Поддержка:</b> {SUPPORT_USERNAME}"
     )
     await callback.message.edit_text(
@@ -8040,7 +8040,15 @@ async def edit_profile_open(callback: CallbackQuery, state: FSMContext):
         draft_about=profile['about'],
         draft_avatar=None,
     )
+
+    # Показываем текущую аватарку первым сообщением, если она есть.
+    # После этого edit_text в _render_profile_editor уже не подойдёт
+    # (message изменилось), поэтому явно шлём редактор как новое сообщение.
     if profile.get('avatar'):
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         try:
             await callback.message.answer_photo(
                 BufferedInputFile(
@@ -8050,24 +8058,45 @@ async def edit_profile_open(callback: CallbackQuery, state: FSMContext):
             )
         except Exception as ex:
             logger.warning("send current profile photo failed: %s", ex)
-    await _render_profile_editor(callback, state, edit=True)
+        # После отправки фото редактор идёт отдельным сообщением (edit=False)
+        await _render_profile_editor(callback, state, edit=False)
+    else:
+        await _render_profile_editor(callback, state, edit=True)
 
 
 async def _guard_profile_owner(
     event: Any, state: FSMContext
 ) -> Optional[int]:
-    """Проверяет, что аккаунт из FSM всё ещё принадлежит юзеру."""
+    """Проверяет, что аккаунт из FSM всё ещё принадлежит юзеру.
+
+    FSM-хранилище (особенно Redis) сериализует все значения в строки,
+    поэтому и account_id, и user_id приводим к int перед сравнением.
+    """
     data = await state.get_data()
-    account_id = data.get('profile_account_id')
-    user_id = (
-        event.from_user.id if isinstance(event, (CallbackQuery, Message))
-        else None
-    )
-    if not account_id:
+    raw_id = data.get('profile_account_id')
+    if not raw_id:
         return None
+    try:
+        account_id = int(raw_id)
+    except (TypeError, ValueError):
+        return None
+
+    user_id = None
+    if isinstance(event, (CallbackQuery, Message)):
+        user_id = event.from_user.id
+
+    if user_id is None:
+        return None
+
     account = await get_account(account_id)
-    if not account or account['user_id'] != user_id:
+    if not account:
         return None
+    try:
+        if int(account['user_id']) != int(user_id):
+            return None
+    except (TypeError, ValueError):
+        return None
+
     return account_id
 
 
@@ -8275,7 +8304,7 @@ async def _generate_profile_with_ai(prompt: str) -> Optional[Dict[str, str]]:
     system = (
         "Ты помогаешь оформить профиль Telegram-аккаунта. "
         "На основе запроса пользователя придумай реалистичные имя, "
-        "фамилию и короткое описание (about). "
+        "фамилию и короткое описан��е (about). "
         f"Имя — до {PROFILE_FIRST_NAME_LIMIT} символов, фамилия — до "
         f"{PROFILE_LAST_NAME_LIMIT} символов, описание — до "
         f"{PROFILE_ABOUT_LIMIT} символов. "
@@ -8674,7 +8703,7 @@ async def toggle_warming(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("confirm_warming_"))
 async def confirm_warming_plan(callback: CallbackQuery):
-    """Юзер подтвердил план — реально включаем прогрев и запускаем воркер."""
+    """Юзер подтвердил план — реально включаем прогрев и запускаем ворке��."""
     account_id = int(callback.data.split("_")[2])
     account = await get_account(account_id)
 
@@ -9880,7 +9909,7 @@ async def process_dm_file_invalid(message: Message):
 
 @dp.message(DMBroadcastStates.waiting_for_message)
 async def process_dm_message(message: Message, state: FSMContext):
-    """Набираем до 100 вариантов сообщений для DM-рассылки."""
+    """Набираем до 100 в��риантов сообщений для DM-рассылки."""
     text, media_paths = await _extract_message_payload(message, state)
 
     data = await state.get_data()
