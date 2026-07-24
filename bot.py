@@ -640,7 +640,7 @@ async def init_db():
             pass
         # Список сообщений для рандомной рассылки (JSONB-массив объектов
         # {text, media}). Если заполнен — execute_*_broadcast будет
-        # случайно выбират�� одно из сообщений при каждой отправке.
+        # случайно выбират���� одно из сообщений при каждой отправке.
         try:
             await conn.execute(
                 "ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS message_texts JSONB DEFAULT '[]'::jsonb"
@@ -2291,7 +2291,7 @@ async def call_llm_api_plain(
         logger.exception("LLM API (plain) anthropic error")
         raise RuntimeError(f"LLM API ошибка: {e}") from e
 
-    # Собираем все text-блоки; если есть thinking — отдадим его как fallback
+    # Собираем все text-блоки; если ес��ь thinking — отдадим его как fallback
     # (на случай, если модель отдала только рассуждения).
     text_parts: List[str] = []
     thinking_parts: List[str] = []
@@ -2579,7 +2579,7 @@ async def acct_ar_reset_history(account_id: int) -> None:
 # ============================================================
 # Отдельная фича: по последним логам + истории флуд-вейтов аккаунта
 # формируем структурированный отчёт (уровень риска + причины + советы)
-# через LLM в режиме «эксперт по безопасности Telegram».
+# через LLM в режиме «эксперт по ��езопасности Telegram».
 
 def _format_log_line(log: Dict[str, Any]) -> str:
     """Одна строка лога для промта: время (МСК), направление, чат, превью."""
@@ -7967,7 +7967,11 @@ async def _fetch_profile_from_telegram(
         logger.warning("GetFullUserRequest failed: %s", ex)
     avatar = None
     try:
-        avatar = await client.download_profile_photo('me', file=bytes)
+        import io as _io
+        buf = _io.BytesIO()
+        result = await client.download_profile_photo('me', file=buf)
+        if result is not None:
+            avatar = buf.getvalue() or None
     except Exception as ex:
         logger.warning("download_profile_photo failed: %s", ex)
     return {
@@ -7999,9 +8003,14 @@ async def _render_profile_editor(
 
 @dp.callback_query(F.data.startswith("edit_profile_"))
 async def edit_profile_open(callback: CallbackQuery, state: FSMContext):
-    account_id = int(callback.data.split("_")[2])
+    # callback.data = "edit_profile_{account_id}"
+    try:
+        account_id = int(callback.data.split("edit_profile_", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Неверный формат кнопки", show_alert=True)
+        return
     account = await get_account(account_id)
-    if not account or account['user_id'] != callback.from_user.id:
+    if not account or int(account['user_id']) != int(callback.from_user.id):
         await callback.answer("Аккаунт не найден", show_alert=True)
         return
 
@@ -9090,7 +9099,7 @@ async def process_count(message: Message, state: FSMContext):
     
     await message.answer(
         f"{emoji('WRITE')} <b>Введите сообщение для рассылки:</b>\n\n"
-        f"Поддерживается HTML и премиум эмодзи.\n"
+        f"Поддерживается HTML и преми��м эмодзи.\n"
         f"Можно прикрепить медиа (фото, видео, документы).",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
@@ -9882,7 +9891,7 @@ async def process_dm_file(message: Message, state: FSMContext):
             f"<code>{'{first_name}'}</code> - имя\n"
             f"<code>{'{last_name}'}</code> - фамилия\n"
             f"<code>{'{user_id}'}</code> - ID пользователя\n\n"
-            f"{emoji('WRITE')} <b>Введите сообщение для рассылки:</b>\n"
+            f"{emoji('WRITE')} <b>Введите сообщени�� для рассылки:</b>\n"
             f"Поддерживается HTML и премиум эмодзи.\n"
             f"Можно прикрепить медиа.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
@@ -11868,7 +11877,7 @@ async def account_ai_responder_worker(account_id: int, user_id: int):
                 except Exception:
                     logger.exception("acct_ar: не удалось сохранить историю")
 
-                # 6) Шлём ответ (с разбивкой на куски > 4000 символов).
+                # 6) Шлём ответ (с разбивкой на куски > 4000 сим��олов).
                 sent_ok = False
                 try:
                     if len(answer) <= 4000:
