@@ -256,6 +256,8 @@ class AutoResponderStates(StatesGroup):
 
 class AdminStates(StatesGroup):
     waiting_for_broadcast_message = State()
+    waiting_for_gift_user_id = State()
+    waiting_for_gift_days = State()
 
 class ParsingStates(StatesGroup):
     waiting_for_account = State()
@@ -2291,7 +2293,7 @@ async def call_llm_api_plain(
         logger.exception("LLM API (plain) anthropic error")
         raise RuntimeError(f"LLM API ошибка: {e}") from e
 
-    # Собираем все text-блоки; если есть thinking — отдадим его как fallback
+    # Собираем все text-блоки; если ес��ь thinking — отдадим его как fallback
     # (на случай, если модель отдала только рассуждения).
     text_parts: List[str] = []
     thinking_parts: List[str] = []
@@ -2579,7 +2581,7 @@ async def acct_ar_reset_history(account_id: int) -> None:
 # ============================================================
 # Отдельная фича: по последним логам + истории флуд-вейтов аккаунта
 # формируем структурированный отчёт (уровень риска + причины + советы)
-# через LLM в режиме «эксперт по безопасности Telegram».
+# через LLM в режиме «эксперт по ��езопасности Telegram».
 
 def _format_log_line(log: Dict[str, Any]) -> str:
     """Одна строка лога для промта: время (МСК), направление, чат, превью."""
@@ -4387,6 +4389,79 @@ async def is_pro(user_id: int) -> bool:
     return sub.get("tier") == "pro"
 
 
+# ---- Free/Pro limit helpers ----
+
+async def count_ai_requests_today(user_id: int) -> int:
+    """Returns number of AI requests made by user today (UTC)."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS cnt FROM ai_requests "
+            "WHERE user_id = $1 AND created_at >= CURRENT_DATE",
+            user_id
+        )
+        return int(row["cnt"]) if row else 0
+
+
+async def check_ai_limit(user_id: int) -> bool:
+    """Returns True if user is allowed to make an AI request.
+    Pro users: unlimited. Free users: max 1 per day."""
+    if await is_pro(user_id):
+        return True
+    count = await count_ai_requests_today(user_id)
+    return count < 1
+
+
+async def get_user_broadcast_seconds_this_week(user_id: int) -> float:
+    """Returns total seconds of broadcasts (chat + DM) the user has run
+    in the last 7 days."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COALESCE(SUM("
+            "  EXTRACT(EPOCH FROM ("
+            "    COALESCE(stopped_at, NOW()) - started_at"
+            "  ))"
+            "), 0) AS total_seconds "
+            "FROM broadcasts "
+            "WHERE user_id = $1 "
+            "  AND started_at >= NOW() - INTERVAL '7 days' "
+            "  AND status IN ('active', 'completed', 'stopped')",
+            user_id
+        )
+        seconds = float(row["total_seconds"]) if row else 0.0
+
+    # Also count DM broadcasts
+    async with db_pool.acquire() as conn:
+        row2 = await conn.fetchrow(
+            "SELECT COALESCE(SUM("
+            "  EXTRACT(EPOCH FROM ("
+            "    COALESCE(updated_at, NOW()) - created_at"
+            "  ))"
+            "), 0) AS total_seconds "
+            "FROM dm_broadcasts "
+            "WHERE user_id = $1 "
+            "  AND created_at >= NOW() - INTERVAL '7 days' "
+            "  AND status IN ('active', 'completed', 'stopped')",
+            user_id
+        )
+        seconds += float(row2["total_seconds"]) if row2 else 0.0
+
+    return seconds
+
+
+FREE_BROADCAST_LIMIT_HOURS = 24
+
+
+async def check_broadcast_limit(user_id: int) -> tuple:
+    """Returns (allowed: bool, used_hours: float).
+    Free users are limited to 24 hours of broadcast runtime per week.
+    Pro users have no restriction."""
+    if await is_pro(user_id):
+        return (True, 0.0)
+    used_seconds = await get_user_broadcast_seconds_this_week(user_id)
+    used_hours = used_seconds / 3600.0
+    return (used_hours < FREE_BROADCAST_LIMIT_HOURS, used_hours)
+
+
 async def _cryptopay_request(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """Базовый вызов Crypto Pay API v1. Возвращает {ok, result} или {ok:false, error}."""
     url = f"{CRYPTO_PAY_API}/{method}"
@@ -5771,6 +5846,12 @@ async def cmd_admin(message: Message):
         icon_custom_emoji_id=get_icon("MEGAPHONE")
     ))
     builder.row(InlineKeyboardButton(
+        text="Подарить подписку",
+        callback_data="admin_gift_sub",
+        style='default',
+        icon_custom_emoji_id=get_icon("STAR")
+    ))
+    builder.row(InlineKeyboardButton(
         text="Обновить статистику",
         callback_data="admin_refresh_stats",
         style='default',
@@ -6520,6 +6601,13 @@ async def check_pro_payment(callback: CallbackQuery):
 @dp.callback_query(F.data == "ai_generator")
 async def ai_generator_start(callback: CallbackQuery, state: FSMContext):
     """Шаг 1: пользователь выбирает модель."""
+    if not await check_ai_limit(callback.from_user.id):
+        await callback.answer(
+            "Лимит исчерпан: 1 AI-запрос в день на Free-тарифе. "
+            "Обновитесь до Pro!",
+            show_alert=True
+        )
+        return
     await state.clear()
     current = await get_user_llm_model(callback.from_user.id)
     label = LLM_MODELS.get(current, LLM_DEFAULT_MODEL)
@@ -7750,6 +7838,12 @@ async def analyze_risk_handler(callback: CallbackQuery):
       3) Зовём LLM в режиме «эксперт по безопасности Telegram».
       4) Если LLM недоступна — отдаём эвристический отчёт.
     """
+    if not await is_pro(callback.from_user.id):
+        await callback.answer(
+            "AI-анализ безопасности доступен только в Pro.",
+            show_alert=True
+        )
+        return
     parts = callback.data.split("_")
     # data = "analyze_risk_<id>"
     if len(parts) < 3:
@@ -8426,6 +8520,12 @@ async def _generate_profile_with_ai(prompt: str) -> Optional[Dict[str, str]]:
 
 @dp.callback_query(F.data.startswith("profedit_ai:"))
 async def profile_ai_prompt(callback: CallbackQuery, state: FSMContext):
+    if not await is_pro(callback.from_user.id):
+        await callback.answer(
+            "AI-генерация профиля доступна только в Pro.",
+            show_alert=True
+        )
+        return
     account_id = await _guard_profile_owner(callback, state)
     if account_id is None:
         await callback.answer("Аккаунт не найден", show_alert=True)
@@ -8658,6 +8758,13 @@ async def toggle_warming(callback: CallbackQuery):
         return
 
     # ============ ВКЛЮЧЕНИЕ ============
+    if not await is_pro(callback.from_user.id):
+        await callback.answer(
+            "Прогрев с AI-планом доступен только в Pro.",
+            show_alert=True
+        )
+        return
+
     # Шаг 1: сразу отвечаем «Думаю...» и обновляем сообщение по таймеру.
     started = time.monotonic()
     try:
@@ -9323,6 +9430,23 @@ async def broadcast_messages_done(callback: CallbackQuery, state: FSMContext):
 async def start_broadcast(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     user_id = callback.from_user.id
+
+    allowed, used_hours = await check_broadcast_limit(user_id)
+    if not allowed:
+        remaining = max(0.0, FREE_BROADCAST_LIMIT_HOURS - used_hours)
+        await callback.message.edit_text(
+            f"<b>Лимит рассылки исчерпан</b>\n\n"
+            f"На Free-тарифе доступно <b>{FREE_BROADCAST_LIMIT_HOURS} часов</b> "
+            f"рассылок в неделю.\n"
+            f"Использовано: <b>{used_hours:.1f} ч</b> "
+            f"из {FREE_BROADCAST_LIMIT_HOURS} ч "
+            f"(осталось: {remaining:.1f} ч).\n\n"
+            f"Обновитесь до Pro для неограниченной рассылки!",
+            reply_markup=get_subscription_keyboard("free")
+        )
+        await callback.answer()
+        return
+
     chat_ids_str = [str(x) for x in data['selected_chats']]
     variants = list(data.get('message_texts') or [])
     if not variants:
@@ -10127,6 +10251,23 @@ async def process_dm_delay(message: Message, state: FSMContext):
 async def start_dm_broadcast(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     user_id = callback.from_user.id
+
+    allowed, used_hours = await check_broadcast_limit(user_id)
+    if not allowed:
+        remaining = max(0.0, FREE_BROADCAST_LIMIT_HOURS - used_hours)
+        await callback.message.edit_text(
+            f"<b>Лимит рассылки исчерпан</b>\n\n"
+            f"На Free-тарифе доступно <b>{FREE_BROADCAST_LIMIT_HOURS} часов</b> "
+            f"рассылок в неделю.\n"
+            f"Использовано: <b>{used_hours:.1f} ч</b> "
+            f"из {FREE_BROADCAST_LIMIT_HOURS} ч "
+            f"(осталось: {remaining:.1f} ч).\n\n"
+            f"Обновитесь до Pro для неограниченной рассылки!",
+            reply_markup=get_subscription_keyboard("free")
+        )
+        await callback.answer()
+        return
+
     variants = list(data.get('message_texts') or [])
     if not variants:
         variants = [{
@@ -10257,7 +10398,7 @@ async def process_join_file(message: Message, state: FSMContext):
         ]
         
         if not links:
-            await message.answer(f"{emoji('CROSS')} Файл пуст.")
+            await message.answer(f"{emoji('CROSS')} Файл пу��т.")
             os.remove(file_path)
             return
         
@@ -11200,6 +11341,12 @@ async def admin_refresh_stats(callback: CallbackQuery):
         icon_custom_emoji_id=get_icon("MEGAPHONE")
     ))
     builder.row(InlineKeyboardButton(
+        text="Подарить подписку",
+        callback_data="admin_gift_sub",
+        style='default',
+        icon_custom_emoji_id=get_icon("STAR")
+    ))
+    builder.row(InlineKeyboardButton(
         text="Обновить статистику",
         callback_data="admin_refresh_stats",
         style='default',
@@ -11296,6 +11443,115 @@ async def process_admin_broadcast(message: Message, state: FSMContext):
         ]])
     )
     await state.clear()
+
+
+# ========== ПОДАРИТЬ ПОДПИСКУ (ADMIN) ==========
+
+@dp.callback_query(F.data == "admin_gift_sub")
+async def admin_gift_sub_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_for_gift_user_id)
+    await callback.message.edit_text(
+        f"{emoji('STAR')} <b>Подарить Pro-подписку</b>\n\n"
+        f"Введите Telegram <b>user_id</b> пользователя, которому хотите "
+        f"подарить подписку:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="Отмена",
+                callback_data="admin_refresh_stats",
+                style='default',
+                icon_custom_emoji_id=get_icon("BACK")
+            )
+        ]])
+    )
+    await callback.answer()
+
+
+@dp.message(AdminStates.waiting_for_gift_user_id)
+async def admin_gift_user_id(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    raw = (message.text or '').strip()
+    if not raw.lstrip('-').isdigit():
+        await message.answer(
+            f"{emoji('CROSS')} Некорректный user_id. "
+            f"Введите числовой Telegram ID:"
+        )
+        return
+    target_id = int(raw)
+    await state.update_data(gift_target_id=target_id)
+    await state.set_state(AdminStates.waiting_for_gift_days)
+    await message.answer(
+        f"{emoji('STAR')} <b>Подарить подписку</b>\n\n"
+        f"User ID: <code>{target_id}</code>\n\n"
+        f"На сколько дней выдать Pro? (1–3650):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="Отмена",
+                callback_data="admin_refresh_stats",
+                style='default',
+                icon_custom_emoji_id=get_icon("BACK")
+            )
+        ]])
+    )
+
+
+@dp.message(AdminStates.waiting_for_gift_days)
+async def admin_gift_days(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    raw = (message.text or '').strip()
+    try:
+        days = int(raw)
+        if days < 1 or days > 3650:
+            raise ValueError
+    except ValueError:
+        await message.answer(
+            f"{emoji('CROSS')} Введите целое число от 1 до 3650:"
+        )
+        return
+
+    data = await state.get_data()
+    target_id = data.get("gift_target_id")
+    if not target_id:
+        await message.answer(f"{emoji('CROSS')} Сессия истекла. Начните заново.")
+        await state.clear()
+        return
+
+    expires_at = datetime.now() + timedelta(days=days)
+    await set_subscription(target_id, "pro", expires_at)
+
+    await state.clear()
+
+    await message.answer(
+        f"{emoji('CHECK')} <b>Подписка выдана!</b>\n\n"
+        f"User ID: <code>{target_id}</code>\n"
+        f"Тариф: <b>Pro</b>\n"
+        f"Срок до: <b>{expires_at.strftime('%d.%m.%Y %H:%M')}</b> "
+        f"(+{days} дн.)",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="В админ-панель",
+                callback_data="admin_refresh_stats",
+                style='primary',
+                icon_custom_emoji_id=get_icon("BACK")
+            )
+        ]])
+    )
+
+    # Notify the recipient
+    try:
+        await bot.send_message(
+            target_id,
+            f"{emoji('STAR')} <b>Вам подарена Pro-подписка!</b>\n\n"
+            f"Тариф: <b>Pro</b>\n"
+            f"Активна до: <b>{expires_at.strftime('%d.%m.%Y %H:%M')}</b>\n\n"
+            f"Все AI-функции и неограниченные рассылки теперь доступны!"
+        )
+    except Exception as ex:
+        logger.warning(f"Could not notify gift recipient {target_id}: {ex}")
 
 
 # ========== ПРОКСИ ==========
@@ -12177,6 +12433,13 @@ async def cb_acct_ar_mode(callback: CallbackQuery, state: FSMContext):
     account = await get_account(account_id)
     if not account or account['user_id'] != callback.from_user.id:
         await callback.answer("Аккаунт не найден", show_alert=True)
+        return
+
+    if new_mode == ACCT_AR_MODE_AI and not await is_pro(callback.from_user.id):
+        await callback.answer(
+            "AI-автоответчик доступен только в Pro.",
+            show_alert=True
+        )
         return
 
     await acct_ar_set_mode(account_id, new_mode)
