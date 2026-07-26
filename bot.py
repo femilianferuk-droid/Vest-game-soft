@@ -840,7 +840,7 @@ async def get_user_accounts(user_id: int) -> List[Dict]:
 
 
 async def get_user_llm_model(user_id: int) -> str:
-    """Возвращает выбранную пользователем LLM-модель или дефолт."""
+    """��озвращает выбранную пользователем LLM-модель или дефолт."""
     if db_pool is None:
         return LLM_DEFAULT_MODEL
     try:
@@ -2048,7 +2048,7 @@ LLM_SYSTEM_PROMPT = (
 #  - интервалы между волнами с учётом времени суток
 #  - распределение типов действий
 #  - почасовое расписание интенсивности
-#  - набор уникальных текстов для Избранного
+#  - набор уника��ьных текстов для Избранного
 #  - пул безопасных реакций
 #  - тихие часы
 # Возвращает СТРОГО JSON без markdown-обёрток.
@@ -3091,7 +3091,7 @@ WARMING_SAVED_NOTES = [
 
 
 def _is_quiet_hours() -> bool:
-    """Ночной режим по МСК: 0–7 и 23–24 — спим, активность минимальна."""
+    """Ночной режим по МСК: 0–7 и 23��24 — спим, активность минимальна."""
     hour = datetime.now(MSK_TZ).hour
     return hour < 7 or hour >= 23
 
@@ -5819,16 +5819,16 @@ def get_chat_selection_keyboard(
 async def cmd_start(message: Message):
     user = message.from_user
     await register_user(user.id, user.username, user.first_name)
-    
+    limits = await format_limits_text(user.id)
     welcome_text = (
         f"{emoji('SMILE')} <b>Добро пожаловать в Vest Game Soft!</b>\n\n"
         f"{emoji('BOT')} Я помогу вам управлять аккаунтами и делать рассылки.\n\n"
         f"{emoji('PEOPLE')} <b>Менеджер аккаунтов</b> — добавление и управление\n"
         f"{emoji('APPS')} <b>Функции</b> — рассылка, автоответчик, парсинг\n"
         f"{emoji('SUPPORT')} <b>Поддержка:</b> {SUPPORT_USERNAME}\n\n"
+        f"{limits}\n\n"
         f"Выберите действие:"
     )
-    
     await message.answer(welcome_text, reply_markup=get_main_menu_keyboard())
 
 @dp.message(Command("admin"))
@@ -5871,8 +5871,11 @@ async def cmd_admin(message: Message):
 # --- Главное меню ---
 @dp.callback_query(F.data == "main_menu")
 async def back_to_main(callback: CallbackQuery):
+    limits = await format_limits_text(callback.from_user.id)
     await callback.message.edit_text(
-        f"{emoji('SMILE')} <b>Главное меню</b>\n\nВыберите действие:",
+        f"{emoji('SMILE')} <b>Главное меню</b>\n\n"
+        f"{limits}\n\n"
+        f"Выберите действие:",
         reply_markup=get_main_menu_keyboard()
     )
     await callback.answer()
@@ -6330,7 +6333,7 @@ async def script_delete_ask(callback: CallbackQuery):
     await callback.message.edit_text(
         f"{emoji('CROSS')} <b>Удалить скрипт?</b>\n\n"
         f"<b>{escape(script['name'])}</b>\n"
-        "История запусков этого скрипта также будет удалена.",
+        "История запус��ов этого скрипта также будет удалена.",
         reply_markup=keyboard,
     )
     await callback.answer()
@@ -6427,8 +6430,34 @@ def get_subscription_keyboard(tier: str) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def _format_sub_text(sub: Dict[str, Any]) -> str:
+async def format_limits_text(user_id: int) -> str:
+    """Returns a short usage-counter block to embed in subscription/menu messages."""
+    if await is_pro(user_id):
+        return f"{emoji('STAR')} <b>Лимиты:</b> Pro — без ограничений"
+
+    ai_used = await count_ai_requests_today(user_id)
+    ai_limit = 1
+    ai_bar = "█" * ai_used + "░" * max(0, ai_limit - ai_used)
+
+    broadcast_seconds = await get_user_broadcast_seconds_this_week(user_id)
+    broadcast_used_h = broadcast_seconds / 3600.0
+    broadcast_limit_h = FREE_BROADCAST_LIMIT_HOURS
+    bar_filled = min(round(broadcast_used_h), broadcast_limit_h)
+    broadcast_bar = "█" * bar_filled + "░" * max(0, broadcast_limit_h - bar_filled)
+    # Reset time: midnight UTC 7 days from the oldest broadcast start this week
+    reset_info = "обновляется через 7 дней"
+
+    return (
+        f"📊 <b>Использование (Free):</b>\n"
+        f"  AI-запросы сегодня: <code>{ai_bar}</code> {ai_used}/{ai_limit}\n"
+        f"  Рассылка на неделе: {broadcast_used_h:.1f}/{broadcast_limit_h} ч "
+        f"({reset_info})"
+    )
+
+
+def _format_sub_text_sync(sub: Dict[str, Any], limits_text: str = "") -> str:
     tier = sub.get("tier", "free")
+    limits_block = f"\n\n{limits_text}" if limits_text else ""
     if tier == "pro":
         exp = sub.get("expires_at")
         exp_str = ""
@@ -6442,6 +6471,7 @@ def _format_sub_text(sub: Dict[str, Any]) -> str:
             f"<b>Тариф:</b> Pro\n"
             f"{emoji('CLOCK')} <b>Активна до:</b> {exp_str}\n\n"
             f"{emoji('CHECK')} Спасибо за поддержку! Все функции открыты."
+            f"{limits_block}"
         )
     return (
         f"{emoji('MONEY_SEND')} <b>Моя подписка</b>\n\n"
@@ -6452,14 +6482,22 @@ def _format_sub_text(sub: Dict[str, Any]) -> str:
         f"  {emoji('CHECK')} Ранний доступ к новым функциям\n"
         f"  {emoji('CHECK')} Smart Delay Engine в усиленном режиме\n\n"
         f"Оплата через @CryptoBot (USDT, 0.6$)."
+        f"{limits_block}"
     )
+
+
+# Keep old name as thin wrapper for any call sites that still use it
+def _format_sub_text(sub: Dict[str, Any]) -> str:
+    return _format_sub_text_sync(sub)
 
 
 @dp.callback_query(F.data == "my_subscription")
 async def my_subscription(callback: CallbackQuery):
-    sub = await get_subscription(callback.from_user.id)
+    user_id = callback.from_user.id
+    sub = await get_subscription(user_id)
+    limits = await format_limits_text(user_id)
     await callback.message.edit_text(
-        _format_sub_text(sub),
+        _format_sub_text_sync(sub, limits),
         reply_markup=get_subscription_keyboard(sub.get("tier", "free"))
     )
     await callback.answer()
@@ -6615,7 +6653,7 @@ async def ai_generator_start(callback: CallbackQuery, state: FSMContext):
         f"{emoji('AI')} <b>AI Генератор текста</b>\n\n"
         f"{emoji('INFO')} Шаг 1 из 2. Выбери модель для генерации. "
         f"На шаге 2 опишешь задачу — бот пришлёт "
-        f"<b>3 разных варианта</b> готового текста.\n\n"
+        f"<b>3 раз��ых варианта</b> готового текста.\n\n"
         f"По умолчанию: <code>{escape(label)}</code>"
     )
     await callback.message.edit_text(
@@ -7884,7 +7922,7 @@ async def analyze_risk_handler(callback: CallbackQuery):
     flood = result.get('flood') or {}
     source = result.get('source') or 'heuristic'
     src_label = (
-        "LLM-эксперт" if source == 'llm' else "локальная эвристика "
+        "LLM-эксперт" if source == 'llm' else "локальная ��вристика "
         "(LLM недоступна)"
     )
     total = stats.get('total', 0)
@@ -12244,7 +12282,7 @@ async def account_ai_responder_worker(account_id: int, user_id: int):
                         f"acct_ar: не удалось отправить ответ: {ex}"
                     )
 
-                # 7) Лог аккаунта: что отправили
+                # 7) Лог аккаунт��: что отправили
                 if sent_ok:
                     try:
                         await add_account_log(
