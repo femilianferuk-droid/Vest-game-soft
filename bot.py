@@ -2129,7 +2129,7 @@ WARMING_PLAN_SYSTEM_PROMPT = """Ты — эксперт по безопасно�
 
 
 # --- LLM: системный промпт для анализа риска бана аккаунта ---
-# Используется отдельной фичей «Анализ логов аккаунта (оценка риска бана)».
+# Используется отдельной фич��й «Анализ логов аккаунта (оценка риска бана)».
 # В отличие от копирайтерского промта — здесь модель возвращает связный
 # текст на русском, а не JSON-варианты.
 LLM_SECURITY_SYSTEM_PROMPT = (
@@ -4196,7 +4196,7 @@ async def execute_delete_messages(
 # Адаптивная задержка перед отправкой сообщения.
 # Снижает риск бана на ~30-50% за счёт:
 #   1) времени суток (ночью/пик вечером — медленнее)
-#   2) частоты аккаунта в конкретном чате (если только что писал — пауза)
+#   2) частоты аккаунта в конкретном чате (если только что писал — ��ауза)
 #   3) flood-wait истории аккаунта (если недавно ловили флуд — сильно медленнее)
 # Плюс всегда добавляется случайный джиттер ±15%, чтобы поведение
 # не выглядело роботизированным.
@@ -5903,8 +5903,19 @@ def get_chat_selection_keyboard(
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user = message.from_user
-    await register_user(user.id, user.username, user.first_name)
-    limits = await format_limits_text(user.id)
+    # Регистрация пользователя — критична. Если упадёт, всё равно
+    # пробуем показать меню, но логируем реальную причину.
+    try:
+        await register_user(user.id, user.username, user.first_name)
+    except Exception as ex:
+        logger.error(f"register_user failed for {user.id}: {ex}")
+    # Блок лимитов — косметический. Его сбой НЕ должен мешать
+    # новому пользователю получить приветствие и меню.
+    try:
+        limits = await format_limits_text(user.id)
+    except Exception as ex:
+        logger.error(f"format_limits_text failed for {user.id}: {ex}")
+        limits = ""
     welcome_text = (
         f"{emoji('SMILE')} <b>Добро пожаловать в Vest Game Soft!</b>\n\n"
         f"{emoji('BOT')} Я помогу вам управлять аккаунтами и делать рассылки.\n\n"
@@ -6520,11 +6531,23 @@ async def format_limits_text(user_id: int) -> str:
     if await is_pro(user_id):
         return f"{emoji('STAR')} <b>Лимиты:</b> Pro — без ограничений"
 
-    ai_used = await count_ai_requests_today(user_id)
+    # Счётчики использования — не критичны. Если БД недоступна или
+    # какой-то таблицы нет, показываем нули вместо падения обработчика.
+    try:
+        ai_used = await count_ai_requests_today(user_id)
+    except Exception as ex:
+        logger.error(f"count_ai_requests_today failed for {user_id}: {ex}")
+        ai_used = 0
     ai_limit = 1
     ai_bar = "█" * ai_used + "░" * max(0, ai_limit - ai_used)
 
-    broadcast_seconds = await get_user_broadcast_seconds_this_week(user_id)
+    try:
+        broadcast_seconds = await get_user_broadcast_seconds_this_week(user_id)
+    except Exception as ex:
+        logger.error(
+            f"get_user_broadcast_seconds_this_week failed for {user_id}: {ex}"
+        )
+        broadcast_seconds = 0.0
     broadcast_used_h = broadcast_seconds / 3600.0
     broadcast_limit_h = FREE_BROADCAST_LIMIT_HOURS
     bar_filled = min(round(broadcast_used_h), broadcast_limit_h)
@@ -6982,7 +7005,7 @@ async def ai_generator_prompt(message: Message, state: FSMContext):
             f"{emoji('SPARK')} <b>Вариант {i}.</b> {escape(title)}\n"
             f"{emoji('INFO')} Длина: {len(body)} символов\n\n"
         )
-        # первая часть — с заголовком
+        # первая часть — с заголовк��м
         first_chunk = header + body[: max(0, 4000 - len(header))]
         await message.answer(first_chunk)
         rest = body[max(0, 4000 - len(header)):]
@@ -7365,7 +7388,7 @@ async def ai_generator_history(callback: CallbackQuery, state: FSMContext):
     if not requests:
         await callback.message.edit_text(
             f"{emoji('INFO')} <b>История пуста.</b>\n\n"
-            f"Сгенерируйте первый текст — он сохранится автоматически.",
+            f"Сгенерируйте первый текст ��� он сохранится автоматически.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(
                     text="Создать запрос",
@@ -10140,7 +10163,7 @@ async def show_dm_broadcast_detail(callback: CallbackQuery, dm_id: int):
         f"{emoji('GEAR')} Статус: {bc['status']}\n"
         f"{emoji('STATS')} Прогресс: {progress}\n"
         f"{emoji('CLOCK')} Задержка: {bc['delay']} сек\n"
-        f"{emoji('PEOPLE')} Получателей: {len(bc.get('usernames', []))}\n"
+        f"{emoji('PEOPLE')} П��лучателей: {len(bc.get('usernames', []))}\n"
         f"{emoji('CALENDAR')} Создана: "
         f"{bc['created_at'].astimezone(MSK_TZ).strftime('%d.%m.%Y %H:%M')}"
     )
