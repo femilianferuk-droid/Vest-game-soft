@@ -728,6 +728,14 @@ async def init_db():
             )
         except Exception:
             pass
+        # СБП (Platega) — ID последней транзакции (UUID). Отдельно от Crypto Pay.
+        try:
+            await conn.execute(
+                'ALTER TABLE subscriptions '
+                'ADD COLUMN IF NOT EXISTS last_platega_id TEXT'
+            )
+        except Exception:
+            pass
 
         # ===== Per-account AI-автоответчик (account_ai_responder) =====
         # Живёт на добавленном Telegram-аккаунте, а не в самом боте.
@@ -2291,7 +2299,7 @@ async def call_llm_api_plain(
         raise RuntimeError(f"LLM API вернул статус {e.status_code}") from e
     except anthropic.APIError as e:
         logger.exception("LLM API (plain) anthropic error")
-        raise RuntimeError(f"LLM API ошибка: {e}") from e
+        raise RuntimeError(f"LLM API оши��ка: {e}") from e
 
     # Собираем все text-блоки; если ес��ь thinking — отдадим его как fallback
     # (на случай, если модель отдала только рассуждения).
@@ -3219,7 +3227,7 @@ def _actions_count_for_now(
 
 
 def _warming_random_cooldown() -> int:
-    """Случайная пауза между волнами с учётом времени суток."""
+    """Случайная пауза между волнами с учётом времени с��ток."""
     base = random.randint(
         WARMING_DEFAULT_COOLDOWN_MIN, WARMING_DEFAULT_COOLDOWN_MAX
     )
@@ -3874,7 +3882,7 @@ async def execute_dm_broadcast_db(
             total, dm_id
         )
 
-    # Список вариантов сообщений. Если передан message_texts (новый
+    # Список вариантов соо��щений. Если передан message_texts (новый
     # формат с рандомной ротацией) — используем его, иначе собираем
     # один вариант из message_text / media_paths.
     message_variants = _normalize_message_variants(
@@ -4368,19 +4376,21 @@ async def get_subscription(user_id: int) -> Dict[str, Any]:
 async def set_subscription(
     user_id: int, tier: str, expires_at: Optional[datetime] = None,
     invoice_id: Optional[int] = None, invoice_payload: Optional[str] = None,
+    platega_id: Optional[str] = None,
 ) -> None:
     async with db_pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO subscriptions "
             "(user_id, tier, expires_at, last_invoice_id, last_invoice_payload, "
-            " updated_at) "
-            "VALUES ($1, $2, $3, $4, $5, NOW()) "
+            " last_platega_id, updated_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, NOW()) "
             "ON CONFLICT (user_id) DO UPDATE SET "
             "tier = EXCLUDED.tier, expires_at = EXCLUDED.expires_at, "
             "last_invoice_id = EXCLUDED.last_invoice_id, "
             "last_invoice_payload = EXCLUDED.last_invoice_payload, "
+            "last_platega_id = EXCLUDED.last_platega_id, "
             "updated_at = NOW()",
-            user_id, tier, expires_at, invoice_id, invoice_payload
+            user_id, tier, expires_at, invoice_id, invoice_payload, platega_id
         )
 
 
@@ -4502,6 +4512,80 @@ async def cryptopay_create_invoice(
 async def cryptopay_get_invoices(invoice_ids: str) -> Dict[str, Any]:
     """Запросить статус инвойсов. invoice_ids — comma-separated string."""
     return await _cryptopay_request("getInvoices", {"invoice_ids": invoice_ids})
+
+
+# ------------------------------------------------------------
+# СБП (Platega) — альтернативный способ оплаты Pro-подписки
+# ------------------------------------------------------------
+PLATEGA_API = "https://app.platega.io"
+# Данные магазина Platega прописаны в открытом виде по требованию заказчика.
+PLATEGA_MERCHANT_ID = "39cd4a01-a435-4c17-bff2-19519d043d6b"
+# ВНИМАНИЕ: API-ключ пришёл в замаскированном виде — замените на реальный секрет.
+PLATEGA_SECRET = "PASTE_YOUR_PLATEGA_API_KEY_HERE"
+# СБП (QR-код) + Sberpay.
+PLATEGA_PAYMENT_METHOD_SBP = 2
+# Pro-подписка по СБП: 40₽/мес.
+PRO_PRICE_RUB = 40
+
+
+def _platega_headers() -> Dict[str, str]:
+    return {
+        "X-MerchantId": PLATEGA_MERCHANT_ID,
+        "X-Secret": PLATEGA_SECRET,
+        "Content-Type": "application/json",
+    }
+
+
+async def platega_create_transaction(
+    user_id: int, amount: int = PRO_PRICE_RUB, payload: str = "pro_30d"
+) -> Dict[str, Any]:
+    """Создаёт СБП-транзакцию в Platega. Возвращает {ok, result} либо {ok:false, error}."""
+    try:
+        bot_me = await bot.get_me()
+        return_url = f"https://t.me/{bot_me.username}"
+    except Exception:
+        return_url = "https://t.me"
+    body = {
+        "paymentMethod": PLATEGA_PAYMENT_METHOD_SBP,
+        "paymentDetails": {"amount": int(amount), "currency": "RUB"},
+        "description": "Vest Game Soft — Pro подписка (30 дней)",
+        "return": return_url,
+        "failedUrl": return_url,
+        "payload": f"{payload}:{user_id}",
+        "metadata": {"userId": str(user_id), "userName": f"tg_{user_id}"},
+    }
+    url = f"{PLATEGA_API}/transaction/process"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url, json=body, headers=_platega_headers(),
+                timeout=aiohttp.ClientTimeout(total=20)
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status == 200 and isinstance(data, dict) and data.get("transactionId"):
+                    return {"ok": True, "result": data}
+                return {"ok": False, "error": data}
+    except Exception as ex:
+        logger.error(f"Platega create failed: {ex}")
+        return {"ok": False, "error": str(ex)}
+
+
+async def platega_get_transaction(transaction_id: str) -> Dict[str, Any]:
+    """Проверяет статус СБП-транзакции в Platega."""
+    url = f"{PLATEGA_API}/transaction/{transaction_id}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, headers=_platega_headers(),
+                timeout=aiohttp.ClientTimeout(total=20)
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status == 200 and isinstance(data, dict):
+                    return {"ok": True, "result": data}
+                return {"ok": False, "error": data}
+    except Exception as ex:
+        logger.error(f"Platega status failed: {ex}")
+        return {"ok": False, "error": str(ex)}
 
 
 # --- Очередь задач Mini App ---
@@ -6481,7 +6565,7 @@ def _format_sub_text_sync(sub: Dict[str, Any], limits_text: str = "") -> str:
         f"  {emoji('CHECK')} Приоритетная поддержка\n"
         f"  {emoji('CHECK')} Ранний доступ к новым функциям\n"
         f"  {emoji('CHECK')} Smart Delay Engine в усиленном режиме\n\n"
-        f"Оплата через @CryptoBot (USDT, 0.6$)."
+        f"Оплата: СБП ({PRO_PRICE_RUB}₽) или @CryptoBot (USDT, 0.6$)."
         f"{limits_block}"
     )
 
@@ -6510,6 +6594,44 @@ async def noop_handler(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "buy_pro")
 async def buy_pro(callback: CallbackQuery):
+    """Экран выбора способа оплаты Pro-подписки."""
+    await callback.answer()
+    sub = await get_subscription(callback.from_user.id)
+    if sub.get("tier") == "pro":
+        await my_subscription(callback)
+        return
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text=f"СБП — {PRO_PRICE_RUB}₽ / месяц",
+        callback_data="buy_pro_sbp",
+        style='primary',
+        icon_custom_emoji_id=get_icon("MONEY_SEND")
+    ))
+    builder.row(InlineKeyboardButton(
+        text=f"Crypto Pay — {PRO_PRICE_LABEL}",
+        callback_data="buy_pro_crypto",
+        style='default',
+        icon_custom_emoji_id=get_icon("MONEY_SEND")
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Назад",
+        callback_data="my_subscription",
+        style='default',
+        icon_custom_emoji_id=get_icon("BACK")
+    ))
+    await callback.message.edit_text(
+        f"{emoji('MONEY_SEND')} <b>Оплата Pro-подписки</b>\n\n"
+        f"Тариф: <b>Pro</b> ({PRO_PRICE_LABEL})\n\n"
+        f"Выберите удобный способ оплаты:\n"
+        f"  {emoji('CHECK')} <b>СБП</b> — оплата по QR-коду / Sberpay (₽)\n"
+        f"  {emoji('CHECK')} <b>Crypto Pay</b> — оплата в USDT через @CryptoBot",
+        reply_markup=builder.as_markup()
+    )
+
+
+@dp.callback_query(F.data == "buy_pro_crypto")
+async def buy_pro_crypto(callback: CallbackQuery):
     await callback.answer()
     sub = await get_subscription(callback.from_user.id)
     if sub.get("tier") == "pro":
@@ -6634,6 +6756,117 @@ async def check_pro_payment(callback: CallbackQuery):
             f"Если возникла проблема — напишите в поддержку: {SUPPORT_USERNAME}",
             reply_markup=get_subscription_keyboard(sub.get("tier", "free"))
         )
+
+# --- СБП (Platega) ---
+@dp.callback_query(F.data == "buy_pro_sbp")
+async def buy_pro_sbp(callback: CallbackQuery):
+    await callback.answer()
+    sub = await get_subscription(callback.from_user.id)
+    if sub.get("tier") == "pro":
+        await my_subscription(callback)
+        return
+
+    await callback.message.edit_text(
+        f"{emoji('CLOCK')} Создаю счёт СБП...",
+        reply_markup=None
+    )
+    result = await platega_create_transaction(callback.from_user.id)
+    if not result.get("ok"):
+        await callback.message.edit_text(
+            f"{emoji('CROSS')} Не удалось создать счёт СБП.\n"
+            f"Попробуйте позже или напишите в поддержку: {SUPPORT_USERNAME}\n\n"
+            f"<code>{escape(str(result.get('error')))}</code>",
+            reply_markup=get_subscription_keyboard("free")
+        )
+        return
+
+    tx = result["result"]
+    transaction_id = tx.get("transactionId")
+    pay_url = tx.get("redirect")
+    # Сохраняем ID транзакции, чтобы потом проверять оплату.
+    await set_subscription(
+        callback.from_user.id, "free", None,
+        platega_id=transaction_id
+    )
+
+    builder = InlineKeyboardBuilder()
+    if pay_url:
+        builder.row(InlineKeyboardButton(
+            text="Оплатить по СБП",
+            url=pay_url,
+            style='primary',
+            icon_custom_emoji_id=get_icon("MONEY_SEND")
+        ))
+    builder.row(InlineKeyboardButton(
+        text="Я оплатил — проверить",
+        callback_data="check_sbp_payment",
+        style='success',
+        icon_custom_emoji_id=get_icon("CHECK")
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Назад",
+        callback_data="my_subscription",
+        style='default',
+        icon_custom_emoji_id=get_icon("BACK")
+    ))
+    await callback.message.edit_text(
+        f"{emoji('MONEY_SEND')} <b>Счёт на оплату Pro (СБП)</b>\n\n"
+        f"Тариф: <b>Pro</b> ({PRO_PRICE_LABEL})\n"
+        f"Сумма: <b>{PRO_PRICE_RUB} ₽</b>\n"
+        f"🆔 ID транзакции: <code>{escape(str(transaction_id))}</code>\n\n"
+        f"{emoji('INFO')} Нажмите кнопку ниже, оплатите через СБП (QR-код / Sberpay), "
+        f"затем вернитесь сюда и нажмите «Я оплатил — проверить».",
+        reply_markup=builder.as_markup()
+    )
+
+
+@dp.callback_query(F.data == "check_sbp_payment")
+async def check_sbp_payment(callback: CallbackQuery):
+    await callback.answer()
+    sub = await get_subscription(callback.from_user.id)
+    transaction_id = sub.get("last_platega_id")
+    if not transaction_id:
+        await callback.message.edit_text(
+            f"{emoji('INFO')} У вас нет активного счёта СБП. Нажмите «Купить Pro».",
+            reply_markup=get_subscription_keyboard(sub.get("tier", "free"))
+        )
+        return
+
+    result = await platega_get_transaction(str(transaction_id))
+    if not result.get("ok") or not result.get("result"):
+        await callback.message.edit_text(
+            f"{emoji('CROSS')} Не удалось проверить оплату. Попробуйте позже.\n\n"
+            f"<code>{escape(str(result.get('error')))}</code>",
+            reply_markup=get_subscription_keyboard(sub.get("tier", "free"))
+        )
+        return
+
+    status = (result["result"].get("status") or "").upper()
+    if status == "CONFIRMED":
+        expires = datetime.now(MSK_TZ).replace(tzinfo=None) + timedelta(days=PRO_DURATION_DAYS)
+        await set_subscription(
+            callback.from_user.id, "pro", expires,
+            platega_id=transaction_id
+        )
+        new_sub = await get_subscription(callback.from_user.id)
+        await callback.message.edit_text(
+            f"{emoji('FIRE')} <b>Оплата получена!</b>\n\n"
+            + _format_sub_text(new_sub),
+            reply_markup=get_subscription_keyboard("pro")
+        )
+    elif status == "PENDING":
+        await callback.message.edit_text(
+            f"{emoji('CLOCK')} Счёт ещё не оплачен.\n"
+            f"Оплатите по СБП и нажмите «Проверить» снова.",
+            reply_markup=get_subscription_keyboard(sub.get("tier", "free"))
+        )
+    else:
+        await callback.message.edit_text(
+            f"{emoji('INFO')} Статус счёта: <b>{escape(status)}</b>.\n"
+            f"Если возникла проблема — напишите в поддержку: {SUPPORT_USERNAME}",
+            reply_markup=get_subscription_keyboard(sub.get("tier", "free"))
+        )
+
 
 # --- AI Генератор текста (LLM) ---
 @dp.callback_query(F.data == "ai_generator")
@@ -6813,7 +7046,7 @@ async def ai_generator_pick(callback: CallbackQuery, state: FSMContext):
     ))
     builder.row(
         InlineKeyboardButton(
-            text="Заново",
+            text="Зано��о",
             callback_data="llm_regen",
             style='default',
             icon_custom_emoji_id=get_icon("REFRESH")
