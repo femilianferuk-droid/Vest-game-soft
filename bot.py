@@ -71,6 +71,17 @@ ADMIN_IDS = [7973988177]
 SUPPORT_USERNAME = "@VestGameSupport"
 MSK_TZ = pytz.timezone('Europe/Moscow')
 
+# --- Платежи: СБП (Platega) ---
+# Данные магазина Platega прописаны в открытом виде по требованию заказчика.
+PLATEGA_API = "https://app.platega.io"
+PLATEGA_MERCHANT_ID = "39cd4a01-a435-4c17-bff2-19519d043d6b"
+# ВНИМАНИЕ: API-ключ пришёл в замаскированном виде — замените на реальный секрет.
+PLATEGA_SECRET = "PASTE_YOUR_PLATEGA_API_KEY_HERE"
+# СБП (QR-код) + Sberpay.
+PLATEGA_PAYMENT_METHOD_SBP = 2
+# Pro-подписка по СБП: 40₽/мес.
+PRO_PRICE_RUB = 40
+
 # --- LLM (AI-генератор текста) ---
 # Официальный Anthropic Python SDK, направленный на Anthropic-совместимый
 # прокси SmartAPI (https://api.smartapi.shop). Клиент ходит в
@@ -769,7 +780,7 @@ async def register_user(user_id: int, username: str, first_name: str):
             user_id, username, first_name
         )
 
-# --- Логирование ---
+# --- ��огирование ---
 async def add_account_log(
     account_id: int, chat_name: str, chat_id: int, 
     direction: str, message_text: str = ""
@@ -2079,7 +2090,7 @@ WARMING_PLAN_SYSTEM_PROMPT = """Ты — эксперт по безопасно�
 Правила генерации:
   1. Интервалы между волнами (intervals) — В СЕКУНДАХ, в диапазоне 300..1800 (5..30 минут). Ночью интервалы длиннее, днём короче.
   2. distribution — сумма вероятностей примерно 1.0. Безопасные действия (read, view_stories) имеют больший вес.
-  3. saved_notes — МАССИВ из 8-12 КОРОТКИХ текстов на русском (как будто человек пишет самому себе). Каждый до 80 символов. БЕЗ спама, БЕЗ рекламы. Разнообразные: напоминалки, мысли, короткие заметки.
+  3. saved_notes — МАССИВ из 8-12 КОРОТКИХ текстов на р��сском (как будто человек пишет самому себе). Каждый до 80 символов. БЕЗ спама, БЕЗ рекламы. Разнообразные: напоминалки, мысли, короткие заметки.
   4. reaction_pool — 4-6 эмодзи из безопасного набора: «👍», «🔥», «❤️», «😂», «😢», «🙏».
   5. schedule — массив объектов {hour_offset, intensity, focus, actions_count_min, actions_count_max}. intensity ∈ {low, medium, high}. focus — короткая подсказка что делать (например «active_dialogs», «stories_only», «rest»).
   6. quiet_periods — массив строк вида «HH:MM-HH:MM» в МСК, когда активность минимальна (например ночь 00:00-07:00). Если время сейчас попадает в quiet_period — бот должен уйти в длинный сон.
@@ -3093,7 +3104,7 @@ WARMING_SAVED_NOTES = [
     "Напоминалка самому себе",
     "Скину сюда идею, чтобы не потерять",
     "Тест прогрева",
-    "Записал мысль, чтобы не забыть",
+    "Записал мысль, чтобы не забы��ь",
     "Позже разберусь",
 ]
 
@@ -4195,7 +4206,7 @@ SMART_DELAY_JITTER = 0.15    # ±15% джиттер
 
 
 def _time_of_day_multiplier() -> float:
-    """Множитель по часу МСК: ночью тормозим, днём норма, вечером осторожно."""
+    """Множит��ль по часу МСК: ночью тормозим, днём норма, вечером осторожно."""
     hour = datetime.now(MSK_TZ).hour
     if 0 <= hour < 7:        # ночь — Telegram-антиспам самый злой
         return 1.6
@@ -4516,18 +4527,8 @@ async def cryptopay_get_invoices(invoice_ids: str) -> Dict[str, Any]:
 
 # ------------------------------------------------------------
 # СБП (Platega) — альтернативный способ оплаты Pro-подписки
+# Конфигурация (merchant id / api key) вынесена в начало файла.
 # ------------------------------------------------------------
-PLATEGA_API = "https://app.platega.io"
-# Данные магазина Platega прописаны в открытом виде по требованию заказчика.
-PLATEGA_MERCHANT_ID = "39cd4a01-a435-4c17-bff2-19519d043d6b"
-# ВНИМАНИЕ: API-ключ пришёл в замаскированном виде — замените на реальный секрет.
-PLATEGA_SECRET = "PASTE_YOUR_PLATEGA_API_KEY_HERE"
-# СБП (QR-код) + Sberpay.
-PLATEGA_PAYMENT_METHOD_SBP = 2
-# Pro-подписка по СБП: 40₽/мес.
-PRO_PRICE_RUB = 40
-
-
 def _platega_headers() -> Dict[str, str]:
     return {
         "X-MerchantId": PLATEGA_MERCHANT_ID,
@@ -4986,7 +4987,7 @@ def get_proxies_keyboard(proxies: List[Dict]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for p in proxies:
         label = p.get('label') or f"{p['host']}:{p['port']}"
-        # маскируем пароль в подписи
+        # маскируем паро��ь в подписи
         masked = f"{p['proxy_type']} | {label}"
         builder.row(InlineKeyboardButton(
             text=f"{masked}",
@@ -5246,7 +5247,7 @@ def get_functions_keyboard() -> InlineKeyboardMarkup:
         icon_custom_emoji_id=get_icon("LIKE")
     ))
     builder.row(InlineKeyboardButton(
-        text="Удаление сообщений",
+        text="Удаление сообщ��ний",
         callback_data="delete_messages",
         style='primary',
         icon_custom_emoji_id=get_icon("SWEEP")
@@ -5656,7 +5657,7 @@ def get_account_actions_keyboard(
         icon_custom_emoji_id=get_icon("FIRE")
     ))
     builder.row(InlineKeyboardButton(
-        text="План прогрева (ИИ)",
+        text="План ��рогрева (ИИ)",
         callback_data=f"show_warming_plan_{account_id}",
         style='default',
         icon_custom_emoji_id=get_icon("CLIPBOARD")
@@ -6084,7 +6085,7 @@ async def script_select_account(
         "• <code>https://t.me/example_bot</code>\n"
         "• <code>https://t.me/example_bot?start=code</code>\n"
         "• <code>@example_bot</code>\n\n"
-        "После этого аккаунт отправит боту <code>/start</code> "
+        "После ��того аккаунт отправит боту <code>/start</code> "
         "и загрузит доступные кнопки.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
@@ -8107,7 +8108,7 @@ async def analyze_risk_handler(callback: CallbackQuery):
       1) Проверяем владельца.
       2) Тянем 50 последних логов + историю флудов.
       3) Зовём LLM в режиме «эксперт по безопасности Telegram».
-      4) Если LLM недоступна — отдаём эвристический отчёт.
+      4) Если LLM недоступна — отдаём эвристический отчё��.
     """
     if not await is_pro(callback.from_user.id):
         await callback.answer(
@@ -8549,7 +8550,7 @@ async def profile_edit_field(callback: CallbackQuery, state: FSMContext):
 
     new_state, prompt = prompts[field]
     await state.set_state(new_state)
-    # Запоминаем id сообщения с промптом, чтобы потом убрать его из чата,
+    # Запоминаем id сообщения с промптом, чтобы потом уб��ать его из чата,
     # когда пользователь пришлёт картинку/текст.
     await state.update_data(
         prompt_chat_id=callback.message.chat.id,
@@ -8944,7 +8945,7 @@ async def profile_edit_save(callback: CallbackQuery, state: FSMContext):
 
     except FloodWaitError as ex:
         await callback.message.edit_text(
-            f"{emoji('CLOCK')} Telegram просит подождать "
+            f"{emoji('CLOCK')} Telegram про��ит подождать "
             f"<b>{ex.seconds} сек</b> перед изменением профиля. "
             f"Попробуйте позже.",
             reply_markup=InlineKeyboardBuilder().row(InlineKeyboardButton(
@@ -9557,7 +9558,7 @@ async def process_count(message: Message, state: FSMContext):
         f"Можно прикрепить медиа (фото, видео, документы).",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
-                text="Назад",
+                text="Наза��",
                 callback_data="broadcast",
                 style='default',
                 icon_custom_emoji_id=get_icon("BACK")
@@ -11026,7 +11027,7 @@ async def show_responder(callback: CallbackQuery):
     ))
     
     text = (
-        f"{emoji('BELL')} <b>Автоответчик ID: {responder['id']}</b>\n\n"
+        f"{emoji('BELL')} <b>Автоответчи�� ID: {responder['id']}</b>\n\n"
         f"{emoji('EYE')} Статус: "
         f"{'Активен' if responder['is_active'] else 'Остановлен'}\n"
         f"{emoji('TAG')} Триггер: "
