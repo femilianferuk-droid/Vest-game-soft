@@ -76,7 +76,7 @@ MSK_TZ = pytz.timezone('Europe/Moscow')
 PLATEGA_API = "https://app.platega.io"
 PLATEGA_MERCHANT_ID = "39cd4a01-a435-4c17-bff2-19519d043d6b"
 # ВНИМАНИЕ: API-ключ пришёл в замаскированном виде — замените на реальный секрет.
-PLATEGA_SECRET = "PASTE_YOUR_PLATEGA_API_KEY_HERE"
+PLATEGA_SECRET = "sh7BhDGLhBnqJxECAGBGkSd68hZ9Xdaqdb1Wmu1SXMbIAR6alPk5F9AyV34VRCx2AChkMoNvTkTEJ1WJo9PFb4aPsCbcwZQRVsl1"
 # СБП (QR-код) + Sberpay.
 PLATEGA_PAYMENT_METHOD_SBP = 2
 # Pro-подписка по СБП: 40₽/мес.
