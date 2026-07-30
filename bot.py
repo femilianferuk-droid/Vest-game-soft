@@ -453,7 +453,26 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         ''')
-        
+
+        # Миграция: пер-аккаунтный «отпечаток устройства» (A3).
+        # Telethon-параметры device_model / system_version / app_version /
+        # lang_code / system_lang_code. Хранятся в БД, чтобы можно было
+        # в любой момент поменять и пересоздать Telethon-клиент.
+        for _col in (
+            'device_model TEXT',
+            'system_version TEXT',
+            'app_version TEXT',
+            'lang_code TEXT',
+            'system_lang_code TEXT',
+            'fingerprint_updated_at TIMESTAMP',
+        ):
+            try:
+                await conn.execute(
+                    f'ALTER TABLE accounts ADD COLUMN IF NOT EXISTS {_col}'
+                )
+            except Exception:
+                pass
+
         # Рассылки в чаты
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS broadcasts (
@@ -1342,8 +1361,25 @@ def _warming_plan_keyboard(plan_id: int, account_id: int) -> InlineKeyboardMarku
 
 
 async def create_telethon_client(
-    session_string: str, proxy: Optional[Dict] = None
+    session_string: str, proxy: Optional[Dict] = None,
+    fingerprint: Optional[Dict] = None
 ) -> TelegramClient:
+    # Собираем «отпечаток устройства» для Telethon-клиента. Если не
+    # задан — используем параметры по умолчанию, как делал Telegram
+    # Desktop (это давно «палится» антифрод-системой TG).
+    fp_kwargs: Dict[str, str] = {}
+    if fingerprint:
+        if fingerprint.get('device_model'):
+            fp_kwargs['device_model'] = fingerprint['device_model']
+        if fingerprint.get('system_version'):
+            fp_kwargs['system_version'] = fingerprint['system_version']
+        if fingerprint.get('app_version'):
+            fp_kwargs['app_version'] = fingerprint['app_version']
+        if fingerprint.get('lang_code'):
+            fp_kwargs['lang_code'] = fingerprint['lang_code']
+        if fingerprint.get('system_lang_code'):
+            fp_kwargs['system_lang_code'] = fingerprint['system_lang_code']
+
     if proxy:
         # Telethon ждёт кортеж (type, addr, port, rdns, username, password)
         # type: 2 = SOCKS5, 1 = SOCKS4, 3 = HTTP
@@ -1358,9 +1394,12 @@ async def create_telethon_client(
             proxy.get('password') or None,
         )
         return TelegramClient(
-            StringSession(session_string), API_ID, API_HASH, proxy=proxy_arg
+            StringSession(session_string), API_ID, API_HASH,
+            proxy=proxy_arg, **fp_kwargs
         )
-    return TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    return TelegramClient(
+        StringSession(session_string), API_ID, API_HASH, **fp_kwargs
+    )
 
 # --- Прокси: CRUD ---
 def parse_proxy_string(text: str) -> Optional[Dict]:
@@ -1478,9 +1517,17 @@ async def get_client_for_account(account_id: int) -> Optional[TelegramClient]:
     if account.get('proxy_id'):
         proxy = await get_proxy(account['proxy_id'])
 
+    # Подтягиваем пер-аккаунтный «отпечаток устройства» (A3).
+    # Если в БД его нет — авто-генерим и сохраняем, чтобы
+    # последующие подключения были консистентны.
+    fingerprint = await get_account_fingerprint(account_id)
+    if not fingerprint:
+        fingerprint = await regenerate_account_fingerprint(account_id)
+
     try:
         client = await create_telethon_client(
-            account['session_string'], proxy=proxy
+            account['session_string'], proxy=proxy,
+            fingerprint=fingerprint
         )
         await client.connect()
 
@@ -1493,6 +1540,622 @@ async def get_client_for_account(account_id: int) -> Optional[TelegramClient]:
     except Exception as ex:
         logger.error(f"Error connecting client: {ex}")
         return None
+
+
+# =====================================================================
+# A3 — Пер-аккаунтный «отпечаток устройства» (device fingerprint)
+# =====================================================================
+# Telethon позволяет задать пять полей, по которым Telegram-сервер
+# различает клиентов: device_model, system_version, app_version,
+# lang_code, system_lang_code. Если у всех аккаунтов они одинаковые
+# (а у desktop-клиента по умолчанию одинаковые) — это легко
+# детектируется антифродом и аккаунты банят пачкой.
+#
+# Поведение:
+#   • При первом подключении аккаунта отпечаток авто-генерируется
+#     из пула реалистичных устройств и сохраняется в БД.
+#   • Пользователь может в любой момент сгенерировать новый
+#     отпечаток через UI (кнопка «Отпечаток устройства»).
+#   • После смены отпечатка активный Telethon-клиент сбрасывается
+#     из active_clients, чтобы при следующем подключении
+#     использовались новые параметры.
+# =====================================================================
+
+# Реалистичный пул устройств. Берём распространённые модели,
+# актуальные версии ОС и популярные связки языков. Не включаем
+# экзотику, чтобы не вызывать лишних подозрений.
+FINGERPRINT_DEVICE_POOL: List[Dict[str, str]] = [
+    # --- iOS (iPhone) ---
+    {
+        "device_model": "iPhone 14 Pro",
+        "system_version": "iOS 16.5.1",
+        "app_version": "8.9.3",
+        "lang_code": "ru",
+        "system_lang_code": "ru-RU",
+    },
+    {
+        "device_model": "iPhone 14",
+        "system_version": "iOS 16.4.1",
+        "app_version": "8.8.4",
+        "lang_code": "ru",
+        "system_lang_code": "ru-RU",
+    },
+    {
+        "device_model": "iPhone 13 Pro",
+        "system_version": "iOS 15.7.2",
+        "app_version": "8.7.4",
+        "lang_code": "en",
+        "system_lang_code": "en-US",
+    },
+    {
+        "device_model": "iPhone 12",
+        "system_version": "iOS 15.6",
+        "app_version": "8.6.3",
+        "lang_code": "ru",
+        "system_lang_code": "ru-RU",
+    },
+    {
+        "device_model": "iPhone 11",
+        "system_version": "iOS 14.8.1",
+        "app_version": "8.5.2",
+        "lang_code": "en",
+        "system_lang_code": "en-US",
+    },
+    # --- Android (Samsung) ---
+    {
+        "device_model": "Samsung Galaxy S22",
+        "system_version": "Android 13",
+        "app_version": "9.0.1",
+        "lang_code": "ru",
+        "system_lang_code": "ru-RU",
+    },
+    {
+        "device_model": "Samsung Galaxy S21",
+        "system_version": "Android 12",
+        "app_version": "8.9.2",
+        "lang_code": "en",
+        "system_lang_code": "en-US",
+    },
+    {
+        "device_model": "Samsung Galaxy A53",
+        "system_version": "Android 13",
+        "app_version": "9.1.3",
+        "lang_code": "ru",
+        "system_lang_code": "ru-RU",
+    },
+    {
+        "device_model": "Samsung Galaxy S20",
+        "system_version": "Android 11",
+        "app_version": "8.6.1",
+        "lang_code": "ru",
+        "system_lang_code": "ru-RU",
+    },
+    # --- Android (Xiaomi) ---
+    {
+        "device_model": "Xiaomi Redmi Note 11",
+        "system_version": "Android 12",
+        "app_version": "8.8.3",
+        "lang_code": "ru",
+        "system_lang_code": "ru-RU",
+    },
+    {
+        "device_model": "Xiaomi 13",
+        "system_version": "Android 13",
+        "app_version": "9.1.4",
+        "lang_code": "en",
+        "system_lang_code": "en-GB",
+    },
+    {
+        "device_model": "Xiaomi Mi 11",
+        "system_version": "Android 12",
+        "app_version": "8.7.5",
+        "lang_code": "ru",
+        "system_lang_code": "ru-RU",
+    },
+    # --- Android (другие) ---
+    {
+        "device_model": "Pixel 7",
+        "system_version": "Android 14",
+        "app_version": "9.2.3",
+        "lang_code": "en",
+        "system_lang_code": "en-US",
+    },
+    {
+        "device_model": "OnePlus 10 Pro",
+        "system_version": "Android 13",
+        "app_version": "9.0.2",
+        "lang_code": "en",
+        "system_lang_code": "en-US",
+    },
+    {
+        "device_model": "Huawei P50 Pro",
+        "system_version": "Android 12",
+        "app_version": "8.7.4",
+        "lang_code": "ru",
+        "system_lang_code": "ru-RU",
+    },
+]
+
+
+def generate_random_fingerprint() -> Dict[str, str]:
+    """Случайно выбирает реалистичный отпечаток устройства из пула.
+
+    Возвращает dict со всеми пятью Telethon-параметрами. Никаких
+    внешних вызовов и БД — чистая функция, удобно для тестов.
+    """
+    return dict(random.choice(FINGERPRINT_DEVICE_POOL))
+
+
+def format_fingerprint_text(fingerprint: Optional[Dict[str, Any]]) -> str:
+    """Красиво отформатировать отпечаток для вывода в боте."""
+    if not fingerprint:
+        return (
+            f"{emoji('WARNING')} Отпечаток не задан — "
+            f"будет сгенерирован автоматически."
+        )
+    updated = fingerprint.get('fingerprint_updated_at')
+    updated_str = "—"
+    if updated:
+        try:
+            updated_str = updated.strftime('%d.%m.%Y %H:%M')
+        except Exception:
+            updated_str = "—"
+
+    return (
+        f"{emoji('PHONE')} <b>Модель:</b> "
+        f"<code>{fingerprint.get('device_model') or '—'}</code>\n"
+        f"{emoji('STATS')} <b>ОС:</b> "
+        f"<code>{fingerprint.get('system_version') or '—'}</code>\n"
+        f"{emoji('AI')} <b>App:</b> "
+        f"<code>{fingerprint.get('app_version') or '—'}</code>\n"
+        f"{emoji('GLOBE')} <b>Язык приложения:</b> "
+        f"<code>{fingerprint.get('lang_code') or '—'}</code>\n"
+        f"{emoji('GLOBE')} <b>Язык системы:</b> "
+        f"<code>{fingerprint.get('system_lang_code') or '—'}</code>\n"
+        f"{emoji('CLOCK')} <b>Обновлён:</b> {updated_str}"
+    )
+
+
+async def get_account_fingerprint(account_id: int) -> Optional[Dict[str, Any]]:
+    """Достать сохранённый отпечаток из БД. None, если не задан."""
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                '''SELECT device_model, system_version, app_version,
+                          lang_code, system_lang_code,
+                          fingerprint_updated_at
+                   FROM accounts WHERE id = $1''',
+                account_id
+            )
+            if not row:
+                return None
+            data = dict(row)
+            # Если все пять Telethon-полей пустые — считаем, что
+            # отпечаток не задан (неактивный аккаунт или legacy).
+            if not any([
+                data.get('device_model'),
+                data.get('system_version'),
+                data.get('app_version'),
+            ]):
+                return None
+            return data
+    except Exception as ex:
+        logger.error(f"get_account_fingerprint failed: {ex}")
+        return None
+
+
+async def set_account_fingerprint(
+    account_id: int, fingerprint: Dict[str, str]
+) -> bool:
+    """Записать конкретный отпечаток в БД."""
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                '''UPDATE accounts SET
+                    device_model = $1,
+                    system_version = $2,
+                    app_version = $3,
+                    lang_code = $4,
+                    system_lang_code = $5,
+                    fingerprint_updated_at = NOW()
+                   WHERE id = $6''',
+                fingerprint.get('device_model'),
+                fingerprint.get('system_version'),
+                fingerprint.get('app_version'),
+                fingerprint.get('lang_code'),
+                fingerprint.get('system_lang_code'),
+                account_id,
+            )
+        return True
+    except Exception as ex:
+        logger.error(f"set_account_fingerprint failed: {ex}")
+        return False
+
+
+async def regenerate_account_fingerprint(
+    account_id: int
+) -> Optional[Dict[str, str]]:
+    """Сгенерировать новый случайный отпечаток и сразу сохранить."""
+    fp = generate_random_fingerprint()
+    ok = await set_account_fingerprint(account_id, fp)
+    if not ok:
+        return None
+    # Сбрасываем активный Telethon-клиент, чтобы при следующем
+    # подключении использовались новые параметры.
+    try:
+        if account_id in active_clients:
+            client = active_clients.pop(account_id)
+            try:
+                if client.is_connected():
+                    await client.disconnect()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return fp
+
+
+def get_fingerprint_keyboard(account_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура меню отпечатка."""
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text="Сгенерировать новый",
+        callback_data=f"fingerprint_regen_{account_id}",
+        style='primary',
+        icon_custom_emoji_id=get_icon("REPEAT")
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Назад",
+        callback_data=f"manage_account_{account_id}",
+        style='default',
+        icon_custom_emoji_id=get_icon("BACK")
+    ))
+    return builder.as_markup()
+
+
+def get_fingerprint_regen_keyboard(
+    account_id: int
+) -> InlineKeyboardMarkup:
+    """Клавиатура подтверждения перегенерации."""
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text="Да, сменить отпечаток",
+        callback_data=f"fingerprint_regen_go_{account_id}",
+        style='danger',
+        icon_custom_emoji_id=get_icon("REPEAT")
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Отмена",
+        callback_data=f"fingerprint_menu_{account_id}",
+        style='default',
+        icon_custom_emoji_id=get_icon("BACK")
+    ))
+    return builder.as_markup()
+
+
+# =====================================================================
+# B1 — Дашборд здоровья аккаунта
+# =====================================================================
+# На одной карточке показываем: 14-дневный график активности,
+# последние flood-wait-ы, сколько отправлено/получено сообщений,
+# риск-скор. Источники: account_logs, flood_wait_history, accounts.
+# =====================================================================
+
+
+async def get_account_health(
+    account_id: int
+) -> Optional[Dict[str, Any]]:
+    """Собрать данные для дашборда. None, если аккаунт не найден."""
+    try:
+        async with db_pool.acquire() as conn:
+            account = await conn.fetchrow(
+                '''SELECT id, phone, is_active, created_at,
+                          warming_enabled, warming_cycles
+                   FROM accounts WHERE id = $1''',
+                account_id
+            )
+            if not account:
+                return None
+
+            # 14-дневный разрез активности.
+            daily = await conn.fetch(
+                '''SELECT DATE(created_at AT TIME ZONE 'Europe/Moscow') AS day,
+                          COUNT(*) AS cnt
+                   FROM account_logs
+                   WHERE account_id = $1
+                     AND created_at > NOW() - INTERVAL '14 days'
+                   GROUP BY day
+                   ORDER BY day''',
+                account_id
+            )
+            daily_map = {r['day']: r['cnt'] for r in daily}
+
+            # Все 14 дней подряд, даже пустые.
+            today = datetime.now(MSK_TZ).date()
+            daily_series = []
+            for i in range(13, -1, -1):
+                d = today - timedelta(days=i)
+                daily_series.append({
+                    'day': d,
+                    'cnt': daily_map.get(d, 0),
+                })
+
+            # Flood-wait-ы за 7 дней.
+            floods = await conn.fetch(
+                '''SELECT seconds, occurred_at,
+                          COALESCE(chat_id, 0) AS chat_id
+                   FROM flood_wait_history
+                   WHERE account_id = $1
+                     AND occurred_at > NOW() - INTERVAL '7 days'
+                   ORDER BY occurred_at DESC
+                   LIMIT 10''',
+                account_id
+            )
+
+            # Суммарная статистика сообщений.
+            sent_total = await conn.fetchval(
+                '''SELECT COUNT(*) FROM account_logs
+                   WHERE account_id = $1 AND direction = 'outgoing' ''',
+                account_id
+            )
+            recv_total = await conn.fetchval(
+                '''SELECT COUNT(*) FROM account_logs
+                   WHERE account_id = $1 AND direction = 'incoming' ''',
+                account_id
+            )
+            sent_today = await conn.fetchval(
+                '''SELECT COUNT(*) FROM account_logs
+                   WHERE account_id = $1 AND direction = 'outgoing'
+                     AND created_at > NOW() - INTERVAL '24 hours' ''',
+                account_id
+            )
+            sent_week = await conn.fetchval(
+                '''SELECT COUNT(*) FROM account_logs
+                   WHERE account_id = $1 AND direction = 'outgoing'
+                     AND created_at > NOW() - INTERVAL '7 days' ''',
+                account_id
+            )
+
+            # Суммарный «вес» flood-wait-ов за 7 дней.
+            flood_sum_week = await conn.fetchval(
+                '''SELECT COALESCE(SUM(seconds), 0) FROM flood_wait_history
+                   WHERE account_id = $1
+                     AND occurred_at > NOW() - INTERVAL '7 days' ''',
+                account_id
+            )
+
+        # Простой риск-скор: чем больше flood-wait-ов, тем хуже.
+        # 0  — всё чисто, 100 — вчера забанили бы.
+        flood_count = len(floods)
+        if flood_count == 0:
+            risk_score = 0
+        elif flood_count < 3:
+            risk_score = min(20 + flood_sum_week // 60, 40)
+        elif flood_count < 6:
+            risk_score = 40 + min(flood_sum_week // 30, 30)
+        else:
+            risk_score = 70 + min(flood_sum_week // 20, 30)
+        risk_score = min(risk_score, 100)
+
+        return {
+            'account': dict(account),
+            'daily': daily_series,
+            'floods': [dict(f) for f in floods],
+            'flood_count_week': flood_count,
+            'flood_sum_week': flood_sum_week,
+            'sent_total': sent_total or 0,
+            'recv_total': recv_total or 0,
+            'sent_today': sent_today or 0,
+            'sent_week': sent_week or 0,
+            'risk_score': risk_score,
+        }
+    except Exception as ex:
+        logger.error(f"get_account_health failed: {ex}")
+        return None
+
+
+def _risk_label(score: int) -> str:
+    if score < 20:
+        return "🟢 Низкий"
+    if score < 50:
+        return "🟡 Умеренный"
+    if score < 75:
+        return "🟠 Повышенный"
+    return "🔴 Высокий"
+
+
+def _format_activity_bars(daily: List[Dict[str, Any]]) -> str:
+    """ASCII-бар-чарт активности за 14 дней."""
+    if not daily:
+        return "<i>недостаточно данных</i>"
+    max_cnt = max((d['cnt'] for d in daily), default=0) or 1
+    lines = []
+    for d in daily:
+        bar_len = int(round((d['cnt'] / max_cnt) * 10)) if max_cnt else 0
+        bar = "▇" * bar_len + "·" * (10 - bar_len)
+        day_label = d['day'].strftime('%d.%m')
+        lines.append(f"<code>{day_label}</code> {bar} {d['cnt']}")
+    return "\n".join(lines)
+
+
+def format_health_dashboard(health: Dict[str, Any]) -> str:
+    """Собрать финальный текст дашборда."""
+    acc = health['account']
+    status = "Активен" if acc['is_active'] else "Неактивен"
+    created = acc['created_at'].strftime('%d.%m.%Y')
+    warming = "Вкл" if acc.get('warming_enabled') else "Выкл"
+    cycles = acc.get('warming_cycles') or 0
+
+    floods_text = "—"
+    if health['floods']:
+        items = []
+        for f in health['floods'][:5]:
+            ts = f['occurred_at'].strftime('%d.%m %H:%M')
+            items.append(f"  • {ts} — {f['seconds']}с")
+        floods_text = "\n".join(items)
+    elif health['flood_count_week'] == 0:
+        floods_text = f"{emoji('CHECK')} за 7 дней — чисто"
+
+    bar_chart = _format_activity_bars(health['daily'])
+
+    text = (
+        f"{emoji('STATS')} <b>Дашборд здоровья аккаунта</b>\n\n"
+        f"{emoji('PHONE')} Телефон: <code>{acc['phone']}</code>\n"
+        f"{emoji('EYE')} Статус: {status}\n"
+        f"{emoji('CLOCK')} Создан: {created}\n"
+        f"{emoji('FIRE')} Прогрев: {warming} (циклов: {cycles})\n\n"
+        f"{emoji('STATS')} <b>Риск-скор: {health['risk_score']}/100</b> — "
+        f"{_risk_label(health['risk_score'])}\n"
+        f"{emoji('WARNING')} FloodWait за 7 дней: "
+        f"<b>{health['flood_count_week']}</b> шт., "
+        f"суммарно <b>{health['flood_sum_week']}с</b>\n"
+        f"{floods_text}\n\n"
+        f"{emoji('CHART')} <b>Активность (14 дней):</b>\n"
+        f"{bar_chart}\n\n"
+        f"{emoji('OUTBOX')} Отправлено:\n"
+        f"  • сегодня: <b>{health['sent_today']}</b>\n"
+        f"  • за 7 дней: <b>{health['sent_week']}</b>\n"
+        f"  • всего: <b>{health['sent_total']}</b>\n"
+        f"{emoji('INBOX')} Получено всего: <b>{health['recv_total']}</b>"
+    )
+    return text
+
+
+def get_health_dashboard_keyboard(
+    account_id: int
+) -> InlineKeyboardMarkup:
+    """Клавиатура дашборда."""
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text="Обновить",
+        callback_data=f"account_dashboard_{account_id}",
+        style='primary',
+        icon_custom_emoji_id=get_icon("REPEAT")
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Назад",
+        callback_data=f"manage_account_{account_id}",
+        style='default',
+        icon_custom_emoji_id=get_icon("BACK")
+    ))
+    return builder.as_markup()
+
+
+# --- Хендлеры A3 и B1 ---
+
+@dp.callback_query(F.data.startswith("fingerprint_menu_"))
+async def fingerprint_menu(callback: CallbackQuery):
+    """Показать текущий отпечаток аккаунта."""
+    account_id = int(callback.data.split("_")[2])
+    account = await get_account(account_id)
+    if not account or account['user_id'] != callback.from_user.id:
+        await callback.answer("Аккаунт не найден", show_alert=True)
+        return
+    fingerprint = await get_account_fingerprint(account_id)
+    text = (
+        f"{emoji('PHONE')} <b>Отпечаток устройства</b>\n\n"
+        f"Это параметры, под которыми Telegram видит этот аккаунт. "
+        f"У разных аккаунтов должны быть разные — иначе антифрод "
+        f"свяжет их между собой.\n\n"
+        f"{format_fingerprint_text(fingerprint)}"
+    )
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=get_fingerprint_keyboard(account_id)
+        )
+    except Exception:
+        await callback.message.answer(
+            text,
+            reply_markup=get_fingerprint_keyboard(account_id)
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("fingerprint_regen_go_"))
+async def fingerprint_regen_confirm(callback: CallbackQuery):
+    """Собственно сгенерировать новый отпечаток.
+
+    ВАЖНО: зарегистрирован РАНЬШЕ базового fingerprint_regen_,
+    потому что fingerprint_regen_go_<id> тоже удовлетворяет
+    startswith("fingerprint_regen_"). В aiogram 3 первый
+    зарегистрированный подходящий хендлер забирает callback.
+    """
+    account_id = int(callback.data.split("_")[3])
+    account = await get_account(account_id)
+    if not account or account['user_id'] != callback.from_user.id:
+        await callback.answer("Аккаунт не найден", show_alert=True)
+        return
+    new_fp = await regenerate_account_fingerprint(account_id)
+    if not new_fp:
+        await callback.answer(
+            "Не удалось обновить отпечаток. Попробуй позже.",
+            show_alert=True
+        )
+        return
+    text = (
+        f"{emoji('CHECK')} <b>Готово! Новый отпечаток:</b>\n\n"
+        f"{format_fingerprint_text(await get_account_fingerprint(account_id))}"
+    )
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=get_fingerprint_keyboard(account_id)
+        )
+    except Exception:
+        pass
+    await callback.answer("Отпечаток обновлён")
+
+
+@dp.callback_query(F.data.startswith("fingerprint_regen_"))
+async def fingerprint_regen(callback: CallbackQuery):
+    """Запросить подтверждение перегенерации."""
+    account_id = int(callback.data.split("_")[2])
+    account = await get_account(account_id)
+    if not account or account['user_id'] != callback.from_user.id:
+        await callback.answer("Аккаунт не найден", show_alert=True)
+        return
+    text = (
+        f"{emoji('WARNING')} <b>Сменить отпечаток?</b>\n\n"
+        f"Будет выбран новый случайный отпечаток из пула. "
+        f"Активный Telethon-клиент сбросится, при следующем "
+        f"подключении аккаунт зайдёт с новыми параметрами.\n\n"
+        f"<i>Если сейчас запущены задачи (рассылки, прогрев, "
+        f"автоответчик) — они продолжат работу после переподключения.</i>"
+    )
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=get_fingerprint_regen_keyboard(account_id)
+        )
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("account_dashboard_"))
+async def account_dashboard(callback: CallbackQuery):
+    """Дашборд здоровья аккаунта (B1)."""
+    account_id = int(callback.data.split("_")[2])
+    account = await get_account(account_id)
+    if not account or account['user_id'] != callback.from_user.id:
+        await callback.answer("Аккаунт не найден", show_alert=True)
+        return
+    health = await get_account_health(account_id)
+    if not health:
+        await callback.answer(
+            "Не удалось собрать статистику.", show_alert=True
+        )
+        return
+    text = format_health_dashboard(health)
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=get_health_dashboard_keyboard(account_id)
+        )
+    except Exception:
+        pass
+    await callback.answer()
 
 
 # --- Сохранённые скрипты для Telegram-ботов ---
@@ -5860,6 +6523,18 @@ def get_account_actions_keyboard(
         callback_data=f"account_logs_{account_id}",
         style='default',
         icon_custom_emoji_id=get_icon("EYE")
+    ))
+    builder.row(InlineKeyboardButton(
+        text="📊 Дашборд здоровья",
+        callback_data=f"account_dashboard_{account_id}",
+        style='primary',
+        icon_custom_emoji_id=get_icon("STATS")
+    ))
+    builder.row(InlineKeyboardButton(
+        text="🛡 Отпечаток устройства",
+        callback_data=f"fingerprint_menu_{account_id}",
+        style='primary',
+        icon_custom_emoji_id=get_icon("PHONE")
     ))
     builder.row(InlineKeyboardButton(
         text="ИИ-автоответчик",
