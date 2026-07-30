@@ -759,7 +759,7 @@ async def init_db():
         # model         — выбранная LLM (по умолчанию глобальная).
         # history       — JSONB, ключ = chat_id (str), значение = список пар
         #                 {role, content} последних ACCT_AR_HISTORY_PAIRS*2
-        #                 сообщений для этого собеседника.
+        #                 сообщений для этого с��беседника.
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS account_ai_responder (
                 account_id     INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
@@ -4371,7 +4371,7 @@ async def smart_delay(
 
     Учитывает:
       - время суток (МСК)
-      - когда аккаунт последний раз писал в этот чат
+      - когда аккаунт последний раз ��исал в этот чат
       - историю флуд-вейтов аккаунта
     Возвращённое значение уже включает джиттер ±15% и
     ограничено [min_delay, max_delay] секунд.
@@ -5190,7 +5190,7 @@ def get_llm_model_pick_keyboard(
     """Клавиатура выбора модели на старте генерации.
     Подсвечивает модель, выбранную пользователем (current).
     При include_back=False — нижняя кнопка не показывается
-    (используется, если вызываем из основного меню)."""
+    (и��пользуется, если вызываем из основного меню)."""
     builder = InlineKeyboardBuilder()
     for key, label in LLM_MODELS.items():
         mark = '✅ ' if key == current else ''
@@ -6044,7 +6044,7 @@ async def build_admin_panel() -> tuple:
         f"{emoji('FIRE')} Pro: <b>{ext['pro_count']}</b>\n"
         f"{emoji('SMILE')} Free: <b>{ext['free_count']}</b>\n"
         f"{emoji('CLOCK')} Истекают за 7 дней: <b>{ext['expiring_soon']}</b>\n"
-        f"{emoji('CHART_UP')} Новых за 24ч: <b>{ext['new_today']}</b>"
+        f"{emoji('CHART')} Новых за 24ч: <b>{ext['new_today']}</b>"
     )
     return admin_text, builder.as_markup()
 
@@ -6064,7 +6064,7 @@ async def back_to_main(callback: CallbackQuery):
     await callback.message.edit_text(
         f"{emoji('SMILE')} <b>Главное меню</b>\n\n"
         f"{limits}\n\n"
-        f"Выберите действие:",
+        f"Выберит�� действие:",
         reply_markup=get_main_menu_keyboard()
     )
     await callback.answer()
@@ -8616,7 +8616,7 @@ async def _guard_profile_owner(
         return None
 
     # Состояние могло потеряться — восстанавливаем минимум, чтобы
-    # следующие шаги (ожидание текста/картинки) не падали.
+    # следующ��е шаги (ожидание текста/картинки) не падали.
     if not data.get('profile_account_id'):
         await state.update_data(profile_account_id=account_id)
     if isinstance(event, CallbackQuery):
@@ -9003,7 +9003,7 @@ async def profile_edit_save(callback: CallbackQuery, state: FSMContext):
 
     if not first_name:
         await callback.answer(
-            "Имя не может быть пустым", show_alert=True
+            "Имя не может быть п��стым", show_alert=True
         )
         return
 
