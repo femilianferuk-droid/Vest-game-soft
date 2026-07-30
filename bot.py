@@ -269,6 +269,8 @@ class AdminStates(StatesGroup):
     waiting_for_broadcast_message = State()
     waiting_for_gift_user_id = State()
     waiting_for_gift_days = State()
+    waiting_for_revoke_user_id = State()
+    waiting_for_user_lookup_id = State()
 
 class ParsingStates(StatesGroup):
     waiting_for_account = State()
@@ -1944,6 +1946,74 @@ async def get_broadcast_stats():
             'total_accounts': total_accounts
         }
 
+async def get_admin_extended_stats() -> Dict[str, Any]:
+    """Расширенная статистика для админ-панели: разбивка по подпискам."""
+    async with db_pool.acquire() as conn:
+        pro_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM subscriptions WHERE tier = 'pro'"
+        ) or 0
+        total_users = await conn.fetchval('SELECT COUNT(*) FROM users') or 0
+        # Истекают в ближайшие 7 дней
+        expiring_soon = await conn.fetchval(
+            "SELECT COUNT(*) FROM subscriptions "
+            "WHERE tier = 'pro' AND expires_at IS NOT NULL "
+            "AND expires_at BETWEEN NOW() AND NOW() + INTERVAL '7 days'"
+        ) or 0
+        # Новые пользователи за последние 24 часа
+        new_today = await conn.fetchval(
+            "SELECT COUNT(*) FROM users "
+            "WHERE joined_at >= NOW() - INTERVAL '24 hours'"
+        ) or 0
+        free_count = max(total_users - pro_count, 0)
+        return {
+            'pro_count': int(pro_count),
+            'free_count': int(free_count),
+            'expiring_soon': int(expiring_soon),
+            'new_today': int(new_today),
+        }
+
+
+async def get_users_page(offset: int, limit: int) -> Dict[str, Any]:
+    """Возвращает страницу пользователей с их тарифом для админ-списка."""
+    async with db_pool.acquire() as conn:
+        total = await conn.fetchval('SELECT COUNT(*) FROM users') or 0
+        rows = await conn.fetch(
+            "SELECT u.user_id, u.username, u.first_name, u.joined_at, "
+            "COALESCE(s.tier, 'free') AS tier "
+            "FROM users u "
+            "LEFT JOIN subscriptions s ON s.user_id = u.user_id "
+            "ORDER BY u.joined_at DESC "
+            "LIMIT $1 OFFSET $2",
+            limit, offset
+        )
+        return {'total': int(total), 'rows': [dict(r) for r in rows]}
+
+
+async def get_user_admin_card(user_id: int) -> Optional[Dict[str, Any]]:
+    """Детальная карточка пользователя для админа."""
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow(
+            'SELECT user_id, username, first_name, joined_at '
+            'FROM users WHERE user_id = $1',
+            user_id
+        )
+        if not user:
+            return None
+        accounts_count = await conn.fetchval(
+            'SELECT COUNT(*) FROM accounts WHERE user_id = $1', user_id
+        ) or 0
+        proxies_count = await conn.fetchval(
+            'SELECT COUNT(*) FROM proxies WHERE user_id = $1', user_id
+        ) or 0
+    sub = await get_subscription(user_id)
+    card = dict(user)
+    card['accounts_count'] = int(accounts_count)
+    card['proxies_count'] = int(proxies_count)
+    card['tier'] = sub.get('tier', 'free')
+    card['expires_at'] = sub.get('expires_at')
+    return card
+
+
 async def get_all_user_broadcasts(user_id: int) -> List[Dict]:
     results = []
     async with db_pool.acquire() as conn:
@@ -2050,7 +2120,7 @@ LLM_SYSTEM_PROMPT = (
     "5. Строго следуй параметрам пользователя: тема, длина, канал, "
     "аудитория, цель. Не выходи за рамки.\n\n"
     "Формат ответа — СТРОГО JSON, без markdown-обёрток, без пояснений, "
-    "без префиксов вроде \"Вот варианты:\":\n"
+    "без пре��иксов вроде \"Вот варианты:\":\n"
     "{\n"
     '  "variants": [\n'
     '    {"title": "короткий заголовок 1", "text": "текст 1"},\n'
@@ -2150,7 +2220,7 @@ LLM_SECURITY_SYSTEM_PROMPT = (
     "  • Советы: 3-5 конкретных действий (например, «увеличить задержку до "
     "30-60 сек», «сменить прокси», «не слать ночью 00:00-07:00 МСК», "
     "«уменьшить число активных чатов до 5-7»).\n"
-    "Тон — спокойный, технический, без паники. Пиши по делу."
+    "Тон — споко��ный, технический, без паники. Пиши по делу."
 )
 
 
@@ -3085,7 +3155,7 @@ async def auto_responder_worker(responder: Dict, user_id: int):
 #   - изредка отправить что-то в Избранное (Saved Messages)
 #   - изредка подёргать статус (online / offline)
 #   - при тихом часе — вообще уйти в сон
-# Всё с адаптивной задержкой (5–18 минут между волнами)
+# Всё с адапт��вной задержкой (5–18 минут между волнами)
 # и множителем по времени суток (МСК).
 
 # Реакции, которые безопасно кидать в прогреве.
@@ -3777,7 +3847,7 @@ async def execute_broadcast(broadcast_id: int, user_id: int):
     mode = broadcast['mode']
     # Список сообщений для рандомной рассылки (новый формат). Каждый
     # элемент — {"text": str, "media": [str, ...]}. Если заполнен — он
-    # используется вместо одиночных message_text / message_media.
+    # использ��ется вместо одиночных message_text / message_media.
     message_texts_raw = broadcast.get('message_texts') or []
     message_variants = _normalize_message_variants(
         message_texts_raw, message_text, message_media
@@ -5927,13 +5997,11 @@ async def cmd_start(message: Message):
     )
     await message.answer(welcome_text, reply_markup=get_main_menu_keyboard())
 
-@dp.message(Command("admin"))
-async def cmd_admin(message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    
+async def build_admin_panel() -> tuple:
+    """Строит текст и клавиатуру главной админ-панели (единый источник)."""
     stats = await get_broadcast_stats()
-    
+    ext = await get_admin_extended_stats()
+
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(
         text="Рассылка всем пользователям",
@@ -5942,10 +6010,22 @@ async def cmd_admin(message: Message):
         icon_custom_emoji_id=get_icon("MEGAPHONE")
     ))
     builder.row(InlineKeyboardButton(
+        text="Пользователи",
+        callback_data="admin_users:0",
+        style='default',
+        icon_custom_emoji_id=get_icon("PEOPLE")
+    ))
+    builder.row(InlineKeyboardButton(
         text="Подарить подписку",
         callback_data="admin_gift_sub",
         style='default',
         icon_custom_emoji_id=get_icon("STAR")
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Забрать подписку",
+        callback_data="admin_revoke_sub",
+        style='destructive',
+        icon_custom_emoji_id=get_icon("LOCK_CLOSED")
     ))
     builder.row(InlineKeyboardButton(
         text="Обновить статистику",
@@ -5953,16 +6033,29 @@ async def cmd_admin(message: Message):
         style='default',
         icon_custom_emoji_id=get_icon("REFRESH")
     ))
-    
+
     admin_text = (
         f"{emoji('BOT')} <b>Админ-панель</b>\n\n"
         f"{emoji('PEOPLE')} Пользователей: <b>{stats['total_users']}</b>\n"
         f"{emoji('PROFILE')} Аккаунтов: <b>{stats['total_accounts']}</b>\n"
         f"{emoji('MEGAPHONE')} Всего рассылок: <b>{stats['total_broadcasts']}</b>\n"
-        f"{emoji('PLAY')} Активных: <b>{stats['active_broadcasts']}</b>"
+        f"{emoji('PLAY')} Активных рассылок: <b>{stats['active_broadcasts']}</b>\n\n"
+        f"{emoji('STAR')} <b>Подписки</b>\n"
+        f"{emoji('FIRE')} Pro: <b>{ext['pro_count']}</b>\n"
+        f"{emoji('SMILE')} Free: <b>{ext['free_count']}</b>\n"
+        f"{emoji('CLOCK')} Истекают за 7 дней: <b>{ext['expiring_soon']}</b>\n"
+        f"{emoji('CHART_UP')} Новых за 24ч: <b>{ext['new_today']}</b>"
     )
-    
-    await message.answer(admin_text, reply_markup=builder.as_markup())
+    return admin_text, builder.as_markup()
+
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    admin_text, markup = await build_admin_panel()
+    await message.answer(admin_text, reply_markup=markup)
 
 # --- Главное меню ---
 @dp.callback_query(F.data == "main_menu")
@@ -6532,7 +6625,7 @@ async def format_limits_text(user_id: int) -> str:
         return f"{emoji('STAR')} <b>Лимиты:</b> Pro — без ограничений"
 
     # Счётчики использования — не критичны. Если БД недоступна или
-    # какой-то таблицы нет, показываем нули вместо падения обработчика.
+    # какой-то таблицы нет, ��оказываем нули вместо падения обработчика.
     try:
         ai_used = await count_ai_requests_today(user_id)
     except Exception as ex:
@@ -7436,7 +7529,7 @@ async def ai_generator_view(callback: CallbackQuery, state: FSMContext):
     created = req['created_at']
     when = created.strftime('%d.%m.%Y %H:%M') if hasattr(created, 'strftime') else str(created)[:16]
 
-    # Перешлём варианты текстом
+    # Перешлём вариа��ты текстом
     for i, v in enumerate(variants, 1):
         text = (v or {}).get('text') or ''
         title = (v or {}).get('title') or f'Вариант {i}'
@@ -7884,7 +7977,7 @@ async def process_code(message: Message, state: FSMContext):
         proxy = await get_proxy(proxy_id)
         if not proxy:
             await message.answer(
-                f"{emoji('CROSS')} Выбранный прокси не найден. "
+                f"{emoji('CROSS')} Выб��анный прокси не найден. "
                 f"Попробуйте добавить аккаунт заново."
             )
             await state.clear()
@@ -8096,7 +8189,7 @@ async def account_logs(callback: CallbackQuery):
     await callback.answer()
 
 
-# --- Анализ логов аккаунта (оценка риска бана) ---
+# --- Анализ логов аккаунта (оценка риска бан��) ---
 def _risk_analysis_keyboard(account_id: int) -> InlineKeyboardMarkup:
     """Клавиатура после отчёта: переанализ / назад / в логи."""
     builder = InlineKeyboardBuilder()
@@ -8235,7 +8328,7 @@ async def analyze_risk_handler(callback: CallbackQuery):
 # ============================================================
 #  Редактирование профиля Telegram-аккаунта
 # ============================================================
-# Профиль (аватар, имя, фамилия, описание) хранится в самом
+# Профиль (аватар, имя, фамилия, описан��е) хранится в самом
 # Telegram, а не в нашей БД. Поэтому:
 #   - при открытии редактора читаем актуальные данные из Telegram;
 #   - все правки складываем в черновик внутри FSM;
@@ -8856,7 +8949,7 @@ async def profile_ai_generate(message: Message, state: FSMContext):
     prompt = (message.text or '').strip()
     if not prompt:
         await message.answer(
-            f"{emoji('CROSS')} Опишите желаемый образ текстом."
+            f"{emoji('CROSS')} Опишите желаемый образ тек��том."
         )
         return
 
@@ -9968,7 +10061,7 @@ async def scheduled_process_datetime(message: Message, state: FSMContext):
         
     except ValueError:
         await message.answer(
-            f"{emoji('CROSS')} Неверный формат. Используйте: ДД.ММ.ГГГГ ЧЧ:ММ"
+            f"{emoji('CROSS')} Неверн��й формат. Используйте: ДД.ММ.ГГГГ ЧЧ:ММ"
         )
     except Exception as ex:
         await message.answer(f"{emoji('CROSS')} Ошибка: {str(ex)}")
@@ -10590,7 +10683,7 @@ async def start_dm_broadcast(callback: CallbackQuery, state: FSMContext):
         f"{emoji('LOADING')} <b>Запускаю рассылку в ЛС...</b>\n\n"
         f"DM ID: {dm_id}\n"
         f"Получателей: {data['usernames_count']}\n"
-        f"Вариантов: {len(variants)} (случайный выбор)\n"
+        f"Вариан��ов: {len(variants)} (случайный выбор)\n"
         f"Это может занять некоторое время.",
         reply_markup=get_broadcast_control_keyboard(dm_id, 'dm')
     )
@@ -11621,48 +11714,14 @@ async def process_parsing_mode(callback: CallbackQuery, state: FSMContext):
 
 # --- Админ-панель ---
 @dp.callback_query(F.data == "admin_refresh_stats")
-async def admin_refresh_stats(callback: CallbackQuery):
+async def admin_refresh_stats(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("Нет доступа", show_alert=True)
         return
-    
-    stats = await get_broadcast_stats()
-    
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(
-        text="Рассылка всем пользователям",
-        callback_data="admin_broadcast_all",
-        style='primary',
-        icon_custom_emoji_id=get_icon("MEGAPHONE")
-    ))
-    builder.row(InlineKeyboardButton(
-        text="Подарить подписку",
-        callback_data="admin_gift_sub",
-        style='default',
-        icon_custom_emoji_id=get_icon("STAR")
-    ))
-    builder.row(InlineKeyboardButton(
-        text="Обновить статистику",
-        callback_data="admin_refresh_stats",
-        style='default',
-        icon_custom_emoji_id=get_icon("REFRESH")
-    ))
-    
-    admin_text = (
-        f"{emoji('BOT')} <b>Админ-панель</b>\n\n"
-        f"{emoji('PEOPLE')} Пользователей: "
-        f"<b>{stats['total_users']}</b>\n"
-        f"{emoji('PROFILE')} Аккаунтов: "
-        f"<b>{stats['total_accounts']}</b>\n"
-        f"{emoji('MEGAPHONE')} Всего рассылок: "
-        f"<b>{stats['total_broadcasts']}</b>\n"
-        f"{emoji('PLAY')} Активных: "
-        f"<b>{stats['active_broadcasts']}</b>"
-    )
-    
-    await callback.message.edit_text(
-        admin_text, reply_markup=builder.as_markup()
-    )
+
+    await state.clear()
+    admin_text, markup = await build_admin_panel()
+    await callback.message.edit_text(admin_text, reply_markup=markup)
     await callback.answer()
 
 @dp.callback_query(F.data == "admin_broadcast_all")
@@ -11847,6 +11906,348 @@ async def admin_gift_days(message: Message, state: FSMContext):
         )
     except Exception as ex:
         logger.warning(f"Could not notify gift recipient {target_id}: {ex}")
+
+
+# ========== ПРОСМОТР ПОЛЬЗОВАТЕЛЕЙ (ADMIN) ==========
+
+ADMIN_USERS_PAGE_SIZE = 8
+
+
+def _fmt_dt(dt) -> str:
+    """Безопасно форматирует дату/время для админ-карточек."""
+    if not dt:
+        return "—"
+    try:
+        return dt.strftime('%d.%m.%Y %H:%M')
+    except Exception:
+        return str(dt)
+
+
+@dp.callback_query(F.data.startswith("admin_users:"))
+async def admin_users_list(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    try:
+        offset = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        offset = 0
+    if offset < 0:
+        offset = 0
+
+    page = await get_users_page(offset, ADMIN_USERS_PAGE_SIZE)
+    total = page['total']
+    rows = page['rows']
+
+    builder = InlineKeyboardBuilder()
+    for u in rows:
+        name = u.get('first_name') or u.get('username') or 'Без имени'
+        badge = "🔥" if u.get('tier') == 'pro' else "•"
+        builder.row(InlineKeyboardButton(
+            text=f"{badge} {name} (ID {u['user_id']})",
+            callback_data=f"admin_user_view:{u['user_id']}",
+            style='default',
+            icon_custom_emoji_id=get_icon("PROFILE")
+        ))
+
+    # Навигация по страницам
+    nav = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton(
+            text="◀ Назад",
+            callback_data=f"admin_users:{max(offset - ADMIN_USERS_PAGE_SIZE, 0)}",
+            style='default'
+        ))
+    if offset + ADMIN_USERS_PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton(
+            text="Вперёд ▶",
+            callback_data=f"admin_users:{offset + ADMIN_USERS_PAGE_SIZE}",
+            style='default'
+        ))
+    if nav:
+        builder.row(*nav)
+
+    builder.row(InlineKeyboardButton(
+        text="Найти по ID",
+        callback_data="admin_user_lookup",
+        style='primary',
+        icon_custom_emoji_id=get_icon("ID")
+    ))
+    builder.row(InlineKeyboardButton(
+        text="В админ-панель",
+        callback_data="admin_refresh_stats",
+        style='default',
+        icon_custom_emoji_id=get_icon("BACK")
+    ))
+
+    page_from = offset + 1 if total else 0
+    page_to = min(offset + ADMIN_USERS_PAGE_SIZE, total)
+    text = (
+        f"{emoji('PEOPLE')} <b>Пользователи</b>\n\n"
+        f"Всего: <b>{total}</b>\n"
+        f"Показаны: <b>{page_from}–{page_to}</b>\n\n"
+        f"Нажмите на пользователя, чтобы открыть карточку."
+    )
+    if not rows:
+        text = f"{emoji('PEOPLE')} <b>Пользователи</b>\n\nСписок пуст."
+
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+def _build_user_card_markup(user_id: int, tier: str, back_offset: int = 0):
+    """Клавиатура карточки пользователя с действиями по подписке."""
+    builder = InlineKeyboardBuilder()
+    if tier == 'pro':
+        builder.row(InlineKeyboardButton(
+            text="Забрать Pro",
+            callback_data=f"admin_user_revoke:{user_id}",
+            style='destructive',
+            icon_custom_emoji_id=get_icon("LOCK_CLOSED")
+        ))
+    else:
+        builder.row(InlineKeyboardButton(
+            text="Выдать Pro на 30 дней",
+            callback_data=f"admin_user_grant30:{user_id}",
+            style='primary',
+            icon_custom_emoji_id=get_icon("STAR")
+        ))
+    builder.row(InlineKeyboardButton(
+        text="К списку",
+        callback_data=f"admin_users:{back_offset}",
+        style='default',
+        icon_custom_emoji_id=get_icon("BACK")
+    ))
+    return builder.as_markup()
+
+
+async def _render_user_card(target_id: int) -> tuple:
+    card = await get_user_admin_card(target_id)
+    if not card:
+        return None, None
+    tier = card.get('tier', 'free')
+    tier_label = "🔥 Pro" if tier == 'pro' else "Free"
+    username = f"@{card['username']}" if card.get('username') else "—"
+    expires = _fmt_dt(card.get('expires_at')) if tier == 'pro' else "—"
+    text = (
+        f"{emoji('PROFILE')} <b>Карточка пользователя</b>\n\n"
+        f"{emoji('ID')} ID: <code>{card['user_id']}</code>\n"
+        f"{emoji('PEOPLE')} Имя: <b>{escape(card.get('first_name') or '—')}</b>\n"
+        f"{emoji('CHAT')} Username: {escape(username)}\n"
+        f"{emoji('CALENDAR')} Регистрация: <b>{_fmt_dt(card.get('joined_at'))}</b>\n\n"
+        f"{emoji('STAR')} Тариф: <b>{tier_label}</b>\n"
+        f"{emoji('CLOCK')} Активна до: <b>{expires}</b>\n\n"
+        f"{emoji('PROFILE')} Аккаунтов: <b>{card['accounts_count']}</b>\n"
+        f"{emoji('LINK')} Прокси: <b>{card['proxies_count']}</b>"
+    )
+    return text, _build_user_card_markup(target_id, tier)
+
+
+@dp.callback_query(F.data.startswith("admin_user_view:"))
+async def admin_user_view(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        target_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+
+    text, markup = await _render_user_card(target_id)
+    if text is None:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_user_lookup")
+async def admin_user_lookup_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_for_user_lookup_id)
+    await callback.message.edit_text(
+        f"{emoji('ID')} <b>Поиск пользователя</b>\n\n"
+        f"Введите Telegram <b>user_id</b> пользователя:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="Отмена",
+                callback_data="admin_users:0",
+                style='default',
+                icon_custom_emoji_id=get_icon("BACK")
+            )
+        ]])
+    )
+    await callback.answer()
+
+
+@dp.message(AdminStates.waiting_for_user_lookup_id)
+async def admin_user_lookup_process(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    raw = (message.text or '').strip()
+    if not raw.lstrip('-').isdigit():
+        await message.answer(
+            f"{emoji('CROSS')} Некорректный user_id. Введите числовой Telegram ID:"
+        )
+        return
+    await state.clear()
+    text, markup = await _render_user_card(int(raw))
+    if text is None:
+        await message.answer(
+            f"{emoji('CROSS')} Пользователь с таким ID не найден.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="К списку",
+                    callback_data="admin_users:0",
+                    style='default',
+                    icon_custom_emoji_id=get_icon("BACK")
+                )
+            ]])
+        )
+        return
+    await message.answer(text, reply_markup=markup)
+
+
+@dp.callback_query(F.data.startswith("admin_user_grant30:"))
+async def admin_user_grant30(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        target_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+
+    expires_at = datetime.now() + timedelta(days=30)
+    await set_subscription(target_id, "pro", expires_at)
+    await callback.answer("Pro выдан на 30 дней", show_alert=True)
+
+    text, markup = await _render_user_card(target_id)
+    if text:
+        await callback.message.edit_text(text, reply_markup=markup)
+
+    try:
+        await bot.send_message(
+            target_id,
+            f"{emoji('STAR')} <b>Вам подарена Pro-подписка!</b>\n\n"
+            f"Активна до: <b>{expires_at.strftime('%d.%m.%Y %H:%M')}</b>"
+        )
+    except Exception as ex:
+        logger.warning(f"Could not notify grant recipient {target_id}: {ex}")
+
+
+# ========== ЗАБРАТЬ ПОДПИСКУ (ADMIN) ==========
+
+async def _revoke_subscription(target_id: int) -> None:
+    """Сбрасывает подписку пользователя обратно на Free."""
+    await set_subscription(target_id, "free", None)
+
+
+async def _notify_revoked(target_id: int) -> None:
+    try:
+        await bot.send_message(
+            target_id,
+            f"{emoji('INFO')} <b>Ваша Pro-подписка была отключена администратором.</b>\n\n"
+            f"Тариф изменён на <b>Free</b>."
+        )
+    except Exception as ex:
+        logger.warning(f"Could not notify revoke recipient {target_id}: {ex}")
+
+
+@dp.callback_query(F.data.startswith("admin_user_revoke:"))
+async def admin_user_revoke(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        target_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+
+    await _revoke_subscription(target_id)
+    await callback.answer("Pro-подписка забрана", show_alert=True)
+
+    text, markup = await _render_user_card(target_id)
+    if text:
+        await callback.message.edit_text(text, reply_markup=markup)
+
+    await _notify_revoked(target_id)
+
+
+@dp.callback_query(F.data == "admin_revoke_sub")
+async def admin_revoke_sub_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_for_revoke_user_id)
+    await callback.message.edit_text(
+        f"{emoji('LOCK_CLOSED')} <b>Забрать Pro-подписку</b>\n\n"
+        f"Введите Telegram <b>user_id</b> пользователя, у которого нужно "
+        f"забрать подписку:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="Отмена",
+                callback_data="admin_refresh_stats",
+                style='default',
+                icon_custom_emoji_id=get_icon("BACK")
+            )
+        ]])
+    )
+    await callback.answer()
+
+
+@dp.message(AdminStates.waiting_for_revoke_user_id)
+async def admin_revoke_process(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    raw = (message.text or '').strip()
+    if not raw.lstrip('-').isdigit():
+        await message.answer(
+            f"{emoji('CROSS')} Некорректный user_id. Введите числовой Telegram ID:"
+        )
+        return
+    target_id = int(raw)
+    await state.clear()
+
+    sub = await get_subscription(target_id)
+    if sub.get('tier') != 'pro':
+        await message.answer(
+            f"{emoji('INFO')} У пользователя <code>{target_id}</code> "
+            f"нет активной Pro-подписки (тариф уже Free).",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="В админ-панель",
+                    callback_data="admin_refresh_stats",
+                    style='primary',
+                    icon_custom_emoji_id=get_icon("BACK")
+                )
+            ]])
+        )
+        return
+
+    await _revoke_subscription(target_id)
+
+    await message.answer(
+        f"{emoji('CHECK')} <b>Подписка забрана!</b>\n\n"
+        f"User ID: <code>{target_id}</code>\n"
+        f"Новый тариф: <b>Free</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="В админ-панель",
+                callback_data="admin_refresh_stats",
+                style='primary',
+                icon_custom_emoji_id=get_icon("BACK")
+            )
+        ]])
+    )
+
+    await _notify_revoked(target_id)
 
 
 # ========== ПРОКСИ ==========
@@ -12121,7 +12522,7 @@ async def do_set_proxy(callback: CallbackQuery):
         await callback.answer(
             "Не удалось привязать (чужая запись?)", show_alert=True
         )
-    # Возвращаемся к карточке аккаунта
+    # Возвращаемся к к��рточке аккаунта
     account = await get_account(account_id)
     if not account:
         return
