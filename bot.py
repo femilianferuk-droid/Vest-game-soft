@@ -759,7 +759,7 @@ async def init_db():
         # model         — выбранная LLM (по умолчанию глобальная).
         # history       — JSONB, ключ = chat_id (str), значение = список пар
         #                 {role, content} последних ACCT_AR_HISTORY_PAIRS*2
-        #                 сообщений для этого с��беседника.
+        #                 сообщений для этого с����беседника.
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS account_ai_responder (
                 account_id     INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
@@ -1269,7 +1269,7 @@ def _warming_plan_keyboard(plan_id: int, account_id: int) -> InlineKeyboardMarku
     ))
     builder.row(
         InlineKeyboardButton(
-            text="Перегенерировать",
+            text="Пер��генерировать",
             callback_data=f"regen_warming_{account_id}",
             style='primary',
             icon_custom_emoji_id=get_icon("REFRESH")
@@ -4267,7 +4267,7 @@ async def execute_delete_messages(
 # Снижает риск бана на ~30-50% за счёт:
 #   1) времени суток (ночью/пик вечером — медленнее)
 #   2) частоты аккаунта в конкретном чате (если только что писал — ��ауза)
-#   3) flood-wait истории аккаунта (если недавно ловили флуд — сильно медленнее)
+#   3) flood-wait истории аккаунта (если недавно ловил�� флуд — сильно медленнее)
 # Плюс всегда добавляется случайный джиттер ±15%, чтобы поведение
 # не выглядело роботизированным.
 SMART_DELAY_MIN = 2.0        # минимальный "хвост" задержки (сек)
@@ -4642,7 +4642,7 @@ async def platega_create_transaction(
 
 
 async def platega_get_transaction(transaction_id: str) -> Dict[str, Any]:
-    """Проверяет статус СБП-транзакции в Platega."""
+    """Проверяет статус СБП-транзак��ии в Platega."""
     url = f"{PLATEGA_API}/transaction/{transaction_id}"
     try:
         async with aiohttp.ClientSession() as session:
@@ -5718,7 +5718,7 @@ def get_account_actions_keyboard(
         icon_custom_emoji_id=get_icon("STATS")
     ))
     warming_text = (
-        "Выключить прогрев" if warming_enabled else "Включить прогрев"
+        "Выключить прогрев" if warming_enabled else "Включи��ь прогрев"
     )
     builder.row(InlineKeyboardButton(
         text=warming_text,
@@ -6040,11 +6040,11 @@ async def build_admin_panel() -> tuple:
         f"{emoji('PROFILE')} Аккаунтов: <b>{stats['total_accounts']}</b>\n"
         f"{emoji('MEGAPHONE')} Всего рассылок: <b>{stats['total_broadcasts']}</b>\n"
         f"{emoji('PLAY')} Активных рассылок: <b>{stats['active_broadcasts']}</b>\n\n"
-        f"{emoji('STAR')} <b>Подписки</b>\n"
-        f"{emoji('FIRE')} Pro: <b>{ext['pro_count']}</b>\n"
-        f"{emoji('SMILE')} Free: <b>{ext['free_count']}</b>\n"
-        f"{emoji('CLOCK')} Истекают за 7 дней: <b>{ext['expiring_soon']}</b>\n"
-        f"{emoji('CHART')} Новых за 24ч: <b>{ext['new_today']}</b>"
+        f"<b>Подписки</b>\n"
+        f"Pro: <b>{ext['pro_count']}</b>\n"
+        f"Free: <b>{ext['free_count']}</b>\n"
+        f"Истекают за 7 дней: <b>{ext['expiring_soon']}</b>\n"
+        f"Новых за 24ч: <b>{ext['new_today']}</b>"
     )
     return admin_text, builder.as_markup()
 
@@ -6499,7 +6499,7 @@ async def script_delete_ask(callback: CallbackQuery):
     try:
         script_id = int(callback.data.rsplit(':', 1)[1])
     except ValueError:
-        await callback.answer('Некорректный скрипт', show_alert=True)
+        await callback.answer('Неко��ректный скрипт', show_alert=True)
         return
     script = await get_user_script(script_id, callback.from_user.id)
     if not script:
@@ -9800,7 +9800,7 @@ async def broadcast_messages_done(callback: CallbackQuery, state: FSMContext):
     preview_text = (
         f"{emoji('EYE')} <b>Предпросмотр рассылки:</b>\n\n"
         f"{emoji('PROFILE')} Аккаунт ID: {data['account_id']}\n"
-        f"{emoji('PEOPLE')} Чатов: {len(data['selected_chats'])}\n"
+        f"{emoji('PEOPLE')} Чат��в: {len(data['selected_chats'])}\n"
         f"{emoji('CLOCK')} Задержка: {data['delay']} сек\n"
         f"{emoji('MAIL')} Сообщений в чат: {data['message_count']}\n"
         f"{emoji('GEAR')} Режим: "
@@ -12967,7 +12967,7 @@ async def account_ai_responder_worker(account_id: int, user_id: int):
                     pass
         return _handler
 
-    # --- основной цикл с авто-реконнектом ---
+    # --- основной цикл с авто-реконнек��ом ---
     try:
         account = await get_account(account_id)
         if not account:
