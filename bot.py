@@ -18,7 +18,7 @@ import anthropic
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.methods import DeleteWebhook
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -206,6 +206,14 @@ EMOJI = {
     "AI": ("🧠", "6030400221232501136"),
     "SPARK": ("✨", "5870753782874246579"),
     "COPY": ("📋", "5769289093221454192"),
+    "STAR": ("⭐", "5890848474563352982"),
+    "OK": ("✅", "5870633910337015697"),
+    "RIGHT": ("▶", "6041731551845159060"),
+    "BRAIN": ("🧠", "6030400221232501136"),
+    "CLIPBOARD": ("📋", "5769289093221454192"),
+    "HOURGLASS": ("⏳", "5775896410780079073"),
+    "MOON": ("🌙", "5983150113483134607"),
+    "NOTE": ("📝", "5870753782874246579"),
 }
 
 REACTIONS = {
@@ -227,6 +235,55 @@ def get_icon(name: str) -> str:
     if name in EMOJI:
         return EMOJI[name][1]
     return None
+
+
+# --- Санитайзер стилей кнопок ---
+# Telegram Bot API принимает у InlineKeyboardButton.style только
+# 'primary', 'success' и 'danger'. Любое другое значение (например
+# 'default' или 'destructive') даёт ошибку Bad Request, и всё сообщение
+# не отправляется. Именно из-за этого молча не работал /admin.
+VALID_BUTTON_STYLES = {'primary', 'success', 'danger'}
+
+_STYLE_ALIASES = {
+    'destructive': 'danger',
+    'red': 'danger',
+    'green': 'success',
+    'blue': 'primary',
+    'default': None,
+    'secondary': None,
+    'normal': None,
+}
+
+
+def _sanitize_button_style(value):
+    """Возвращает корректный для Telegram style либо None."""
+    if value is None:
+        return None
+    style = str(value).strip().lower()
+    if style in VALID_BUTTON_STYLES:
+        return style
+    if style in _STYLE_ALIASES:
+        return _STYLE_ALIASES[style]
+    logger.warning(f"Unknown button style: {value!r} - style omitted")
+    return None
+
+
+# Оборачиваем InlineKeyboardButton один раз, чтобы правило работало во
+# всём боте (кнопок ~250, править каждую вручную смысла нет).
+_OriginalInlineKeyboardButton = InlineKeyboardButton
+
+
+class InlineKeyboardButton(_OriginalInlineKeyboardButton):  # noqa: F811
+    def __init__(self, **kwargs):
+        if 'style' in kwargs:
+            style = _sanitize_button_style(kwargs.get('style'))
+            if style is None:
+                kwargs.pop('style', None)
+            else:
+                kwargs['style'] = style
+        if kwargs.get('icon_custom_emoji_id') in (None, ''):
+            kwargs.pop('icon_custom_emoji_id', None)
+        super().__init__(**kwargs)
 
 # --- Состояния FSM ---
 class AccountStates(StatesGroup):
@@ -6049,13 +6106,26 @@ async def build_admin_panel() -> tuple:
     return admin_text, builder.as_markup()
 
 
-@dp.message(Command("admin"))
-async def cmd_admin(message: Message):
+@dp.message(Command("admin"), StateFilter("*"))
+async def cmd_admin(message: Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
+        logger.info(f"/admin denied for user_id={message.from_user.id}")
         return
 
-    admin_text, markup = await build_admin_panel()
-    await message.answer(admin_text, reply_markup=markup)
+    # /admin должен работать всегда, даже если админ "застрял" в каком-то
+    # FSM-состоянии (рассылка, подарок подписки и т.п.).
+    if await state.get_state() is not None:
+        await state.clear()
+
+    try:
+        admin_text, markup = await build_admin_panel()
+        await message.answer(admin_text, reply_markup=markup)
+    except Exception as ex:
+        logger.exception(f"/admin failed: {ex}")
+        await message.answer(
+            f"{emoji('CROSS')} <b>Не удалось открыть админ-панель</b>\n\n"
+            f"<code>{escape(str(ex))}</code>"
+        )
 
 # --- Главное меню ---
 @dp.callback_query(F.data == "main_menu")
@@ -13680,7 +13750,7 @@ async def cb_acct_ar_dialog_back(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.message(Command("cancel"))
+@dp.message(Command("cancel"), StateFilter("*"))
 async def cmd_cancel_acct_ar(message: Message, state: FSMContext):
     """Отмена настройки ИИ-автоответчика или создания скрипта."""
     current = await state.get_state()
