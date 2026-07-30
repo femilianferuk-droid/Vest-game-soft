@@ -292,6 +292,18 @@ class AccountStates(StatesGroup):
     waiting_for_2fa = State()
     waiting_for_proxy_choice = State()
 
+
+class FingerprintRegenStates(StatesGroup):
+    """Состояния переавторизации аккаунта с новым отпечатком устройства.
+
+    Используются в flow «Сменить отпечаток»: после подтверждения бот
+    отправляет код на телефон, юзер вводит его (и, если включена 2FA,
+    пароль). В результате получаем НОВЫЙ auth_key и НОВЫЙ session_string
+    — только так Telegram увидит смену устройства в «Активных сессиях».
+    """
+    waiting_for_code = State()
+    waiting_for_2fa = State()
+
 class BroadcastStates(StatesGroup):
     waiting_for_account = State()
     selecting_chats = State()
@@ -2073,38 +2085,273 @@ async def fingerprint_menu(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("fingerprint_regen_go_"))
-async def fingerprint_regen_confirm(callback: CallbackQuery):
-    """Собственно сгенерировать новый отпечаток.
+async def fingerprint_regen_confirm(
+    callback: CallbackQuery, state: FSMContext
+):
+    """Запустить переавторизацию аккаунта с новым отпечатком.
 
     ВАЖНО: зарегистрирован РАНЬШЕ базового fingerprint_regen_,
     потому что fingerprint_regen_go_<id> тоже удовлетворяет
     startswith("fingerprint_regen_"). В aiogram 3 первый
     зарегистрированный подходящий хендлер забирает callback.
+
+    Сам по себе отпечаток (device_model, system_version, app_version,
+    lang_code, system_lang_code) — это только метаданные, которые
+    Telethon отправляет в Telegram ОДИН раз при создании сессии.
+    Чтобы в «Активных сессиях» в Telegram-клиенте появилось
+    новое устройство, нужно создать НОВЫЙ auth_key — то есть
+    пройти send_code_request → sign_in заново, с новыми
+    параметрами устройства. Этот хендлер запускает именно это.
     """
     account_id = int(callback.data.split("_")[3])
     account = await get_account(account_id)
     if not account or account['user_id'] != callback.from_user.id:
         await callback.answer("Аккаунт не найден", show_alert=True)
         return
-    new_fp = await regenerate_account_fingerprint(account_id)
-    if not new_fp:
+
+    # 1. Генерируем и сразу сохраняем новый отпечаток — он
+    #    применится к клиенту, через который будем логиниться.
+    new_fp = generate_random_fingerprint()
+    ok = await set_account_fingerprint(account_id, new_fp)
+    if not ok:
         await callback.answer(
-            "Не удалось обновить отпечаток. Попробуй позже.",
+            "Не удалось сохранить отпечаток. Попробуй позже.",
             show_alert=True
         )
         return
-    text = (
-        f"{emoji('CHECK')} <b>Готово! Новый отпечаток:</b>\n\n"
-        f"{format_fingerprint_text(await get_account_fingerprint(account_id))}"
-    )
+
+    # 2. Сбрасываем активный Telethon-клиент, чтоб не висел
+    #    со старыми параметрами.
+    if account_id in active_clients:
+        try:
+            old_client = active_clients.pop(account_id)
+            if old_client.is_connected():
+                await old_client.disconnect()
+        except Exception:
+            pass
+
+    # 3. Подтягиваем прокси аккаунта, если привязан.
+    proxy = None
+    if account.get('proxy_id'):
+        proxy = await get_proxy(account['proxy_id'])
+
+    # 4. Создаём клиент с ПУСТОЙ StringSession (новый auth_key)
+    #    и новыми параметрами устройства, отправляем код.
     try:
+        client = await create_telethon_client(
+            '', proxy=proxy, fingerprint=new_fp
+        )
+        await client.connect()
+        sent = await client.send_code_request(account['phone'])
+
+        # Сохраняем в state всё, что понадобится в хендлерах
+        # ввода кода / 2FA. Сам клиент не держим — он нам
+        # не нужен до момента sign_in (Telethon переиспользует
+        # сохранённый StringSession).
+        await state.update_data(
+            account_id=account_id,
+            phone=account['phone'],
+            client_session=client.session.save(),
+            phone_code_hash=sent.phone_code_hash,
+            dc_id=client.session.dc_id,
+            proxy_id=account.get('proxy_id'),
+        )
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+        cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="Отмена",
+                callback_data=f"manage_account_{account_id}",
+                style='default',
+                icon_custom_emoji_id=get_icon("BACK")
+            )
+        ]])
+
         await callback.message.edit_text(
-            text,
+            f"{emoji('PHONE')} <b>Переавторизация с новым отпечатком</b>\n\n"
+            f"Новый девайс для Telegram:\n"
+            f"  • <code>{new_fp['device_model']}</code>\n"
+            f"  • <code>{new_fp['system_version']}</code>, "
+            f"app <code>{new_fp['app_version']}</code>\n"
+            f"  • язык <code>{new_fp['lang_code']}</code>, "
+            f"система <code>{new_fp['system_lang_code']}</code>\n\n"
+            f"{emoji('KEY')} Код отправлен на "
+            f"<code>{account['phone']}</code>. Введи его из Telegram:",
+            reply_markup=cancel_kb
+        )
+        await state.set_state(FingerprintRegenStates.waiting_for_code)
+    except Exception as ex:
+        logger.error(f"fingerprint_regen_confirm send_code failed: {ex}")
+        # Откатываем отпечаток в БД, чтобы не было разъезда
+        # между fingerprint (новый) и session_string (старый).
+        await callback.message.edit_text(
+            f"{emoji('CROSS')} Не удалось начать переавторизацию: "
+            f"<code>{escape(str(ex))}</code>\n\n"
+            f"Возможно, TG уже запрашивал код недавно — подожди "
+            f"пару минут и попробуй снова.",
             reply_markup=get_fingerprint_keyboard(account_id)
         )
-    except Exception:
-        pass
-    await callback.answer("Отпечаток обновлён")
+    await callback.answer()
+
+
+@dp.message(FingerprintRegenStates.waiting_for_code)
+async def fingerprint_reauth_code(message: Message, state: FSMContext):
+    """Принять код и завершить переавторизацию, либо запросить 2FA."""
+    code = message.text.strip()
+    data = await state.get_data()
+    account_id = data.get('account_id')
+
+    proxy = None
+    if data.get('proxy_id'):
+        proxy = await get_proxy(data['proxy_id'])
+
+    # Берём самый свежий отпечаток из БД — именно с ним
+    # создавался клиент.
+    fingerprint = await get_account_fingerprint(account_id)
+
+    try:
+        client = await create_telethon_client(
+            data['client_session'], proxy=proxy,
+            fingerprint=fingerprint
+        )
+        await client.connect()
+        try:
+            await client.sign_in(
+                phone=data['phone'],
+                code=code,
+                phone_code_hash=data['phone_code_hash']
+            )
+        except SessionPasswordNeededError:
+            await state.update_data(code=code)
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            await message.answer(
+                f"{emoji('LOCK_CLOSED')} Введите пароль 2FA:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="Отмена",
+                        callback_data=f"manage_account_{account_id}",
+                        style='default',
+                        icon_custom_emoji_id=get_icon("BACK")
+                    )
+                ]])
+            )
+            await state.set_state(FingerprintRegenStates.waiting_for_2fa)
+            return
+
+        # Успех: сохраняем новый session_string.
+        new_session = client.session.save()
+        new_dc_id = data.get('dc_id') or client.session.dc_id
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                'UPDATE accounts SET session_string = $1, dc_id = $2 '
+                'WHERE id = $3',
+                new_session, new_dc_id, account_id
+            )
+
+        await state.clear()
+        await message.answer(
+            f"{emoji('CHECK')} <b>Готово!</b> Аккаунт переавторизован "
+            f"с новым отпечатком.\n\n"
+            f"Открой Telegram → Настройки → Устройства — там появится "
+            f"новая сессия с именем "
+            f"<code>{fingerprint.get('device_model') if fingerprint else 'новое устройство'}</code>.\n\n"
+            f"<i>Старая сессия тоже останется в списке, пока не истечёт "
+            f"или пока ты её не завершишь вручную — это нормально.</i>",
+            reply_markup=get_fingerprint_keyboard(account_id)
+        )
+    except Exception as ex:
+        logger.error(f"fingerprint_reauth_code failed: {ex}")
+        await message.answer(
+            f"{emoji('CROSS')} Ошибка: <code>{escape(str(ex))}</code>\n\n"
+            f"Попробуй ещё раз или отмени операцию.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data=f"manage_account_{account_id}",
+                    style='default',
+                    icon_custom_emoji_id=get_icon("BACK")
+                )
+            ]])
+        )
+        # state НЕ чистим — пусть юзер попробует ещё раз ввести код.
+
+
+@dp.message(FingerprintRegenStates.waiting_for_2fa)
+async def fingerprint_reauth_2fa(message: Message, state: FSMContext):
+    """Принять 2FA-пароль и завершить переавторизацию."""
+    password = message.text.strip()
+    data = await state.get_data()
+    account_id = data.get('account_id')
+
+    proxy = None
+    if data.get('proxy_id'):
+        proxy = await get_proxy(data['proxy_id'])
+
+    fingerprint = await get_account_fingerprint(account_id)
+
+    try:
+        client = await create_telethon_client(
+            data['client_session'], proxy=proxy,
+            fingerprint=fingerprint
+        )
+        await client.connect()
+        await client.sign_in(password=password)
+
+        new_session = client.session.save()
+        new_dc_id = data.get('dc_id') or client.session.dc_id
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                'UPDATE accounts SET session_string = $1, dc_id = $2 '
+                'WHERE id = $3',
+                new_session, new_dc_id, account_id
+            )
+
+        await state.clear()
+        # Стираем следы 2FA-пароля в чате.
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        # Шлём подтверждение отдельным сообщением.
+        await message.answer(
+            f"{emoji('CHECK')} <b>Готово!</b> Аккаунт переавторизован "
+            f"с новым отпечатком.\n\n"
+            f"Новое устройство: <code>"
+            f"{fingerprint.get('device_model') if fingerprint else '—'}"
+            f"</code>.\n"
+            f"Старая сессия в Telegram ещё отображается — заверши "
+            f"её вручную или дождись автоистечения.",
+            reply_markup=get_fingerprint_keyboard(account_id)
+        )
+    except Exception as ex:
+        logger.error(f"fingerprint_reauth_2fa failed: {ex}")
+        await message.answer(
+            f"{emoji('CROSS')} Ошибка: <code>{escape(str(ex))}</code>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data=f"manage_account_{account_id}",
+                    style='default',
+                    icon_custom_emoji_id=get_icon("BACK")
+                )
+            ]])
+        )
 
 
 @dp.callback_query(F.data.startswith("fingerprint_regen_"))
@@ -2117,11 +2364,18 @@ async def fingerprint_regen(callback: CallbackQuery):
         return
     text = (
         f"{emoji('WARNING')} <b>Сменить отпечаток?</b>\n\n"
-        f"Будет выбран новый случайный отпечаток из пула. "
-        f"Активный Telethon-клиент сбросится, при следующем "
-        f"подключении аккаунт зайдёт с новыми параметрами.\n\n"
-        f"<i>Если сейчас запущены задачи (рассылки, прогрев, "
-        f"автоответчик) — они продолжат работу после переподключения.</i>"
+        f"Бот выберет новый отпечаток и попросит Telegram заново "
+        f"прислать код на телефон — это единственный способ, "
+        f"чтобы в «Активных сессиях» в клиенте Telegram "
+        f"появилось новое устройство с новым именем.\n\n"
+        f"<b>Что будет:</b>\n"
+        f"  • старый Telethon-клиент отключится\n"
+        f"  • тебе придёт SMS/код в Telegram\n"
+        f"  • ты введёшь код (и 2FA, если включена)\n"
+        f"  • аккаунт перезайдёт с новым устройством\n\n"
+        f"<i>Запущенные рассылки/прогрев продолжатся после "
+        f"переподключения. Старая сессия останется в списке "
+        f"устройств до ручного завершения — это норма.</i>"
     )
     try:
         await callback.message.edit_text(
