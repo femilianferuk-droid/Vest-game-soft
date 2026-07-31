@@ -7,7 +7,7 @@ import re
 import tempfile
 import time
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from html import escape
 from urllib.parse import urlparse, parse_qs
 
@@ -28,7 +28,9 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from telethon import TelegramClient, events
-from telethon.errors import SessionPasswordNeededError, FloodWaitError
+from telethon.errors import (
+    SessionPasswordNeededError, FloodWaitError, BadRequestError, RPCError,
+)
 from telethon.sessions import StringSession
 from telethon.tl.types import User, ReactionEmoji
 from telethon.tl.functions.channels import JoinChannelRequest
@@ -272,6 +274,70 @@ def _sanitize_button_style(value):
 # всём боте (кнопок ~250, править каждую вручную смысла нет).
 _OriginalInlineKeyboardButton = InlineKeyboardButton
 
+# Обратный индекс «символ обычного эмодзи → custom_emoji_id».
+# Используется в обёртке ниже, чтобы убрать обычные эмодзи из текста
+# кнопок (Telegram и так рисует premium-иконку через icon_custom_emoji_id,
+# дублирование выглядит как «👥 👥 Менеджер аккаунтов»).
+_EMOJI_SYMBOL_TO_ID: Dict[str, str] = {}
+for _sym, _eid in (EMOJI[k] for k in EMOJI):
+    # Один символ может встречаться у нескольких ключей (например, "▶" →
+    # PLAY и RIGHT). Сохраняем первый встреченный id — для кнопки важна
+    # именно иконка, а не её «семантический» ключ.
+    _EMOJI_SYMBOL_TO_ID.setdefault(_sym, _eid)
+
+
+def _strip_leading_emoji(text: str) -> Tuple[str, Optional[str]]:
+    """Снимает обычный эмодзи в начале строки.
+
+    Возвращает кортеж (новый_текст, custom_emoji_id):
+      • новый_текст — строка без эмодзи и без следующего за ним пробела;
+      • custom_emoji_id — id из EMOJI, если эмодзи нашёлся, иначе None.
+    Если эмодзи в начале нет, возвращает (text, None) без изменений.
+    Если эмодзи есть, но его нет в EMOJI (например, 📜, 📄, 🛡) — текст
+    всё равно обрезается, чтобы обычный эмодзи не дублировал premium-
+    иконку, даже если её и не получится подставить.
+    """
+    if not text:
+        return text, None
+    first = text[0]
+    if _is_emoji_char(first):
+        rest = text[1:]
+        # Срезаем один ведущий пробел, если он есть — чтобы кнопка не
+        # начиналась с двойного отступа.
+        if rest.startswith(' '):
+            rest = rest[1:]
+        return rest, _EMOJI_SYMBOL_TO_ID.get(first)
+    return text, None
+
+
+# Диапазоны codepoints, которые Unicode относит к эмодзи.
+# Покрывают и «классические» эмодзи-блоки (U+1F000+), и «символьные»
+# типа ⏰ (U+23F0), ▶ (U+25B6), ✍ (U+270D), ❤ (U+2764), ◁ (U+25C1).
+_EMOJI_RANGES = (
+    (0x2300, 0x27BF),     # символьные: ⏰, ▶, ◁, ✍, ❤ и пр.
+    (0x1F000, 0x1FFFF),   # основной блок эмодзи
+)
+
+
+def _is_emoji_char(ch: str) -> bool:
+    """Грубая проверка: похож ли символ на эмодзи?
+
+    Проверяем два условия:
+      1. Символ лежит в одном из известных Unicode-диапазонов эмодзи.
+      2. Если диапазон общий (U+2300-U+27BF), то дополнительно смотрим
+         категорию: берём только 'So' (Symbol, other) и 'Sm' (Symbol,
+         math) — иначе зацепим крестики-палочки, плюсы, кавычки и пр.
+    """
+    import unicodedata
+    cp = ord(ch)
+    if cp >= 0x1F000:
+        return True
+    if 0x2300 <= cp <= 0x27BF:
+        cat = unicodedata.category(ch)
+        if cat in ('So', 'Sm'):
+            return True
+    return False
+
 
 class InlineKeyboardButton(_OriginalInlineKeyboardButton):  # noqa: F811
     def __init__(self, **kwargs):
@@ -281,6 +347,19 @@ class InlineKeyboardButton(_OriginalInlineKeyboardButton):  # noqa: F811
                 kwargs.pop('style', None)
             else:
                 kwargs['style'] = style
+
+        # Если в тексте кнопки в начале стоит обычный эмодзи (не premium) —
+        # убираем его. Telegram и так рисует premium-иконку через
+        # icon_custom_emoji_id, оставлять «👥 👥 Менеджер» — дубль.
+        text = kwargs.get('text')
+        if text:
+            new_text, found_id = _strip_leading_emoji(text)
+            if found_id is not None:
+                kwargs['text'] = new_text
+                # Если иконка не задана явно — подставим из словаря.
+                if not kwargs.get('icon_custom_emoji_id'):
+                    kwargs['icon_custom_emoji_id'] = found_id
+
         if kwargs.get('icon_custom_emoji_id') in (None, ''):
             kwargs.pop('icon_custom_emoji_id', None)
         super().__init__(**kwargs)
@@ -10378,6 +10457,71 @@ async def profile_ai_generate(message: Message, state: FSMContext):
     await _render_profile_editor(message, state, edit=False)
 
 
+# Тексты ошибок Telethon, при которых можно безопасно повторить запрос.
+# Telegram иногда отвечает «Try again later / client expired» при
+# серии частых изменений профиля. Это не бан, просто лимит на частоту —
+# через секунду-другую запрос проходит.
+_PROFILE_RETRYABLE_MSG_FRAGMENTS = (
+    "TAKEOUT_INIT_FAIL",
+    "TAKEOUT_REQUIRED",
+    "FLOOD_WAIT",
+    "FLOOD_PREMIUM_WAIT",
+    "PEER_FLOOD",
+    "try again later",
+    "try again",
+    "client expired",
+    "CLIENT_EXPIRED",
+    "SLOWMODE_WAIT",
+    "Timeout",
+    "ConnectionResetError",
+    "ConnectionError",
+)
+
+
+def _is_retryable_rpc_error(ex: Exception) -> bool:
+    """True, если ошибка Telethon похожа на «попробуйте снова»."""
+    if isinstance(ex, FloodWaitError):
+        # Сам FloodWaitError обрабатываем отдельно: там есть seconds.
+        return True
+    if isinstance(ex, BadRequestError):
+        msg = (str(ex.message) if getattr(ex, 'message', None) else str(ex)).lower()
+        return any(frag.lower() in msg for frag in _PROFILE_RETRYABLE_MSG_FRAGMENTS)
+    if isinstance(ex, RPCError):
+        msg = (str(ex.message) if getattr(ex, 'message', None) else str(ex)).lower()
+        return any(frag.lower() in msg for frag in _PROFILE_RETRYABLE_MSG_FRAGMENTS)
+    if isinstance(ex, (TimeoutError, ConnectionError)):
+        return True
+    return False
+
+
+async def _call_profile_rpc(client, request, *, retries: int = 3,
+                            base_delay: float = 1.0, op_label: str = "rpc"):
+    """Выполняет Telethon-RPC с ретраем на «попробуйте снова».
+
+    Не ловит FloodWaitError — её должен обработать вызывающий, чтобы
+    показать пользователю конкретный срок ожидания.
+    """
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            return await client(request)
+        except FloodWaitError:
+            raise
+        except Exception as ex:  # noqa: BLE001
+            last_exc = ex
+            if not _is_retryable_rpc_error(ex) or attempt >= retries:
+                raise
+            # Экспоненциальная задержка: 1с, 2с, 4с...
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.warning(
+                "profile %s: %s (attempt %s/%s), retry in %.1fs",
+                op_label, ex, attempt, retries, delay,
+            )
+            await asyncio.sleep(delay)
+    # На случай, если цикл не сработал (не должно произойти):
+    raise last_exc  # type: ignore[misc]
+
+
 @dp.callback_query(F.data.startswith("profedit_save:"))
 async def profile_edit_save(callback: CallbackQuery, state: FSMContext):
     account_id = await _guard_profile_owner(callback, state)
@@ -10387,15 +10531,32 @@ async def profile_edit_save(callback: CallbackQuery, state: FSMContext):
         return
 
     data = await state.get_data()
-    first_name = (data.get('draft_first_name') or '').strip()
-    last_name = (data.get('draft_last_name') or '').strip()
-    about = (data.get('draft_about') or '').strip()
+    new_first = (data.get('draft_first_name') or '').strip()
+    new_last = (data.get('draft_last_name') or '').strip()
+    new_about = (data.get('draft_about') or '').strip()
     avatar_bytes = data.get('draft_avatar')
 
-    if not first_name:
+    orig_first = (data.get('orig_first_name') or '').strip()
+    orig_last = (data.get('orig_last_name') or '').strip()
+    orig_about = (data.get('orig_about') or '').strip()
+
+    if not new_first:
         await callback.answer(
-            "Имя не может быть п��стым", show_alert=True
+            "Имя не может быть пустым", show_alert=True
         )
+        return
+
+    # Сравниваем с оригиналом: апдейтим только то, что реально изменилось.
+    # Передавать ВСЕ три поля в UpdateProfileRequest при любом чихе —
+    # верный путь получить «TAKEOUT_INIT_FAIL» / «FLOOD_WAIT» /
+    # «client expired» от Telegram, потому что сервер видит «запись в
+    # те же поля, что и так записаны», и ловит частые апдейты.
+    name_changed = new_first != orig_first or new_last != orig_last
+    about_changed = new_about != orig_about
+    avatar_changed = bool(avatar_bytes)
+
+    if not (name_changed or about_changed or avatar_changed):
+        await callback.answer("Нет изменений для сохранения", show_alert=True)
         return
 
     await callback.answer()
@@ -10421,76 +10582,142 @@ async def profile_edit_save(callback: CallbackQuery, state: FSMContext):
         )
         return
 
-    tmp_path = None
-    try:
-        await client(UpdateProfileRequest(
-            first_name=first_name,
-            last_name=last_name,
-            about=about,
-        ))
+    # Сюда собираем красивое описание того, что было сделано, и любую
+    # ошибку — чтобы показать пользователю, даже если финал сломался
+    # на полпути (например, имя ушло, а аватарка — нет).
+    steps_done: List[str] = []
+    steps_failed: Optional[str] = None
+    flood_wait_seconds: Optional[int] = None
 
-        if avatar_bytes:
-            # Сначала загружаем файл, чтобы не удалить старые фото, если
-            # новая картинка оказалась непригодной для Telegram.
+    # 1) Имя / фамилия — отдельным запросом, только если изменились.
+    if name_changed:
+        try:
+            await _call_profile_rpc(
+                client,
+                UpdateProfileRequest(
+                    first_name=new_first,
+                    last_name=new_last,
+                ),
+                op_label="update_name",
+            )
+            steps_done.append("имя")
+        except FloodWaitError as ex:
+            flood_wait_seconds = ex.seconds
+        except Exception as ex:
+            logger.exception("profile name update failed")
+            steps_failed = f"имя: {ex}"
+
+    # 2) Описание — отдельным запросом. Делаем это только если изменилось
+    #    И если имя прошло (иначе нет смысла долбить сервер дальше).
+    if not flood_wait_seconds and not steps_failed and about_changed:
+        # Небольшая пауза между последовательными апдейтами профиля —
+        # Telegram-сервер склонен отвечать «try again», если запросы
+        # идут слишком часто.
+        await asyncio.sleep(0.6)
+        try:
+            await _call_profile_rpc(
+                client,
+                UpdateProfileRequest(about=new_about),
+                op_label="update_about",
+            )
+            steps_done.append("описание")
+        except FloodWaitError as ex:
+            flood_wait_seconds = ex.seconds
+        except Exception as ex:
+            logger.exception("profile about update failed")
+            steps_failed = f"описание: {ex}"
+
+    # 3) Аватарка — отдельный шаг, потому что это совсем другой RPC.
+    #    GetUserPhotosRequest + DeletePhotosRequest мы раньше делали
+    #    сразу после UpdateProfileRequest — это регулярно валилось
+    #    «TAKEOUT_INIT_FAIL_X» / «FLOOD_WAIT_X». Ставим только новое
+    #    фото, историю (если она есть) Telegram сам перетрёт главной
+    #    аватаркой, а старая останется в photo-history без видимого
+    #    эффекта на сам профиль.
+    if not flood_wait_seconds and not steps_failed and avatar_changed:
+        tmp_path = None
+        try:
+            await asyncio.sleep(0.6)
             with tempfile.NamedTemporaryFile(
                 suffix='.jpg', delete=False
             ) as tmp:
                 tmp.write(avatar_bytes)
                 tmp_path = tmp.name
             uploaded = await client.upload_file(tmp_path)
+            await _call_profile_rpc(
+                client,
+                UploadProfilePhotoRequest(file=uploaded),
+                op_label="upload_avatar",
+            )
+            steps_done.append("аватарка")
+        except FloodWaitError as ex:
+            flood_wait_seconds = ex.seconds
+        except Exception as ex:
+            logger.exception("profile avatar update failed")
+            steps_failed = f"аватарка: {ex}"
+        finally:
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
-            # После успешной загрузки удаляем историю и ставим новое фото.
-            try:
-                photos = await client(GetUserPhotosRequest(
-                    user_id='me', offset=0, max_id=0, limit=100
-                ))
-                if getattr(photos, 'photos', None):
-                    await client(DeletePhotosRequest(id=photos.photos))
-            except Exception as ex:
-                logger.warning("delete old photos failed: %s", ex)
-            await client(UploadProfilePhotoRequest(file=uploaded))
-
-    except FloodWaitError as ex:
-        await callback.message.edit_text(
-            f"{emoji('CLOCK')} Telegram про��ит подождать "
-            f"<b>{ex.seconds} сек</b> перед изменением профиля. "
-            f"Попробуйте позже.",
-            reply_markup=InlineKeyboardBuilder().row(InlineKeyboardButton(
-                text="Назад",
-                callback_data=f"manage_account_{account_id}",
-                style='default',
-                icon_custom_emoji_id=get_icon("BACK"),
-            )).as_markup(),
-        )
+    # Если ничего не успело — это «не применено вообще».
+    if not steps_done and (flood_wait_seconds or steps_failed):
+        back_kb = InlineKeyboardBuilder().row(InlineKeyboardButton(
+            text="Назад",
+            callback_data=f"manage_account_{account_id}",
+            style='default',
+            icon_custom_emoji_id=get_icon("BACK"),
+        )).as_markup()
+        if flood_wait_seconds:
+            await callback.message.edit_text(
+                f"{emoji('CLOCK')} Telegram просит подождать "
+                f"<b>{flood_wait_seconds} сек</b> перед изменением профиля. "
+                f"Попробуйте позже.",
+                reply_markup=back_kb,
+            )
+        else:
+            await callback.message.edit_text(
+                f"{emoji('CROSS')} Не удалось сохранить профиль: "
+                f"<code>{escape(str(steps_failed)[:200])}</code>\n\n"
+                f"Чаще всего это значит, что аккаунт-клиент Telegram "
+                f"попал в короткий rate-limit («попробуйте снова, клиент "
+                f"истёк»). Откройте редактор через пару секунд и повторите.",
+                reply_markup=back_kb,
+            )
         return
-    except Exception as ex:
-        logger.exception("profile save failed")
-        await callback.message.edit_text(
-            f"{emoji('CROSS')} Ошибка при сохранении: "
-            f"<code>{escape(str(ex)[:200])}</code>",
-            reply_markup=InlineKeyboardBuilder().row(InlineKeyboardButton(
-                text="Назад",
-                callback_data=f"manage_account_{account_id}",
-                style='default',
-                icon_custom_emoji_id=get_icon("BACK"),
-            )).as_markup(),
-        )
-        return
-    finally:
-        if tmp_path:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
 
     await state.clear()
 
     # Заново читаем профиль из Telegram, чтобы показать применённые данные.
+    # Если что-то не успело — покажем то, что есть.
     fresh = await _fetch_profile_from_telegram(account_id) or {
-        'first_name': first_name,
-        'last_name': last_name,
-        'about': about,
+        'first_name': new_first,
+        'last_name': new_last,
+        'about': new_about,
     }
+    summary_bits: List[str] = []
+    if "имя" in steps_done:
+        summary_bits.append("имя")
+    if "описание" in steps_done:
+        summary_bits.append("описание")
+    if "аватарка" in steps_done:
+        summary_bits.append("аватарка")
+    summary = ", ".join(summary_bits) if summary_bits else "без изменений"
+
+    warning: Optional[str] = None
+    if flood_wait_seconds:
+        warning = (
+            f"\n\n{emoji('CLOCK')} Не всё удалось: Telegram просит "
+            f"подождать <b>{flood_wait_seconds} сек</b>."
+        )
+    elif steps_failed:
+        warning = (
+            f"\n\n{emoji('CROSS')} Не всё удалось: "
+            f"<code>{escape(steps_failed[:200])}</code>"
+        )
+
     await callback.message.edit_text(
         f"{emoji('CHECK')} <b>Профиль обновлён</b>\n\n"
         f"{emoji('ID')} Имя: <b>{_profile_display(fresh['first_name'])}</b>\n"
@@ -10498,7 +10725,8 @@ async def profile_edit_save(callback: CallbackQuery, state: FSMContext):
         f"{emoji('ADD_TEXT')} Описание: "
         f"{_profile_display(fresh['about'], 'пусто')}\n"
         f"{emoji('MEDIA')} Аватарка: "
-        f"{'обновлена' if avatar_bytes else 'без изменений'}",
+        f"{'обновлена' if 'аватарка' in steps_done else 'без изменений'}\n\n"
+        f"Применено: <b>{summary}</b>{warning or ''}",
         reply_markup=InlineKeyboardBuilder().row(InlineKeyboardButton(
             text="Назад к аккаунту",
             callback_data=f"manage_account_{account_id}",
