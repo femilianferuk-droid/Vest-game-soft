@@ -26,6 +26,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup,
     InlineKeyboardButton, FSInputFile, BufferedInputFile
@@ -415,7 +416,7 @@ class InlineKeyboardButton(_OriginalInlineKeyboardButton):  # noqa: F811
 
         # Убираем обычные emoji из любого места текста кнопки. Telegram
         # рисует только premium-иконку через icon_custom_emoji_id.
-        text = kwargs.get('text')
+        text = kwargs.pop('text', None)
         if text:
             new_text, found_id = _strip_button_emojis(text)
             kwargs['text'] = new_text
@@ -426,6 +427,34 @@ class InlineKeyboardButton(_OriginalInlineKeyboardButton):  # noqa: F811
         if kwargs.get('icon_custom_emoji_id') in (None, ''):
             kwargs.pop('icon_custom_emoji_id', None)
         super().__init__(**kwargs)
+
+
+# После прикрепления медиа Telegram считает текст caption, поэтому
+# edit_text для такого сообщения возвращает BadRequest. Перехватываем этот
+# случай централизованно: удаляем старое медиа-сообщение и отправляем новый
+# текстовый экран с той же клавиатурой. Остальные ошибки не скрываем.
+_original_message_edit_text = Message.edit_text
+
+
+async def _safe_message_edit_text(self, *args, **kwargs):
+    try:
+        return await _original_message_edit_text(self, *args, **kwargs)
+    except TelegramBadRequest as ex:
+        error_text = str(ex).lower()
+        if 'no text' not in error_text and 'can\'t be edited' not in error_text:
+            raise
+        try:
+            await self.delete()
+        except Exception:
+            pass
+        text = kwargs.get('text')
+        if text is None and args:
+            text = args[0]
+            args = args[1:]
+        return await self.answer(text or '', *args, **kwargs)
+
+
+Message.edit_text = _safe_message_edit_text
 
 # --- Состояния FSM ---
 class AccountStates(StatesGroup):
