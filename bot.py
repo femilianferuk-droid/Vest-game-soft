@@ -7834,8 +7834,7 @@ async def cmd_start(message: Message):
         f"{limits}\n\n"
         f"Выберите действие:"
     )
-    await message.answer(welcome_text, reply_markup=get_main_menu_keyboard())
-    await send_section_media(message, 'welcome')
+    await present_section(message, 'welcome', welcome_text, get_main_menu_keyboard())
 
 async def get_section_media(section: str) -> Optional[Dict[str, Any]]:
     if section not in MEDIA_SECTIONS or db_pool is None:
@@ -7860,6 +7859,37 @@ async def send_section_media(message: Message, section: str) -> None:
             await message.answer_document(media['file_id'], caption=caption)
     except Exception as ex:
         logger.warning('section media send failed (%s): %s', section, ex)
+
+
+async def present_section(
+    message: Message, section: str, text: str,
+    reply_markup: InlineKeyboardMarkup, replace: bool = False,
+) -> None:
+    """Показывает экран одним сообщением: медиа используется как вложение,
+    а текст становится caption и получает ту же inline-клавиатуру."""
+    media = await get_section_media(section)
+    if not media:
+        if replace:
+            await message.edit_text(text, reply_markup=reply_markup)
+        else:
+            await message.answer(text, reply_markup=reply_markup)
+        return
+    if replace:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+    caption = text[:1024]
+    try:
+        if media['media_type'] == 'photo':
+            await message.answer_photo(media['file_id'], caption=caption, reply_markup=reply_markup)
+        elif media['media_type'] == 'video':
+            await message.answer_video(media['file_id'], caption=caption, reply_markup=reply_markup)
+        else:
+            await message.answer_document(media['file_id'], caption=caption, reply_markup=reply_markup)
+    except Exception as ex:
+        logger.warning('section media render failed (%s): %s', section, ex)
+        await message.answer(text, reply_markup=reply_markup)
 
 
 def get_admin_media_keyboard(media_map: Dict[str, Any]) -> InlineKeyboardMarkup:
@@ -8053,31 +8083,26 @@ async def cmd_admin(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "main_menu")
 async def back_to_main(callback: CallbackQuery):
     limits = await format_limits_text(callback.from_user.id)
-    await callback.message.edit_text(
+    text = (
         f"{emoji('SMILE')} <b>Главное меню</b>\n\n"
         f"{limits}\n\n"
-        f"Выберите действие:",
-        reply_markup=get_main_menu_keyboard()
+        f"Выберите действие:"
     )
-    await send_section_media(callback.message, 'welcome')
+    await present_section(callback.message, 'welcome', text, get_main_menu_keyboard(), replace=True)
     await callback.answer()
 
 @dp.callback_query(F.data == "account_manager")
 async def account_manager(callback: CallbackQuery):
-    await callback.message.edit_text(
-        f"{emoji('PEOPLE')} <b>Менеджер аккаунтов</b>\n\nВыберите действие:",
-        reply_markup=get_account_manager_keyboard()
-    )
-    await send_section_media(callback.message, 'account_manager')
+    text = f"{emoji('PEOPLE')} <b>Менеджер аккаунтов</b>\n\nВыберите действие:"
+    await present_section(callback.message, 'account_manager', text,
+                          get_account_manager_keyboard(), replace=True)
     await callback.answer()
 
 @dp.callback_query(F.data == "functions")
 async def functions(callback: CallbackQuery):
-    await callback.message.edit_text(
-        f"{emoji('APPS')} <b>Функции</b>\n\nВыберите функцию:",
-        reply_markup=get_functions_keyboard()
-    )
-    await send_section_media(callback.message, 'functions')
+    text = f"{emoji('APPS')} <b>Функции</b>\n\nВыберите функцию:"
+    await present_section(callback.message, 'functions', text,
+                          get_functions_keyboard(), replace=True)
     await callback.answer()
 
 # --- Скрипты: открыть бота, загрузить меню и нажать кнопку ---
@@ -8979,11 +9004,10 @@ async def my_subscription(callback: CallbackQuery):
     user_id = callback.from_user.id
     sub = await get_subscription(user_id)
     limits = await format_limits_text(user_id)
-    await callback.message.edit_text(
-        _format_sub_text_sync(sub, limits),
-        reply_markup=get_subscription_keyboard(sub.get("tier", "free"))
+    await present_section(
+        callback.message, 'subscription', _format_sub_text_sync(sub, limits),
+        get_subscription_keyboard(sub.get("tier", "free")), replace=True
     )
-    await send_section_media(callback.message, 'subscription')
     await callback.answer()
 
 
@@ -9428,8 +9452,7 @@ async def ai_generator_start(callback: CallbackQuery, state: FSMContext):
         markup = builder.as_markup()
     else:
         markup = get_llm_model_pick_keyboard(current, include_back=True)
-    await callback.message.edit_text(text, reply_markup=markup)
-    await send_section_media(callback.message, 'ai')
+    await present_section(callback.message, 'ai', text, markup, replace=True)
     await state.set_state(LLMStates.choosing_model)
     await callback.answer()
 
