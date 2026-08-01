@@ -15,6 +15,7 @@ import aiohttp
 import asyncpg
 import pytz
 import anthropic
+import socks
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.methods import DeleteWebhook
@@ -134,8 +135,8 @@ dm_broadcast_stop_flags: Dict[int, bool] = {}
 dm_broadcast_tasks: Dict[int, asyncio.Task] = {}
 join_stop_flags: Dict[int, bool] = {}
 join_tasks: Dict[int, asyncio.Task] = {}
-channel_creation_stop_flags: Dict[int, bool] = {}
-channel_creation_tasks: Dict[int, asyncio.Task] = {}
+chat_creation_stop_flags: Dict[int, bool] = {}
+chat_creation_tasks: Dict[int, asyncio.Task] = {}
 autolike_tasks: Dict[int, asyncio.Task] = {}
 autolike_stop_flags: Dict[int, bool] = {}
 delete_messages_stop_flags: Dict[int, bool] = {}
@@ -450,7 +451,7 @@ class JoinStates(StatesGroup):
     preview = State()
 
 
-class ChannelCreationStates(StatesGroup):
+class ChatCreationStates(StatesGroup):
     waiting_for_account = State()
     waiting_for_count = State()
     waiting_for_title = State()
@@ -1537,11 +1538,13 @@ def parse_proxy_string(text: str) -> Optional[Dict]:
             parsed = urlparse(text)
             scheme = (parsed.scheme or 'socks5').lower()
             if scheme not in ('socks5', 'socks4', 'http'):
-                scheme = 'socks5'
+                return None
             host = parsed.hostname
             port = parsed.port or 1080
             username = parsed.username
             password = parsed.password
+            if not host or not 1 <= int(port) <= 65535:
+                return None
             return {
                 'proxy_type': scheme, 'host': host, 'port': port,
                 'username': username, 'password': password,
@@ -1549,18 +1552,94 @@ def parse_proxy_string(text: str) -> Optional[Dict]:
         # Формат host:port[:user:pass]
         parts = text.split(':')
         if len(parts) == 2:
+            port = int(parts[1])
+            if not parts[0].strip() or not 1 <= port <= 65535:
+                return None
             return {
-                'proxy_type': 'socks5', 'host': parts[0], 'port': int(parts[1]),
+                'proxy_type': 'socks5', 'host': parts[0].strip(), 'port': port,
                 'username': None, 'password': None,
             }
         if len(parts) == 4:
+            port = int(parts[1])
+            if not parts[0].strip() or not 1 <= port <= 65535:
+                return None
             return {
-                'proxy_type': 'socks5', 'host': parts[0], 'port': int(parts[1]),
+                'proxy_type': 'socks5', 'host': parts[0].strip(), 'port': port,
                 'username': parts[2], 'password': parts[3],
             }
         return None
     except Exception:
         return None
+
+
+try:
+    PROXY_CHECK_TIMEOUT = max(
+        2.0, min(30.0, float(os.getenv('PROXY_CHECK_TIMEOUT') or '8'))
+    )
+except (TypeError, ValueError):
+    PROXY_CHECK_TIMEOUT = 8.0
+PROXY_CHECK_TARGETS = (
+    ('149.154.167.51', 443),
+    ('149.154.175.50', 443),
+)
+
+
+def _check_proxy_connection_sync(proxy: Dict[str, Any]) -> Dict[str, Any]:
+    """Проверить TCP-подключение к Telegram через указанный прокси."""
+    proxy_types = {
+        'socks5': socks.SOCKS5,
+        'socks4': socks.SOCKS4,
+        'http': socks.HTTP,
+    }
+    proxy_type = proxy_types.get(str(proxy.get('proxy_type', '')).lower())
+    if proxy_type is None:
+        return {'ok': False, 'error': 'Неподдерживаемый тип прокси'}
+
+    last_error = 'Прокси не отвечает'
+    for target_host, target_port in PROXY_CHECK_TARGETS:
+        proxy_socket = socks.socksocket()
+        proxy_socket.settimeout(PROXY_CHECK_TIMEOUT)
+        proxy_socket.set_proxy(
+            proxy_type,
+            str(proxy['host']),
+            int(proxy['port']),
+            rdns=True,
+            username=proxy.get('username') or None,
+            password=proxy.get('password') or None,
+        )
+        started_at = time.monotonic()
+        try:
+            proxy_socket.connect((target_host, target_port))
+            latency_ms = max(1, round((time.monotonic() - started_at) * 1000))
+            return {
+                'ok': True,
+                'latency_ms': latency_ms,
+                'target': f'{target_host}:{target_port}',
+            }
+        except Exception as ex:
+            last_error = str(ex) or ex.__class__.__name__
+        finally:
+            try:
+                proxy_socket.close()
+            except Exception:
+                pass
+
+    return {'ok': False, 'error': last_error[:300]}
+
+
+async def check_proxy_connection(proxy: Dict[str, Any]) -> Dict[str, Any]:
+    """Асинхронная реальная проверка прокси без блокировки aiogram."""
+    total_timeout = PROXY_CHECK_TIMEOUT * len(PROXY_CHECK_TARGETS) + 2
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_check_proxy_connection_sync, proxy),
+            timeout=total_timeout,
+        )
+    except asyncio.TimeoutError:
+        return {'ok': False, 'error': 'Истекло время ожидания подключения'}
+    except Exception as ex:
+        logger.exception('Proxy check failed unexpectedly')
+        return {'ok': False, 'error': str(ex)[:300]}
 
 async def add_proxy(
     user_id: int, proxy_type: str, host: str, port: int,
@@ -5202,26 +5281,54 @@ async def execute_join(
     return {'total': total, 'joined': joined, 'failed': failed}
 
 
-# --- Создание каналов ---
-CHANNEL_CREATION_DELAY = 20
+# --- Создание каналов и групп ---
+CHAT_CREATION_DELAY = 20
+
+CHAT_CREATION_LABELS = {
+    'channel': {
+        'title': 'Создание каналов',
+        'items': 'каналов',
+        'current': 'Текущий канал',
+        'first': 'Первый канал',
+        'plural': 'Каналы',
+    },
+    'group': {
+        'title': 'Создание групп',
+        'items': 'групп',
+        'current': 'Текущая группа',
+        'first': 'Первая группа',
+        'plural': 'Группы',
+    },
+}
 
 
-def build_channel_title(base_title: str, index: int, total: int) -> str:
-    """Вернуть название канала, сохранив лимит Telegram в 128 символов."""
+def get_chat_creation_labels(creation_kind: str) -> Dict[str, str]:
+    """Названия для общего сценария создания каналов и групп."""
+    return CHAT_CREATION_LABELS.get(
+        creation_kind, CHAT_CREATION_LABELS['channel']
+    )
+
+
+def build_chat_title(base_title: str, index: int, total: int) -> str:
+    """Вернуть название, сохранив лимит Telegram в 128 символов."""
     if total == 1:
         return base_title[:128]
     suffix = f" {index}"
     return f"{base_title[:128 - len(suffix)]}{suffix}"
 
 
-async def execute_channel_creation(
+async def execute_chat_creation(
     account_id: int,
     user_id: int,
     count: int,
     base_title: str,
+    creation_kind: str,
     progress_message: Message,
 ) -> Dict[str, Any]:
-    """Последовательно создать приватные каналы с паузой 20 секунд."""
+    """Создать приватные каналы или супергруппы с паузой 20 секунд."""
+    labels = get_chat_creation_labels(creation_kind)
+    is_group = creation_kind == 'group'
+
     account = await get_account(account_id)
     if not account or account['user_id'] != user_id:
         raise RuntimeError('Аккаунт не найден или не принадлежит пользователю')
@@ -5232,88 +5339,96 @@ async def execute_channel_creation(
 
     created: List[str] = []
     failed: List[Dict[str, str]] = []
-    channel_creation_stop_flags[user_id] = False
+    chat_creation_stop_flags[user_id] = False
 
     for index in range(1, count + 1):
-        if channel_creation_stop_flags.get(user_id, False):
+        if chat_creation_stop_flags.get(user_id, False):
             break
 
-        channel_title = build_channel_title(base_title, index, count)
+        chat_title = build_chat_title(base_title, index, count)
+        request = CreateChannelRequest(
+            title=chat_title,
+            about='',
+            broadcast=not is_group,
+            megagroup=is_group,
+        )
         try:
-            await client(CreateChannelRequest(
-                title=channel_title,
-                about='',
-                broadcast=True,
-                megagroup=False,
-            ))
-            created.append(channel_title)
+            await client(request)
+            created.append(chat_title)
             logger.info(
-                'Created channel %r for account_id=%s (%s/%s)',
-                channel_title, account_id, index, count,
+                'Created %s %r for account_id=%s (%s/%s)',
+                creation_kind, chat_title, account_id, index, count,
             )
         except FloodWaitError as ex:
             await record_flood_wait(account_id, 0, ex.seconds)
-            wait_seconds = max(CHANNEL_CREATION_DELAY, ex.seconds + 1)
+            wait_seconds = max(CHAT_CREATION_DELAY, ex.seconds + 1)
             try:
                 await progress_message.edit_text(
                     f"{emoji('CLOCK')} <b>Telegram включил ограничение</b>\n\n"
                     f"Ожидание: <b>{wait_seconds} сек.</b>\n"
                     f"Создано: <b>{len(created)}/{count}</b>\n"
-                    f"Текущий канал: <code>{escape(channel_title)}</code>",
-                    reply_markup=get_channel_creation_control_keyboard(),
+                    f"{labels['current']}: "
+                    f"<code>{escape(chat_title)}</code>",
+                    reply_markup=get_chat_creation_control_keyboard(),
                 )
             except Exception:
                 pass
 
             await asyncio.sleep(wait_seconds)
-            if channel_creation_stop_flags.get(user_id, False):
+            if chat_creation_stop_flags.get(user_id, False):
                 break
 
             try:
-                await client(CreateChannelRequest(
-                    title=channel_title,
-                    about='',
-                    broadcast=True,
-                    megagroup=False,
-                ))
-                created.append(channel_title)
+                await client(request)
+                created.append(chat_title)
             except Exception as retry_ex:
                 failed.append({
-                    'title': channel_title,
+                    'title': chat_title,
                     'error': str(retry_ex),
                 })
                 logger.warning(
-                    'Channel retry failed for %r: %s',
-                    channel_title, retry_ex,
+                    '%s retry failed for %r: %s',
+                    creation_kind, chat_title, retry_ex,
                 )
         except RPCError as ex:
-            failed.append({'title': channel_title, 'error': str(ex)})
-            logger.warning('Channel creation failed for %r: %s', channel_title, ex)
+            failed.append({'title': chat_title, 'error': str(ex)})
+            logger.warning(
+                '%s creation failed for %r: %s',
+                creation_kind, chat_title, ex,
+            )
         except Exception as ex:
-            failed.append({'title': channel_title, 'error': str(ex)})
-            logger.exception('Unexpected channel creation error for %r', channel_title)
+            failed.append({'title': chat_title, 'error': str(ex)})
+            logger.exception(
+                'Unexpected %s creation error for %r',
+                creation_kind, chat_title,
+            )
 
         processed = len(created) + len(failed)
         try:
+            next_line = (
+                f"\nСледующий запуск через: <b>{CHAT_CREATION_DELAY} сек.</b>"
+                if index < count else ''
+            )
             await progress_message.edit_text(
-                f"{emoji('LOADING')} <b>Создание каналов...</b>\n\n"
+                f"{emoji('LOADING')} <b>{labels['title']}...</b>\n\n"
                 f"Создано: <b>{len(created)}/{count}</b>\n"
                 f"Ошибок: <b>{len(failed)}</b>\n"
-                f"Обработано: <b>{processed}/{count}</b>\n"
-                f"Следующий запуск через: <b>{CHANNEL_CREATION_DELAY} сек.</b>",
-                reply_markup=get_channel_creation_control_keyboard(),
+                f"Обработано: <b>{processed}/{count}</b>"
+                f"{next_line}",
+                reply_markup=get_chat_creation_control_keyboard(),
             )
         except Exception:
             pass
 
-        if index < count and not channel_creation_stop_flags.get(user_id, False):
-            await asyncio.sleep(CHANNEL_CREATION_DELAY)
+        if index < count and not chat_creation_stop_flags.get(user_id, False):
+            await asyncio.sleep(CHAT_CREATION_DELAY)
 
     return {
         'total': count,
         'created': created,
         'failed': failed,
-        'stopped': channel_creation_stop_flags.get(user_id, False),
+        'stopped': chat_creation_stop_flags.get(user_id, False),
+        'creation_kind': creation_kind,
     }
 
 # --- Авто-лайкинг ---
@@ -6473,96 +6588,56 @@ def get_ai_view_keyboard(request_id: int) -> InlineKeyboardMarkup:
 
 def get_functions_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(
-        text="Рассылка",
-        callback_data="broadcast",
-        style='primary',
-        icon_custom_emoji_id=get_icon("SEND")
-    ))
-    builder.row(InlineKeyboardButton(
-        text="Отложенная рассылка",
-        callback_data="scheduled_broadcast",
-        style='primary',
-        icon_custom_emoji_id=get_icon("CLOCK")
-    ))
-    builder.row(InlineKeyboardButton(
-        text="Рассылка в ЛС",
-        callback_data="dm_broadcast",
-        style='primary',
-        icon_custom_emoji_id=get_icon("CHAT")
-    ))
-    builder.row(InlineKeyboardButton(
-        text="Автоответчик",
-        callback_data="auto_responder",
-        style='primary',
-        icon_custom_emoji_id=get_icon("BELL")
-    ))
-    builder.row(InlineKeyboardButton(
-        text="Вступление в чаты",
-        callback_data="join_chats",
-        style='primary',
-        icon_custom_emoji_id=get_icon("JOIN")
-    ))
-    builder.row(InlineKeyboardButton(
-        text="Создание каналов",
-        callback_data="create_channels",
-        style='primary',
-        icon_custom_emoji_id=get_icon("GLOBE")
-    ))
-    builder.row(InlineKeyboardButton(
-        text="Авто-лайкинг",
-        callback_data="autolike",
-        style='primary',
-        icon_custom_emoji_id=get_icon("LIKE")
-    ))
-    builder.row(InlineKeyboardButton(
-        text="Удаление сообщений",
-        callback_data="delete_messages",
-        style='primary',
-        icon_custom_emoji_id=get_icon("SWEEP")
-    ))
-    builder.row(InlineKeyboardButton(
-        text="Парсинг чата",
-        callback_data="parsing",
-        style='primary',
-        icon_custom_emoji_id=get_icon("USERS")
-    ))
-    builder.row(InlineKeyboardButton(
-        text="Скрипты",
-        callback_data="scripts",
-        style='primary',
-        icon_custom_emoji_id=get_icon("PLAY")
-    ))
-    builder.row(InlineKeyboardButton(
-        text="AI Генератор текста",
-        callback_data="ai_generator",
-        style='primary',
-        icon_custom_emoji_id=get_icon("AI")
-    ))
-    builder.row(InlineKeyboardButton(
-        text="Мои AI запросы",
-        callback_data="ai_history",
-        style='default',
-        icon_custom_emoji_id=get_icon("CHART")
-    ))
-    builder.row(InlineKeyboardButton(
-        text="Мои рассылки",
-        callback_data="my_broadcasts",
-        style='default',
-        icon_custom_emoji_id=get_icon("CHART")
-    ))
-    builder.row(InlineKeyboardButton(
-        text="Мои автоответчики",
-        callback_data="my_auto_responders",
-        style='default',
-        icon_custom_emoji_id=get_icon("BELL")
-    ))
-    builder.row(InlineKeyboardButton(
-        text="Назад",
-        callback_data="main_menu",
-        style='default',
-        icon_custom_emoji_id=get_icon("BACK")
-    ))
+
+    def button(
+        text: str, callback_data: str, icon: str,
+        style: str = 'primary',
+    ) -> InlineKeyboardButton:
+        return InlineKeyboardButton(
+            text=text,
+            callback_data=callback_data,
+            style=style,
+            icon_custom_emoji_id=get_icon(icon),
+        )
+
+    rows = (
+        (
+            button("Рассылка", "broadcast", "SEND"),
+            button("Отложенная", "scheduled_broadcast", "CLOCK"),
+        ),
+        (
+            button("Рассылка в ЛС", "dm_broadcast", "CHAT"),
+            button("Автоответчик", "auto_responder", "BELL"),
+        ),
+        (
+            button("Вступление", "join_chats", "JOIN"),
+            button("Создать каналы", "create_channels", "GLOBE"),
+        ),
+        (
+            button("Создать группы", "create_groups", "PEOPLE"),
+            button("Авто-лайкинг", "autolike", "LIKE"),
+        ),
+        (
+            button("Удалить сообщения", "delete_messages", "SWEEP"),
+            button("Парсинг чата", "parsing", "USERS"),
+        ),
+        (
+            button("Скрипты", "scripts", "PLAY"),
+            button("AI Генератор", "ai_generator", "AI"),
+        ),
+        (
+            button("Мои AI запросы", "ai_history", "CHART", 'default'),
+            button("Мои рассылки", "my_broadcasts", "CHART", 'default'),
+        ),
+        (
+            button(
+                "Мои автоответчики", "my_auto_responders", "BELL", 'default'
+            ),
+            button("Назад", "main_menu", "BACK", 'default'),
+        ),
+    )
+    for row in rows:
+        builder.row(*row)
     return builder.as_markup()
 
 
@@ -7121,48 +7196,50 @@ def get_join_control_keyboard(task_id: int) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def get_channel_creation_accounts_keyboard(
-    accounts: List[Dict],
+def get_chat_creation_accounts_keyboard(
+    accounts: List[Dict], creation_kind: str,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for account in accounts:
         builder.row(InlineKeyboardButton(
             text=str(account['phone']),
-            callback_data=f"select_channel_create_account_{account['id']}",
+            callback_data=(
+                f"select_chat_create_account:{creation_kind}:{account['id']}"
+            ),
             style='default',
             icon_custom_emoji_id=get_icon("PROFILE"),
         ))
     builder.row(InlineKeyboardButton(
         text="Отмена",
-        callback_data="channel_creation_cancel",
+        callback_data="chat_creation_cancel",
         style='danger',
         icon_custom_emoji_id=get_icon("CROSS"),
     ))
     return builder.as_markup()
 
 
-def get_channel_creation_preview_keyboard() -> InlineKeyboardMarkup:
+def get_chat_creation_preview_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(
         text="Начать создание",
-        callback_data="start_channel_creation",
+        callback_data="start_chat_creation",
         style='success',
         icon_custom_emoji_id=get_icon("PLAY"),
     ))
     builder.row(InlineKeyboardButton(
         text="Отмена",
-        callback_data="channel_creation_cancel",
+        callback_data="chat_creation_cancel",
         style='danger',
         icon_custom_emoji_id=get_icon("CROSS"),
     ))
     return builder.as_markup()
 
 
-def get_channel_creation_control_keyboard() -> InlineKeyboardMarkup:
+def get_chat_creation_control_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(
         text="Остановить",
-        callback_data="stop_channel_creation",
+        callback_data="stop_chat_creation",
         style='danger',
         icon_custom_emoji_id=get_icon("STOP"),
     ))
@@ -12540,14 +12617,16 @@ async def start_dm_broadcast(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
 
-# --- Создание каналов ---
-@dp.callback_query(F.data == "create_channels")
-async def create_channels_menu(callback: CallbackQuery, state: FSMContext):
+# --- Создание каналов и групп ---
+async def open_chat_creation_menu(
+    callback: CallbackQuery, state: FSMContext, creation_kind: str,
+) -> None:
+    labels = get_chat_creation_labels(creation_kind)
     user_id = callback.from_user.id
-    running_task = channel_creation_tasks.get(user_id)
+    running_task = chat_creation_tasks.get(user_id)
     if running_task and not running_task.done():
         await callback.answer(
-            'Создание каналов уже запущено',
+            'Создание каналов или групп уже запущено',
             show_alert=True,
         )
         return
@@ -12565,23 +12644,40 @@ async def create_channels_menu(callback: CallbackQuery, state: FSMContext):
         return
 
     await state.clear()
-    await state.set_state(ChannelCreationStates.waiting_for_account)
+    await state.update_data(creation_kind=creation_kind)
+    await state.set_state(ChatCreationStates.waiting_for_account)
     await callback.message.edit_text(
         f"{emoji('PROFILE')} <b>Выберите аккаунт</b>\n\n"
-        "Каналы будут создаваться от имени выбранного аккаунта.",
-        reply_markup=get_channel_creation_accounts_keyboard(accounts),
+        f"{labels['plural']} будут создаваться от имени выбранного аккаунта.",
+        reply_markup=get_chat_creation_accounts_keyboard(
+            accounts, creation_kind
+        ),
     )
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("select_channel_create_account_"))
-async def select_channel_create_account(
+@dp.callback_query(F.data == "create_channels")
+async def create_channels_menu(callback: CallbackQuery, state: FSMContext):
+    await open_chat_creation_menu(callback, state, 'channel')
+
+
+@dp.callback_query(F.data == "create_groups")
+async def create_groups_menu(callback: CallbackQuery, state: FSMContext):
+    await open_chat_creation_menu(callback, state, 'group')
+
+
+@dp.callback_query(F.data.startswith("select_chat_create_account:"))
+async def select_chat_create_account(
     callback: CallbackQuery, state: FSMContext
 ):
     try:
-        account_id = int(callback.data.rsplit('_', 1)[1])
-    except (IndexError, ValueError):
+        _, creation_kind, raw_account_id = callback.data.split(':', 2)
+        account_id = int(raw_account_id)
+    except (AttributeError, ValueError):
         await callback.answer('Некорректный аккаунт', show_alert=True)
+        return
+    if creation_kind not in CHAT_CREATION_LABELS:
+        await callback.answer('Некорректный тип', show_alert=True)
         return
 
     account = await get_account(account_id)
@@ -12593,15 +12689,20 @@ async def select_channel_create_account(
         await callback.answer('Аккаунт не найден', show_alert=True)
         return
 
-    await state.update_data(account_id=account_id, account_phone=account['phone'])
-    await state.set_state(ChannelCreationStates.waiting_for_count)
+    labels = get_chat_creation_labels(creation_kind)
+    await state.update_data(
+        creation_kind=creation_kind,
+        account_id=account_id,
+        account_phone=account['phone'],
+    )
+    await state.set_state(ChatCreationStates.waiting_for_count)
     await callback.message.edit_text(
-        f"{emoji('NAMES')} <b>Количество каналов</b>\n\n"
+        f"{emoji('NAMES')} <b>Количество {labels['items']}</b>\n\n"
         "Введите число от <b>1</b> до <b>100</b>.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
                 text="Отмена",
-                callback_data="channel_creation_cancel",
+                callback_data="chat_creation_cancel",
                 style='danger',
                 icon_custom_emoji_id=get_icon("CROSS"),
             )
@@ -12610,8 +12711,8 @@ async def select_channel_create_account(
     await callback.answer()
 
 
-@dp.message(ChannelCreationStates.waiting_for_count)
-async def process_channel_creation_count(
+@dp.message(ChatCreationStates.waiting_for_count)
+async def process_chat_creation_count(
     message: Message, state: FSMContext
 ):
     try:
@@ -12628,17 +12729,20 @@ async def process_channel_creation_count(
         )
         return
 
+    data = await state.get_data()
+    labels = get_chat_creation_labels(data.get('creation_kind', 'channel'))
     await state.update_data(count=count)
-    await state.set_state(ChannelCreationStates.waiting_for_title)
+    await state.set_state(ChatCreationStates.waiting_for_title)
     await message.answer(
-        f"{emoji('WRITE')} <b>Название каналов</b>\n\n"
-        "Введите базовое название. Если каналов несколько, бот добавит "
-        "номера: <code>Название 1</code>, <code>Название 2</code> и т.д.\n\n"
+        f"{emoji('WRITE')} <b>Название {labels['items']}</b>\n\n"
+        f"Введите базовое название. Если {labels['items']} несколько, бот "
+        "добавит номера: <code>Название 1</code>, "
+        "<code>Название 2</code> и т.д.\n\n"
         "Максимальная длина базового названия — 120 символов.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
                 text="Отмена",
-                callback_data="channel_creation_cancel",
+                callback_data="chat_creation_cancel",
                 style='danger',
                 icon_custom_emoji_id=get_icon("CROSS"),
             )
@@ -12646,8 +12750,8 @@ async def process_channel_creation_count(
     )
 
 
-@dp.message(ChannelCreationStates.waiting_for_title)
-async def process_channel_creation_title(
+@dp.message(ChatCreationStates.waiting_for_title)
+async def process_chat_creation_title(
     message: Message, state: FSMContext
 ):
     title = ' '.join((message.text or '').split()).strip()
@@ -12664,46 +12768,56 @@ async def process_channel_creation_title(
 
     await state.update_data(base_title=title)
     data = await state.get_data()
+    creation_kind = data.get('creation_kind', 'channel')
+    labels = get_chat_creation_labels(creation_kind)
     count = data['count']
     if count == 1:
         names_preview = f"<code>{escape(title)}</code>"
     else:
-        first_title = build_channel_title(title, 1, count)
-        last_title = build_channel_title(title, count, count)
+        first_title = build_chat_title(title, 1, count)
+        last_title = build_chat_title(title, count, count)
         names_preview = (
             f"<code>{escape(first_title)}</code> … "
             f"<code>{escape(last_title)}</code>"
         )
 
-    await state.set_state(ChannelCreationStates.preview)
+    entity_note = (
+        "Группы будут приватными супергруппами."
+        if creation_kind == 'group'
+        else "Каналы будут приватными."
+    )
+    await state.set_state(ChatCreationStates.preview)
     await message.answer(
         f"{emoji('EYE')} <b>Проверьте параметры</b>\n\n"
-        f"{emoji('PHONE')} Аккаунт: <code>{escape(str(data['account_phone']))}</code>\n"
-        f"{emoji('NAMES')} Количество: <b>{count}</b>\n"
+        f"{emoji('PHONE')} Аккаунт: "
+        f"<code>{escape(str(data['account_phone']))}</code>\n"
+        f"{emoji('NAMES')} Количество {labels['items']}: <b>{count}</b>\n"
         f"{emoji('WRITE')} Названия: {names_preview}\n"
-        f"{emoji('CLOCK')} Задержка: <b>{CHANNEL_CREATION_DELAY} секунд</b>\n\n"
-        "Каналы будут приватными. Telegram может применить собственные "
-        "лимиты или дополнительную паузу.",
-        reply_markup=get_channel_creation_preview_keyboard(),
+        f"{emoji('CLOCK')} Задержка: <b>{CHAT_CREATION_DELAY} секунд</b>\n\n"
+        f"{entity_note} Telegram может применить собственные лимиты "
+        "или дополнительную паузу.",
+        reply_markup=get_chat_creation_preview_keyboard(),
     )
 
 
 @dp.callback_query(
-    F.data == "start_channel_creation", ChannelCreationStates.preview
+    F.data == "start_chat_creation", ChatCreationStates.preview
 )
-async def start_channel_creation(
+async def start_chat_creation(
     callback: CallbackQuery, state: FSMContext
 ):
     user_id = callback.from_user.id
-    running_task = channel_creation_tasks.get(user_id)
+    running_task = chat_creation_tasks.get(user_id)
     if running_task and not running_task.done():
         await callback.answer(
-            'Создание каналов уже запущено',
+            'Создание каналов или групп уже запущено',
             show_alert=True,
         )
         return
 
     data = await state.get_data()
+    creation_kind = data.get('creation_kind', 'channel')
+    labels = get_chat_creation_labels(creation_kind)
     account = await get_account(data['account_id'])
     if not account or account['user_id'] != user_id:
         await callback.answer('Аккаунт не найден', show_alert=True)
@@ -12711,21 +12825,22 @@ async def start_channel_creation(
         return
 
     await callback.message.edit_text(
-        f"{emoji('LOADING')} <b>Создание каналов запущено</b>\n\n"
+        f"{emoji('LOADING')} <b>{labels['title']} запущено</b>\n\n"
         f"Количество: <b>{data['count']}</b>\n"
-        f"Задержка: <b>{CHANNEL_CREATION_DELAY} секунд</b>\n"
-        "Первый канал создаётся сейчас.",
-        reply_markup=get_channel_creation_control_keyboard(),
+        f"Задержка: <b>{CHAT_CREATION_DELAY} секунд</b>\n"
+        f"{labels['first']} создаётся сейчас.",
+        reply_markup=get_chat_creation_control_keyboard(),
     )
     await state.clear()
 
     async def run_creation() -> None:
         try:
-            result = await execute_channel_creation(
+            result = await execute_chat_creation(
                 account_id=data['account_id'],
                 user_id=user_id,
                 count=data['count'],
                 base_title=data['base_title'],
+                creation_kind=creation_kind,
                 progress_message=callback.message,
             )
             failed = result['failed']
@@ -12742,7 +12857,7 @@ async def start_channel_creation(
 
             status = 'остановлено' if result['stopped'] else 'завершено'
             await callback.message.edit_text(
-                f"{emoji('CHECK')} <b>Создание каналов {status}</b>\n\n"
+                f"{emoji('CHECK')} <b>{labels['title']} {status}</b>\n\n"
                 f"Запрошено: <b>{result['total']}</b>\n"
                 f"Создано: <b>{len(result['created'])}</b>\n"
                 f"Ошибок: <b>{len(failed)}</b>"
@@ -12752,10 +12867,14 @@ async def start_channel_creation(
         except asyncio.CancelledError:
             raise
         except Exception as ex:
-            logger.exception('Channel creation task failed for user_id=%s', user_id)
+            logger.exception(
+                '%s creation task failed for user_id=%s',
+                creation_kind, user_id,
+            )
             try:
                 await callback.message.edit_text(
-                    f"{emoji('CROSS')} <b>Не удалось создать каналы</b>\n\n"
+                    f"{emoji('CROSS')} <b>Не удалось создать "
+                    f"{labels['items']}</b>\n\n"
                     f"<code>{escape(str(ex))}</code>",
                     reply_markup=get_functions_keyboard(),
                 )
@@ -12763,28 +12882,28 @@ async def start_channel_creation(
                 pass
         finally:
             current_task = asyncio.current_task()
-            if channel_creation_tasks.get(user_id) is current_task:
-                channel_creation_tasks.pop(user_id, None)
-            channel_creation_stop_flags.pop(user_id, None)
+            if chat_creation_tasks.get(user_id) is current_task:
+                chat_creation_tasks.pop(user_id, None)
+            chat_creation_stop_flags.pop(user_id, None)
 
     task = asyncio.create_task(run_creation())
-    channel_creation_tasks[user_id] = task
+    chat_creation_tasks[user_id] = task
     await callback.answer()
 
 
-@dp.callback_query(F.data == "stop_channel_creation")
-async def stop_channel_creation(callback: CallbackQuery):
+@dp.callback_query(F.data == "stop_chat_creation")
+async def stop_chat_creation(callback: CallbackQuery):
     user_id = callback.from_user.id
-    task = channel_creation_tasks.get(user_id)
+    task = chat_creation_tasks.get(user_id)
     if not task or task.done():
         await callback.answer('Активной задачи нет', show_alert=True)
         return
 
-    channel_creation_stop_flags[user_id] = True
+    chat_creation_stop_flags[user_id] = True
     task.cancel()
     try:
         await callback.message.edit_text(
-            f"{emoji('STOP')} <b>Создание каналов остановлено</b>",
+            f"{emoji('STOP')} <b>Создание остановлено</b>",
             reply_markup=get_functions_keyboard(),
         )
     except Exception:
@@ -12792,8 +12911,8 @@ async def stop_channel_creation(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(F.data == "channel_creation_cancel")
-async def cancel_channel_creation(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "chat_creation_cancel")
+async def cancel_chat_creation(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text(
         f"{emoji('APPS')} <b>Функции</b>\n\nВыберите функцию:",
@@ -14384,7 +14503,7 @@ async def add_proxy_start(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(ProxyStates.waiting_for_proxy_string)
 async def process_proxy_string(message: Message, state: FSMContext):
-    parsed = parse_proxy_string(message.text)
+    parsed = parse_proxy_string(message.text or '')
     if not parsed or not parsed.get('host') or not parsed.get('port'):
         await message.answer(
             f"{emoji('CROSS')} Не удалось распарсить прокси. "
@@ -14395,11 +14514,33 @@ async def process_proxy_string(message: Message, state: FSMContext):
         )
         return
 
-    await state.update_data(proxy=parsed)
-    await message.answer(
-        f"{emoji('CHECK')} Прокси распознан:\n"
+    checking_message = await message.answer(
+        f"{emoji('LOADING')} <b>Проверяю прокси…</b>\n\n"
         f"<code>{parsed['proxy_type']}://"
-        f"{parsed['host']}:{parsed['port']}</code>\n\n"
+        f"{escape(str(parsed['host']))}:{parsed['port']}</code>\n"
+        "Проверка выполняется реальным подключением к Telegram через прокси."
+    )
+    check_result = await check_proxy_connection(parsed)
+    if not check_result.get('ok'):
+        await checking_message.edit_text(
+            f"{emoji('CROSS')} <b>Прокси не работает</b>\n\n"
+            f"<code>{parsed['proxy_type']}://"
+            f"{escape(str(parsed['host']))}:{parsed['port']}</code>\n\n"
+            f"Ошибка: <code>"
+            f"{escape(str(check_result.get('error') or 'нет соединения'))}"
+            f"</code>\n\n"
+            "Прокси не сохранён. Отправьте другой прокси.",
+        )
+        return
+
+    await state.update_data(proxy=parsed, proxy_check=check_result)
+    await checking_message.edit_text(
+        f"{emoji('CHECK')} <b>Прокси работает</b>\n\n"
+        f"<code>{parsed['proxy_type']}://"
+        f"{escape(str(parsed['host']))}:{parsed['port']}</code>\n"
+        f"Отклик: <b>{check_result['latency_ms']} мс</b>\n"
+        f"Проверено через Telegram: "
+        f"<code>{escape(str(check_result['target']))}</code>\n\n"
         f"Хотите добавить подпись для удобства? "
         f"Отправьте название (например, <i>DE-1</i>) "
         f"или '-' чтобы пропустить.",
@@ -14421,6 +14562,7 @@ async def process_proxy_label(message: Message, state: FSMContext):
         label = message.text.strip()[:64]
     data = await state.get_data()
     parsed = data['proxy']
+    check_result = data.get('proxy_check') or {}
 
     proxy_id = await add_proxy(
         message.from_user.id, parsed['proxy_type'], parsed['host'],
@@ -14429,7 +14571,9 @@ async def process_proxy_label(message: Message, state: FSMContext):
     )
 
     await message.answer(
-        f"{emoji('CHECK')} Прокси добавлен (id={proxy_id}).",
+        f"{emoji('CHECK')} Прокси добавлен (id={proxy_id}).\n"
+        f"Проверенный отклик: <b>"
+        f"{check_result.get('latency_ms', '—')} мс</b>.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
                 text="К списку прокси",
@@ -14452,6 +14596,7 @@ async def process_proxy_label(message: Message, state: FSMContext):
 async def skip_proxy_label(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     parsed = data['proxy']
+    check_result = data.get('proxy_check') or {}
 
     proxy_id = await add_proxy(
         callback.from_user.id, parsed['proxy_type'], parsed['host'],
@@ -14460,7 +14605,9 @@ async def skip_proxy_label(callback: CallbackQuery, state: FSMContext):
     )
 
     await callback.message.edit_text(
-        f"{emoji('CHECK')} Прокси добавлен (id={proxy_id}).",
+        f"{emoji('CHECK')} Прокси добавлен (id={proxy_id}).\n"
+        f"Проверенный отклик: <b>"
+        f"{check_result.get('latency_ms', '—')} мс</b>.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
                 text="К списку прокси",
