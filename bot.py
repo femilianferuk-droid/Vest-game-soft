@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -16,6 +18,7 @@ import asyncpg
 import pytz
 import anthropic
 import socks
+from cryptography.fernet import Fernet, InvalidToken
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.methods import DeleteWebhook
@@ -118,6 +121,47 @@ LLM_MODELS = {
     'sonnet-4.6':       'Sonnet 4.6',
 }
 LLM_DEFAULT_MODEL = 'sonnet-4.6'
+
+# Пять независимых разделов, для которых администратор может закрепить
+# одно медиа Telegram (file_id хранится в БД, файл не копируется на диск).
+MEDIA_SECTIONS = {
+    'welcome': 'Приветствие',
+    'account_manager': 'Менеджер аккаунтов',
+    'functions': 'Функции',
+    'subscription': 'Подписка',
+    'ai': 'AI-раздел',
+}
+
+
+def _llm_fernet() -> Fernet:
+    """Ключ шифрования токенов пользовательских AI API.
+
+    В продакшене рекомендуется задать LLM_CONFIG_ENCRYPTION_KEY (Fernet).
+    Без него используется детерминированный ключ от BOT_TOKEN, чтобы старые
+    развёртывания не теряли функциональность после миграции.
+    """
+    configured = (os.getenv('LLM_CONFIG_ENCRYPTION_KEY') or '').strip()
+    if configured:
+        try:
+            return Fernet(configured.encode())
+        except Exception as ex:
+            logger.warning('Invalid LLM_CONFIG_ENCRYPTION_KEY: %s', ex)
+    seed = ('vest-game-soft:llm:' + (BOT_TOKEN or '')).encode()
+    key = base64.urlsafe_b64encode(hashlib.sha256(seed).digest())
+    return Fernet(key)
+
+
+def _encrypt_llm_secret(value: str) -> str:
+    return _llm_fernet().encrypt(value.encode('utf-8')).decode('ascii')
+
+
+def _decrypt_llm_secret(value: str) -> str:
+    try:
+        return _llm_fernet().decrypt(value.encode('ascii')).decode('utf-8')
+    except (InvalidToken, ValueError, TypeError, UnicodeDecodeError):
+        # Позволяем мягко мигрировать ранее сохранённые значения, если они
+        # были записаны до включения шифрования.
+        return value
 
 # --- Инициализация ---
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode='HTML'))
@@ -438,6 +482,17 @@ class AdminStates(StatesGroup):
     waiting_for_gift_days = State()
     waiting_for_revoke_user_id = State()
     waiting_for_user_lookup_id = State()
+    waiting_for_media = State()
+
+
+class BalanceStates(StatesGroup):
+    waiting_for_amount = State()
+
+
+class UserLLMConfigStates(StatesGroup):
+    waiting_for_base_url = State()
+    waiting_for_api_key = State()
+    waiting_for_models = State()
 
 class ParsingStates(StatesGroup):
     waiting_for_account = State()
@@ -868,6 +923,58 @@ async def init_db():
             )
         except:
             pass
+        # Персональные Anthropic-совместимые API пользователя. Токен
+        # хранится только в зашифрованном виде и никогда не показывается.
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS user_llm_apis (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                api_key_ciphertext TEXT NOT NULL,
+                models TEXT[] NOT NULL DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        try:
+            await conn.execute(
+                'ALTER TABLE users ADD COLUMN IF NOT EXISTS llm_active_api_id BIGINT'
+            )
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_user_llm_apis_user '
+                'ON user_llm_apis (user_id, created_at DESC)'
+            )
+        except Exception:
+            pass
+        # Медиа для пяти экранов админ-панели.
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS section_media (
+                section TEXT PRIMARY KEY,
+                file_id TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                caption TEXT DEFAULT '',
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        # Внутренний баланс и одноразовые Crypto Pay пополнения.
+        try:
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS balance NUMERIC(12, 2) "
+                "NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS balance_invoices (
+                invoice_id BIGINT PRIMARY KEY,
+                user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                amount_usdt NUMERIC(12, 6) NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT NOW(),
+                paid_at TIMESTAMP
+            )
+        ''')
 
         # История FloodWait для Smart Delay Engine.
         # Хранит последние N флуд-вейтов на аккаунт, чтобы
@@ -1054,15 +1161,23 @@ async def get_user_accounts(user_id: int) -> List[Dict]:
 
 
 async def get_user_llm_model(user_id: int) -> str:
-    """Возвращает выбранную пользователем LLM-модель или дефолт."""
+    """Возвращает модель активного пользовательского API или встроенную."""
     if db_pool is None:
         return LLM_DEFAULT_MODEL
     try:
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow(
-                'SELECT llm_model FROM users WHERE user_id = $1',
+                '''SELECT u.llm_model, a.models
+                   FROM users u
+                   LEFT JOIN user_llm_apis a ON a.id = u.llm_active_api_id
+                   WHERE u.user_id = $1''',
                 user_id,
             )
+        if row and row['models']:
+            models = [str(x).strip() for x in row['models'] if str(x).strip()]
+            if models:
+                selected = (row['llm_model'] or '').strip()
+                return selected if selected in models else models[0]
         if row and row['llm_model'] in LLM_MODELS:
             return row['llm_model']
     except Exception as e:
@@ -1071,18 +1186,133 @@ async def get_user_llm_model(user_id: int) -> str:
 
 
 async def set_user_llm_model(user_id: int, model: str) -> None:
-    """Сохраняет выбор модели за пользователем. Неизвестную модель игнорирует."""
-    if model not in LLM_MODELS:
-        raise ValueError(f'Unknown model: {model}')
+    """Сохраняет модель из встроенного или активного пользовательского API."""
     if db_pool is None:
         return
     async with db_pool.acquire() as conn:
-        # upsert: создаём запись users, если её ещё нет.
+        allowed = await conn.fetchval(
+            '''SELECT models FROM user_llm_apis a
+               JOIN users u ON u.llm_active_api_id = a.id
+               WHERE u.user_id = $1''', user_id
+        )
+        custom_models = {str(x).strip() for x in (allowed or []) if str(x).strip()}
+        if model not in LLM_MODELS and model not in custom_models:
+            raise ValueError(f'Unknown model: {model}')
         await conn.execute(
             'INSERT INTO users (user_id, llm_model) VALUES ($1, $2) '
             'ON CONFLICT (user_id) DO UPDATE SET llm_model = EXCLUDED.llm_model',
             user_id, model,
         )
+
+
+async def get_user_llm_models(user_id: int) -> List[str]:
+    """Список моделей для текущего режима пользователя."""
+    if db_pool is None:
+        return list(LLM_MODELS)
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                '''SELECT a.models FROM users u
+                   LEFT JOIN user_llm_apis a ON a.id = u.llm_active_api_id
+                   WHERE u.user_id = $1''', user_id
+            )
+        models = [str(x).strip() for x in (row['models'] if row else []) or []]
+        return [x for x in models if x] or list(LLM_MODELS)
+    except Exception:
+        return list(LLM_MODELS)
+
+
+async def get_user_llm_runtime(
+    user_id: Optional[int], requested_model: Optional[str] = None
+) -> Tuple[str, str, str]:
+    """Возвращает (base_url, api_key, model), не раскрывая ключ в UI/логах."""
+    model = requested_model or LLM_DEFAULT_MODEL
+    base_url, api_key = LLM_BASE_URL, LLM_API_KEY
+    if user_id is not None and db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    '''SELECT a.base_url, a.api_key_ciphertext, a.models
+                       FROM users u
+                       JOIN user_llm_apis a ON a.id = u.llm_active_api_id
+                       WHERE u.user_id = $1''', user_id
+                )
+            if row:
+                base_url = str(row['base_url']).strip().rstrip('/')
+                api_key = _decrypt_llm_secret(row['api_key_ciphertext'])
+                custom_models = [str(x).strip() for x in (row['models'] or []) if str(x).strip()]
+                if custom_models and (not requested_model or requested_model not in custom_models):
+                    model = custom_models[0]
+        except Exception as ex:
+            logger.warning('get_user_llm_runtime fallback: %s', ex)
+    return base_url, api_key, model
+
+
+async def get_user_llm_apis(user_id: int) -> List[Dict[str, Any]]:
+    if db_pool is None:
+        return []
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            '''SELECT a.id, a.name, a.base_url, a.models,
+                      (u.llm_active_api_id = a.id) AS is_active
+               FROM user_llm_apis a JOIN users u ON u.user_id = a.user_id
+               WHERE a.user_id = $1 ORDER BY a.created_at DESC''', user_id
+        )
+    return [dict(row) for row in rows]
+
+
+async def has_active_custom_llm_api(user_id: int) -> bool:
+    if db_pool is None:
+        return False
+    async with db_pool.acquire() as conn:
+        return bool(await conn.fetchval(
+            'SELECT 1 FROM users WHERE user_id = $1 AND llm_active_api_id IS NOT NULL',
+            user_id
+        ))
+
+
+async def set_active_llm_api(user_id: int, api_id: Optional[int]) -> None:
+    async with db_pool.acquire() as conn:
+        if api_id is not None:
+            owner = await conn.fetchval(
+                'SELECT 1 FROM user_llm_apis WHERE id = $1 AND user_id = $2',
+                api_id, user_id
+            )
+            if not owner:
+                raise ValueError('API не найден')
+            first_model = await conn.fetchval(
+                'SELECT models[1] FROM user_llm_apis WHERE id = $1', api_id
+            )
+            await conn.execute(
+                'UPDATE users SET llm_active_api_id = $1, llm_model = $2 '
+                'WHERE user_id = $3', api_id, first_model, user_id
+            )
+        else:
+            await conn.execute(
+                'UPDATE users SET llm_active_api_id = NULL, llm_model = $1 '
+                'WHERE user_id = $2', LLM_DEFAULT_MODEL, user_id
+            )
+
+
+async def save_user_llm_api(user_id: int, base_url: str, api_key: str, models: List[str]) -> int:
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                'INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING',
+                user_id
+            )
+            api_id = await conn.fetchval(
+                '''INSERT INTO user_llm_apis
+                   (user_id, name, base_url, api_key_ciphertext, models)
+                   VALUES ($1, $2, $3, $4, $5::text[]) RETURNING id''',
+                user_id, f'API пользователя #{user_id}', base_url.rstrip('/'),
+                _encrypt_llm_secret(api_key), models
+            )
+            await conn.execute(
+                'UPDATE users SET llm_active_api_id = $1, llm_model = $2 WHERE user_id = $3',
+                api_id, models[0], user_id
+            )
+    return int(api_id)
 
 async def get_account(account_id: int) -> Optional[Dict]:
     async with db_pool.acquire() as conn:
@@ -1300,9 +1530,10 @@ async def generate_warming_plan_llm(
     )
 
     started = time.monotonic()
+    runtime_url, runtime_key, model = await get_user_llm_runtime(user_id, model)
     client = anthropic.AsyncAnthropic(
-        api_key=LLM_API_KEY,
-        base_url=LLM_BASE_URL,
+        api_key=runtime_key,
+        base_url=runtime_url,
         timeout=LLM_TIMEOUT,
     )
     response = await client.messages.create(
@@ -3443,9 +3674,10 @@ async def call_llm_api(
 
     # Официальный SDK. base_url ведёт в SmartAPI, но формат — Anthropic:
     # SDK сам добавит /v1/messages и нужные заголовки (x-api-key, anthropic-version).
+    runtime_url, runtime_key, model = await get_user_llm_runtime(user_id, model)
     client = anthropic.AsyncAnthropic(
-        api_key=LLM_API_KEY,
-        base_url=LLM_BASE_URL,
+        api_key=runtime_key,
+        base_url=runtime_url,
         timeout=LLM_TIMEOUT,
     )
     try:
@@ -3514,9 +3746,10 @@ async def call_llm_api_plain(
     if not system_prompt:
         system_prompt = LLM_SECURITY_SYSTEM_PROMPT
 
+    runtime_url, runtime_key, model = await get_user_llm_runtime(user_id, model)
     client = anthropic.AsyncAnthropic(
-        api_key=LLM_API_KEY,
-        base_url=LLM_BASE_URL,
+        api_key=runtime_key,
+        base_url=runtime_url,
         timeout=LLM_TIMEOUT,
     )
     try:
@@ -3584,9 +3817,10 @@ async def call_llm_api_with_history(
         else:
             model = LLM_DEFAULT_MODEL
 
+    runtime_url, runtime_key, model = await get_user_llm_runtime(user_id, model)
     client = anthropic.AsyncAnthropic(
-        api_key=LLM_API_KEY,
-        base_url=LLM_BASE_URL,
+        api_key=runtime_key,
+        base_url=runtime_url,
         timeout=LLM_TIMEOUT,
     )
     try:
@@ -5804,7 +6038,7 @@ async def count_ai_requests_today(user_id: int) -> int:
 async def check_ai_limit(user_id: int) -> bool:
     """Returns True if user is allowed to make an AI request.
     Pro users: unlimited. Free users: max 1 per day."""
-    if await is_pro(user_id):
+    if await is_pro(user_id) or await has_active_custom_llm_api(user_id):
         return True
     count = await count_ai_requests_today(user_id)
     return count < 1
@@ -5890,7 +6124,7 @@ async def cryptopay_create_invoice(
         "currency_type": "crypto",
         "asset": "USDT",
         "amount": str(amount),
-        "description": "Vest Game Soft — Pro подписка (30 дней)",
+        "description": "Vest Game Soft — пополнение баланса" if payload == "wallet_topup" else "Vest Game Soft — Pro подписка (30 дней)",
         "payload": f"{payload}:{user_id}",
         "paid_btn_name": "callback",
         "paid_btn_url": f"https://t.me/{bot_me.username}",
@@ -5901,6 +6135,144 @@ async def cryptopay_create_invoice(
 async def cryptopay_get_invoices(invoice_ids: str) -> Dict[str, Any]:
     """Запросить статус инвойсов. invoice_ids — comma-separated string."""
     return await _cryptopay_request("getInvoices", {"invoice_ids": invoice_ids})
+
+
+# ============================================================
+# БАЛАНС ПОЛЬЗОВАТЕЛЯ
+# ============================================================
+async def get_wallet_balance(user_id: int) -> float:
+    async with db_pool.acquire() as conn:
+        value = await conn.fetchval(
+            'SELECT COALESCE(balance, 0) FROM users WHERE user_id = $1', user_id
+        )
+    return float(value or 0)
+
+
+async def add_wallet_balance(user_id: int, amount: float) -> None:
+    if amount <= 0:
+        raise ValueError('Сумма должна быть положительной')
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            'INSERT INTO users (user_id, balance) VALUES ($1, $2) '
+            'ON CONFLICT (user_id) DO UPDATE SET balance = users.balance + $2',
+            user_id, amount
+        )
+
+
+def get_balance_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text='Пополнить баланс', callback_data='wallet_topup', style='primary',
+        icon_custom_emoji_id=get_icon('MONEY_SEND')
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Назад', callback_data='main_menu', style='default',
+        icon_custom_emoji_id=get_icon('BACK')
+    ))
+    return builder.as_markup()
+
+
+@dp.callback_query(F.data == 'wallet')
+async def wallet_screen(callback: CallbackQuery):
+    balance = await get_wallet_balance(callback.from_user.id)
+    await callback.message.edit_text(
+        f"{emoji('MONEY_SEND')} <b>Баланс</b>\n\n"
+        f"Доступно: <b>{balance:.2f} USDT</b>",
+        reply_markup=get_balance_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == 'wallet_topup')
+async def wallet_topup_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(BalanceStates.waiting_for_amount)
+    await callback.message.edit_text(
+        f"{emoji('MONEY_SEND')} <b>Пополнение баланса</b>\n\n"
+        "Введите сумму в USDT от 0.10 до 1000:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text='Отмена', callback_data='wallet',
+                                 style='default', icon_custom_emoji_id=get_icon('BACK'))
+        ]])
+    )
+    await callback.answer()
+
+
+@dp.message(BalanceStates.waiting_for_amount)
+async def wallet_topup_amount(message: Message, state: FSMContext):
+    try:
+        amount = round(float((message.text or '').replace(',', '.')), 6)
+        if amount < 0.10 or amount > 1000:
+            raise ValueError
+    except ValueError:
+        await message.answer('Введите сумму от 0.10 до 1000 USDT.')
+        return
+    result = await cryptopay_create_invoice(
+        message.from_user.id, amount=f'{amount:.6f}', payload='wallet_topup'
+    )
+    if not result.get('ok'):
+        await state.clear()
+        await message.answer(
+            f"{emoji('CROSS')} Не удалось создать счёт. Попробуйте позже.",
+            reply_markup=get_balance_keyboard()
+        )
+        return
+    inv = result.get('result') or {}
+    invoice_id = inv.get('invoice_id')
+    pay_url = inv.get('mini_app_invoice_url') or inv.get('bot_invoice_url') or inv.get('web_app_invoice_url')
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            '''INSERT INTO balance_invoices (invoice_id, user_id, amount_usdt)
+               VALUES ($1, $2, $3) ON CONFLICT (invoice_id) DO NOTHING''',
+            int(invoice_id), message.from_user.id, amount
+        )
+    await state.clear()
+    builder = InlineKeyboardBuilder()
+    if pay_url:
+        builder.row(InlineKeyboardButton(text='Оплатить через Crypto Pay', url=pay_url,
+                                         style='primary', icon_custom_emoji_id=get_icon('MONEY_SEND')))
+    builder.row(InlineKeyboardButton(text='Проверить оплату', callback_data=f'wallet_check:{invoice_id}',
+                                     style='success', icon_custom_emoji_id=get_icon('CHECK')))
+    builder.row(InlineKeyboardButton(text='Назад', callback_data='wallet', style='default',
+                                     icon_custom_emoji_id=get_icon('BACK')))
+    await message.answer(
+        f"{emoji('MONEY_SEND')} <b>Счёт создан</b>\n\nСумма: <b>{amount:.6f} USDT</b>",
+        reply_markup=builder.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith('wallet_check:'))
+async def wallet_check_payment(callback: CallbackQuery):
+    try:
+        invoice_id = int(callback.data.split(':', 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer('Некорректный счёт', show_alert=True)
+        return
+    async with db_pool.acquire() as conn:
+        invoice = await conn.fetchrow(
+            'SELECT * FROM balance_invoices WHERE invoice_id = $1 AND user_id = $2',
+            invoice_id, callback.from_user.id
+        )
+    if not invoice:
+        await callback.answer('Счёт не найден', show_alert=True)
+        return
+    if invoice['status'] == 'paid':
+        await wallet_screen(callback)
+        return
+    result = await cryptopay_get_invoices(str(invoice_id))
+    item = ((result.get('result') or {}).get('items') or [None])[0] if result.get('ok') else None
+    if not item or item.get('status') != 'paid':
+        await callback.answer('Счёт ещё не оплачен', show_alert=True)
+        return
+    async with db_pool.acquire() as conn:
+        claimed = await conn.fetchrow(
+            "UPDATE balance_invoices SET status = 'paid', paid_at = NOW() "
+            "WHERE invoice_id = $1 AND status = 'active' RETURNING amount_usdt",
+            invoice_id
+        )
+    if claimed:
+        await add_wallet_balance(callback.from_user.id, float(claimed['amount_usdt']))
+    await callback.answer('Баланс пополнен')
+    await wallet_screen(callback)
 
 
 # ------------------------------------------------------------
@@ -6319,6 +6691,20 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
         style='success',
         icon_custom_emoji_id=get_icon("MONEY_SEND")
     ))
+    builder.row(
+        InlineKeyboardButton(
+            text="Баланс",
+            callback_data="wallet",
+            style='default',
+            icon_custom_emoji_id=get_icon("MONEY_SEND")
+        ),
+        InlineKeyboardButton(
+            text="Пополнить баланс",
+            callback_data="wallet_topup",
+            style='primary',
+            icon_custom_emoji_id=get_icon("MONEY_SEND")
+        )
+    )
     builder.row(InlineKeyboardButton(
         text="Помощь",
         callback_data="help",
@@ -6484,6 +6870,12 @@ def get_llm_model_keyboard(current: str) -> InlineKeyboardMarkup:
             style='primary' if key == current else 'default',
         ))
     builder.row(InlineKeyboardButton(
+        text="Настроить свой API",
+        callback_data="ai_api_settings",
+        style='default',
+        icon_custom_emoji_id=get_icon("GEAR")
+    ))
+    builder.row(InlineKeyboardButton(
         text="Назад",
         callback_data="llm_back_to_variants",
         style='default',
@@ -6508,6 +6900,12 @@ def get_llm_model_pick_keyboard(
             style='primary' if key == current else 'default',
         ))
     if include_back:
+        builder.row(InlineKeyboardButton(
+            text="Настроить свой API",
+            callback_data="ai_api_settings",
+            style='default',
+            icon_custom_emoji_id=get_icon("GEAR")
+        ))
         builder.row(InlineKeyboardButton(
             text="Отмена",
             callback_data="llm_cancel_pick",
@@ -7437,6 +7835,140 @@ async def cmd_start(message: Message):
         f"Выберите действие:"
     )
     await message.answer(welcome_text, reply_markup=get_main_menu_keyboard())
+    await send_section_media(message, 'welcome')
+
+async def get_section_media(section: str) -> Optional[Dict[str, Any]]:
+    if section not in MEDIA_SECTIONS or db_pool is None:
+        return None
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow('SELECT * FROM section_media WHERE section = $1', section)
+    return dict(row) if row else None
+
+
+async def send_section_media(message: Message, section: str) -> None:
+    """Отправляет закреплённое админом медиа, если оно настроено."""
+    media = await get_section_media(section)
+    if not media:
+        return
+    caption = media.get('caption') or None
+    try:
+        if media['media_type'] == 'photo':
+            await message.answer_photo(media['file_id'], caption=caption)
+        elif media['media_type'] == 'video':
+            await message.answer_video(media['file_id'], caption=caption)
+        else:
+            await message.answer_document(media['file_id'], caption=caption)
+    except Exception as ex:
+        logger.warning('section media send failed (%s): %s', section, ex)
+
+
+def get_admin_media_keyboard(media_map: Dict[str, Any]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for key, label in MEDIA_SECTIONS.items():
+        status = 'Настроено' if media_map.get(key) else 'Не задано'
+        builder.row(InlineKeyboardButton(
+            text=f'{label}: {status}', callback_data=f'admin_media_set:{key}',
+            style='primary' if media_map.get(key) else 'default',
+            icon_custom_emoji_id=get_icon('MEDIA')
+        ))
+        if media_map.get(key):
+            builder.row(InlineKeyboardButton(
+                text=f'Удалить медиа: {label}', callback_data=f'admin_media_delete:{key}',
+                style='destructive', icon_custom_emoji_id=get_icon('DELETE')
+            ))
+    builder.row(InlineKeyboardButton(
+        text='Назад', callback_data='admin_refresh_stats', style='default',
+        icon_custom_emoji_id=get_icon('BACK')
+    ))
+    return builder.as_markup()
+
+
+@dp.callback_query(F.data == 'admin_media')
+async def admin_media_menu(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    await state.clear()
+    media_map = {key: await get_section_media(key) for key in MEDIA_SECTIONS}
+    await callback.message.edit_text(
+        f"{emoji('MEDIA')} <b>Медиа разделов</b>\n\n"
+        "Выберите раздел, чтобы загрузить фото, видео или документ.",
+        reply_markup=get_admin_media_keyboard(media_map)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('admin_media_set:'))
+async def admin_media_set_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    section = callback.data.split(':', 1)[1]
+    if section not in MEDIA_SECTIONS:
+        await callback.answer('Раздел не найден', show_alert=True)
+        return
+    await state.update_data(media_section=section)
+    await state.set_state(AdminStates.waiting_for_media)
+    await callback.message.edit_text(
+        f"{emoji('MEDIA')} <b>{MEDIA_SECTIONS[section]}</b>\n\n"
+        "Отправьте фото, видео или документ. Подпись к сообщению сохранится.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text='Отмена', callback_data='admin_media', style='default',
+                                 icon_custom_emoji_id=get_icon('BACK'))
+        ]])
+    )
+    await callback.answer()
+
+
+@dp.message(AdminStates.waiting_for_media)
+async def admin_media_receive(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    data = await state.get_data()
+    section = data.get('media_section')
+    file_id = media_type = None
+    if message.photo:
+        file_id, media_type = message.photo[-1].file_id, 'photo'
+    elif message.video:
+        file_id, media_type = message.video.file_id, 'video'
+    elif message.document:
+        file_id, media_type = message.document.file_id, 'document'
+    if not section or not file_id:
+        await message.answer('Отправьте фото, видео или документ.')
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            '''INSERT INTO section_media (section, file_id, media_type, caption)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (section) DO UPDATE SET file_id = EXCLUDED.file_id,
+                 media_type = EXCLUDED.media_type, caption = EXCLUDED.caption,
+                 updated_at = NOW()''',
+            section, file_id, media_type, message.caption or ''
+        )
+    await state.clear()
+    await message.answer(f"{emoji('CHECK')} Медиа для раздела «{MEDIA_SECTIONS[section]}» сохранено.",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                             InlineKeyboardButton(text='К медиа разделов', callback_data='admin_media',
+                                                  style='primary', icon_custom_emoji_id=get_icon('MEDIA'))
+                         ]]))
+
+
+@dp.callback_query(F.data.startswith('admin_media_delete:'))
+async def admin_media_delete(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    section = callback.data.split(':', 1)[1]
+    async with db_pool.acquire() as conn:
+        await conn.execute('DELETE FROM section_media WHERE section = $1', section)
+    await callback.answer('Медиа удалено')
+    media_map = {key: await get_section_media(key) for key in MEDIA_SECTIONS}
+    await callback.message.edit_text(
+        f"{emoji('MEDIA')} <b>Медиа разделов</b>\n\n"
+        "Выберите раздел, чтобы загрузить фото, видео или документ.",
+        reply_markup=get_admin_media_keyboard(media_map)
+    )
+
 
 async def build_admin_panel() -> tuple:
     """Строит текст и клавиатуру главной админ-панели (единый источник)."""
@@ -7467,6 +7999,12 @@ async def build_admin_panel() -> tuple:
         callback_data="admin_revoke_sub",
         style='destructive',
         icon_custom_emoji_id=get_icon("LOCK_CLOSED")
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Медиа разделов",
+        callback_data="admin_media",
+        style='default',
+        icon_custom_emoji_id=get_icon("MEDIA")
     ))
     builder.row(InlineKeyboardButton(
         text="Обновить статистику",
@@ -7521,6 +8059,7 @@ async def back_to_main(callback: CallbackQuery):
         f"Выберите действие:",
         reply_markup=get_main_menu_keyboard()
     )
+    await send_section_media(callback.message, 'welcome')
     await callback.answer()
 
 @dp.callback_query(F.data == "account_manager")
@@ -7529,6 +8068,7 @@ async def account_manager(callback: CallbackQuery):
         f"{emoji('PEOPLE')} <b>Менеджер аккаунтов</b>\n\nВыберите действие:",
         reply_markup=get_account_manager_keyboard()
     )
+    await send_section_media(callback.message, 'account_manager')
     await callback.answer()
 
 @dp.callback_query(F.data == "functions")
@@ -7537,6 +8077,7 @@ async def functions(callback: CallbackQuery):
         f"{emoji('APPS')} <b>Функции</b>\n\nВыберите функцию:",
         reply_markup=get_functions_keyboard()
     )
+    await send_section_media(callback.message, 'functions')
     await callback.answer()
 
 # --- Скрипты: открыть бота, загрузить меню и нажать кнопку ---
@@ -8442,6 +8983,7 @@ async def my_subscription(callback: CallbackQuery):
         _format_sub_text_sync(sub, limits),
         reply_markup=get_subscription_keyboard(sub.get("tier", "free"))
     )
+    await send_section_media(callback.message, 'subscription')
     await callback.answer()
 
 
@@ -8726,6 +9268,133 @@ async def check_sbp_payment(callback: CallbackQuery):
         )
 
 
+# --- Пользовательские AI API ---
+async def _render_llm_api_settings(target: Message, user_id: int) -> None:
+    apis = await get_user_llm_apis(user_id)
+    active = next((a for a in apis if a.get('is_active')), None)
+    lines = [
+        f"{emoji('GEAR')} <b>Настройки AI API</b>",
+        "",
+        f"Режим: <b>{'Ваш API' if active else 'Встроенная версия с лимитами'}</b>",
+    ]
+    if active:
+        lines.append(f"Модели: <code>{escape(', '.join(active.get('models') or []))}</code>")
+    if apis:
+        lines += ['', '<b>Сохранённые API:</b>']
+        for api in apis:
+            marker = 'активен' if api.get('is_active') else 'не активен'
+            lines.append(f"{api['name']} — {marker}")
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text='Добавить новый API', callback_data='ai_api_add',
+                                     style='primary', icon_custom_emoji_id=get_icon('ADD_TEXT')))
+    for api in apis:
+        if not api.get('is_active'):
+            builder.row(InlineKeyboardButton(text=f"Применить: {api['name']}",
+                                             callback_data=f"ai_api_use:{api['id']}", style='default',
+                                             icon_custom_emoji_id=get_icon('CHECK')))
+    if active:
+        builder.row(InlineKeyboardButton(text='Вернуться к встроенной версии', callback_data='ai_api_builtin',
+                                         style='default', icon_custom_emoji_id=get_icon('BACK')))
+    builder.row(InlineKeyboardButton(text='Назад', callback_data='ai_generator', style='default',
+                                     icon_custom_emoji_id=get_icon('BACK')))
+    await target.edit_text('\n'.join(lines), reply_markup=builder.as_markup())
+
+
+@dp.callback_query(F.data == 'ai_api_settings')
+async def ai_api_settings(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await _render_llm_api_settings(callback.message, callback.from_user.id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == 'ai_api_add')
+async def ai_api_add(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(UserLLMConfigStates.waiting_for_base_url)
+    await callback.message.edit_text(
+        f"{emoji('LINK')} <b>Новый AI API</b>\n\n"
+        "Отправьте base URL Anthropic-совместимого API (https://...):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text='Отмена', callback_data='ai_api_settings', style='default',
+                                 icon_custom_emoji_id=get_icon('BACK'))
+        ]])
+    )
+    await callback.answer()
+
+
+@dp.message(UserLLMConfigStates.waiting_for_base_url)
+async def ai_api_base_url(message: Message, state: FSMContext):
+    value = (message.text or '').strip().rstrip('/')
+    parsed = urlparse(value)
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc or '@' in parsed.netloc:
+        await message.answer('Нужен корректный URL с http:// или https:// без логина и пароля.')
+        return
+    await state.update_data(base_url=value)
+    await state.set_state(UserLLMConfigStates.waiting_for_api_key)
+    await message.answer('Отправьте API-токен. Он будет зашифрован в базе и не показывается повторно.')
+
+
+@dp.message(UserLLMConfigStates.waiting_for_api_key)
+async def ai_api_key(message: Message, state: FSMContext):
+    value = (message.text or '').strip()
+    if len(value) < 8 or len(value) > 4096:
+        await message.answer('Токен имеет некорректную длину. Отправьте его ещё раз.')
+        return
+    await state.update_data(api_key=value)
+    await state.set_state(UserLLMConfigStates.waiting_for_models)
+    await message.answer('Укажите модели через запятую, например: claude-3-5-sonnet, deepseek-chat')
+
+
+@dp.message(UserLLMConfigStates.waiting_for_models)
+async def ai_api_models(message: Message, state: FSMContext):
+    models = [x.strip() for x in (message.text or '').split(',') if x.strip()]
+    models = list(dict.fromkeys(models))
+    if not models or len(models) > 20 or any(len(x) > 120 for x in models):
+        await message.answer('Укажите от 1 до 20 моделей через запятую.')
+        return
+    data = await state.get_data()
+    try:
+        await save_user_llm_api(message.from_user.id, data['base_url'], data['api_key'], models)
+    except Exception as ex:
+        logger.exception('save user llm api failed')
+        await state.clear()
+        await message.answer(f"{emoji('CROSS')} Не удалось сохранить настройки. Попробуйте позже.")
+        return
+    await state.clear()
+    await message.answer(f"{emoji('CHECK')} API применён. Активная модель: <code>{escape(models[0])}</code>")
+    await _render_llm_api_settings(message, message.from_user.id)
+
+
+@dp.callback_query(F.data.startswith('ai_api_use:'))
+async def ai_api_use(callback: CallbackQuery):
+    try:
+        await set_active_llm_api(callback.from_user.id, int(callback.data.split(':', 1)[1]))
+    except Exception:
+        await callback.answer('API не найден', show_alert=True)
+        return
+    await _render_llm_api_settings(callback.message, callback.from_user.id)
+    await callback.answer('API применён')
+
+
+@dp.callback_query(F.data == 'ai_api_builtin')
+async def ai_api_builtin(callback: CallbackQuery):
+    await set_active_llm_api(callback.from_user.id, None)
+    await _render_llm_api_settings(callback.message, callback.from_user.id)
+    await callback.answer('Встроенная версия включена')
+
+
+@dp.callback_query(F.data == 'llm_choose_custom', LLMStates.choosing_model)
+async def llm_choose_custom(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(LLMStates.waiting_for_prompt)
+    await callback.message.edit_text(
+        f"{emoji('AI')} Опишите задачу для вашей модели:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text='Настройки API', callback_data='ai_api_settings',
+                                 style='default', icon_custom_emoji_id=get_icon('GEAR'))
+        ]])
+    )
+    await callback.answer()
+
+
 # --- AI Генератор текста (LLM) ---
 @dp.callback_query(F.data == "ai_generator")
 async def ai_generator_start(callback: CallbackQuery, state: FSMContext):
@@ -8740,17 +9409,27 @@ async def ai_generator_start(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     current = await get_user_llm_model(callback.from_user.id)
     label = LLM_MODELS.get(current, LLM_DEFAULT_MODEL)
+    custom_api = await has_active_custom_llm_api(callback.from_user.id)
     text = (
         f"{emoji('AI')} <b>AI Генератор текста</b>\n\n"
         f"{emoji('INFO')} Шаг 1 из 2. Выбери модель для генерации. "
         f"На шаге 2 опишешь задачу — бот пришлёт "
         f"<b>3 разных варианта</b> готового текста.\n\n"
-        f"По умолчанию: <code>{escape(label)}</code>"
+        f"Текущая модель: <code>{escape(label if not custom_api else current)}</code>"
     )
-    await callback.message.edit_text(
-        text,
-        reply_markup=get_llm_model_pick_keyboard(current, include_back=True)
-    )
+    if custom_api:
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text=f"Использовать {current}", callback_data='llm_choose_custom',
+                                         style='primary', icon_custom_emoji_id=get_icon('AI')))
+        builder.row(InlineKeyboardButton(text='Настройки API', callback_data='ai_api_settings', style='default',
+                                         icon_custom_emoji_id=get_icon('GEAR')))
+        builder.row(InlineKeyboardButton(text='Назад', callback_data='functions', style='default',
+                                         icon_custom_emoji_id=get_icon('BACK')))
+        markup = builder.as_markup()
+    else:
+        markup = get_llm_model_pick_keyboard(current, include_back=True)
+    await callback.message.edit_text(text, reply_markup=markup)
+    await send_section_media(callback.message, 'ai')
     await state.set_state(LLMStates.choosing_model)
     await callback.answer()
 
@@ -10608,7 +11287,7 @@ def _parse_ai_profile_json(content: str) -> Optional[Dict[str, str]]:
     }
 
 
-async def _generate_profile_with_ai(prompt: str) -> Optional[Dict[str, str]]:
+async def _generate_profile_with_ai(prompt: str, user_id: Optional[int] = None) -> Optional[Dict[str, str]]:
     """Генерирует имя/фамилию/описание через DeepSeek (deepseek-v4-flash)."""
     system = (
         "Ты помогаешь оформить профиль Telegram-аккаунта. "
@@ -10620,13 +11299,16 @@ async def _generate_profile_with_ai(prompt: str) -> Optional[Dict[str, str]]:
         "Верни СТРОГО JSON без пояснений и без markdown в формате: "
         '{"first_name": "...", "last_name": "...", "about": "..."}'
     )
+    runtime_url, runtime_key, runtime_model = await get_user_llm_runtime(
+        user_id, PROFILE_AI_MODEL
+    )
     client = anthropic.AsyncAnthropic(
-        api_key=LLM_API_KEY,
-        base_url=LLM_BASE_URL,
+        api_key=runtime_key,
+        base_url=runtime_url,
         timeout=LLM_TIMEOUT,
     )
     response = await client.messages.create(
-        model=PROFILE_AI_MODEL,
+        model=runtime_model,
         max_tokens=512,
         system=system,
         messages=[{'role': 'user', 'content': prompt}],
@@ -10698,7 +11380,7 @@ async def profile_ai_generate(message: Message, state: FSMContext):
         f"{emoji('LOADING')} Генерирую профиль через DeepSeek…"
     )
     try:
-        result = await _generate_profile_with_ai(prompt)
+        result = await _generate_profile_with_ai(prompt, message.from_user.id)
     except Exception as ex:
         logger.exception("profile AI generation failed")
         await thinking.edit_text(
