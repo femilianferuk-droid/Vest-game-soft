@@ -32,7 +32,7 @@ from aiogram.types import (
     InlineKeyboardButton, FSInputFile, BufferedInputFile
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.errors import (
     SessionPasswordNeededError, FloodWaitError, BadRequestError, RPCError,
 )
@@ -182,6 +182,8 @@ join_stop_flags: Dict[int, bool] = {}
 join_tasks: Dict[int, asyncio.Task] = {}
 chat_creation_stop_flags: Dict[int, bool] = {}
 chat_creation_tasks: Dict[int, asyncio.Task] = {}
+autosub_tasks: Dict[int, asyncio.Task] = {}
+autosub_stop_flags: Dict[int, bool] = {}
 autolike_tasks: Dict[int, asyncio.Task] = {}
 autolike_stop_flags: Dict[int, bool] = {}
 delete_messages_stop_flags: Dict[int, bool] = {}
@@ -482,6 +484,8 @@ class BroadcastStates(StatesGroup):
     waiting_for_count = State()
     waiting_for_message = State()
     preview = State()
+    waiting_for_button_text = State()
+    waiting_for_button_url = State()
 
 class ScheduledBroadcastStates(StatesGroup):
     waiting_for_account = State()
@@ -498,6 +502,8 @@ class DMBroadcastStates(StatesGroup):
     waiting_for_message = State()
     waiting_for_delay = State()
     preview = State()
+    waiting_for_button_text = State()
+    waiting_for_button_url = State()
 
 class AutoResponderStates(StatesGroup):
     waiting_for_account = State()
@@ -533,6 +539,10 @@ class JoinStates(StatesGroup):
     waiting_for_file = State()
     waiting_for_delay = State()
     preview = State()
+
+
+class AutoSubStates(StatesGroup):
+    waiting_for_account = State()
 
 
 class ChatCreationStates(StatesGroup):
@@ -945,6 +955,15 @@ async def init_db():
             )
         except:
             pass
+        try:
+            await conn.execute(
+                "ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS message_buttons JSONB DEFAULT '[]'::jsonb"
+            )
+            await conn.execute(
+                "ALTER TABLE dm_broadcasts ADD COLUMN IF NOT EXISTS message_buttons JSONB DEFAULT '[]'::jsonb"
+            )
+        except:
+            pass
         # Пользовательская настройка LLM-модели.
         try:
             await conn.execute(
@@ -983,6 +1002,14 @@ async def init_db():
                 file_id TEXT NOT NULL,
                 media_type TEXT NOT NULL,
                 caption TEXT DEFAULT '',
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS autosub_configs (
+                account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+                user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
                 updated_at TIMESTAMP DEFAULT NOW()
             )
         ''')
@@ -3262,6 +3289,7 @@ async def get_chats_from_client(
 async def send_message_to_chat(
     client: TelegramClient, account_id: int, chat_id: str,
     text: str, media_paths: List[str] = None,
+    buttons: Optional[List[Dict[str, str]]] = None,
     smart_delay_enabled: bool = True
 ):
     try:
@@ -3280,19 +3308,20 @@ async def send_message_to_chat(
             except Exception as ex:
                 logger.warning(f"smart_delay pre-send failed: {ex}")
 
+        telethon_buttons = _build_telethon_url_buttons(buttons)
         if media_paths and len(media_paths) > 0:
             if len(media_paths) == 1:
                 await client.send_file(
                     chat_id_int, media_paths[0],
-                    caption=text, parse_mode='html'
+                    caption=text, parse_mode='html', buttons=telethon_buttons
                 )
             else:
                 await client.send_file(
                     chat_id_int, media_paths,
-                    caption=text, parse_mode='html'
+                    caption=text, parse_mode='html', buttons=telethon_buttons
                 )
         else:
-            await client.send_message(chat_id_int, text, parse_mode='html')
+            await client.send_message(chat_id_int, text, parse_mode='html', buttons=telethon_buttons)
 
         await add_account_log(
             account_id, str(chat_id_int), chat_id_int, 'sent', text[:100]
@@ -3313,6 +3342,20 @@ async def send_message_to_chat(
         return False
 
 
+def _build_telethon_url_buttons(buttons: Optional[List[Dict[str, str]]]):
+    """Строит только безопасные URL-кнопки для Telethon."""
+    result = []
+    for item in buttons or []:
+        if not isinstance(item, dict):
+            continue
+        label = (item.get('text') or '').strip()[:64]
+        url = (item.get('url') or '').strip()
+        parsed = urlparse(url)
+        if label and parsed.scheme in ('http', 'https') and parsed.netloc:
+            result.append([Button.url(label, url)])
+    return result or None
+
+
 async def _send_variant_to_chat(
     client: TelegramClient, account_id: int, chat_id: str,
     variants: list
@@ -3326,6 +3369,7 @@ async def _send_variant_to_chat(
         client, account_id, chat_id,
         variant.get('text') or '',
         variant.get('media') or [],
+        variant.get('buttons') or [],
     )
 
 
@@ -5230,11 +5274,15 @@ def _normalize_message_variants(
             media = item.get('media') or []
             if isinstance(media, str):
                 media = [media]
-            variants.append({'text': text, 'media': list(media or [])})
+            variants.append({
+                'text': text, 'media': list(media or []),
+                'buttons': list(item.get('buttons') or []),
+            })
     if not variants:
         variants.append({
             'text': fallback_text or '',
             'media': list(fallback_media or []),
+            'buttons': [],
         })
     return variants
 
@@ -5420,6 +5468,7 @@ async def execute_dm_broadcast_db(
                 variant.get('text') or '', user_data
             )
             variant_media = variant.get('media') or []
+            variant_buttons = _build_telethon_url_buttons(variant.get('buttons') or [])
 
             if variant_media and len(variant_media) > 0:
                 if (
@@ -5428,16 +5477,16 @@ async def execute_dm_broadcast_db(
                 ):
                     await client.send_file(
                         entity.id, variant_media[0],
-                        caption=variant_text, parse_mode='html'
+                        caption=variant_text, parse_mode='html', buttons=variant_buttons
                     )
                 else:
                     await client.send_file(
                         entity.id, variant_media,
-                        caption=variant_text, parse_mode='html'
+                        caption=variant_text, parse_mode='html', buttons=variant_buttons
                     )
             else:
                 await client.send_message(
-                    entity.id, variant_text, parse_mode='html'
+                    entity.id, variant_text, parse_mode='html', buttons=variant_buttons
                 )
             
             await add_account_log(
@@ -7041,25 +7090,26 @@ def get_functions_keyboard() -> InlineKeyboardMarkup:
             button("Создать каналы", "create_channels", "GLOBE"),
         ),
         (
+            button("Автосаб", "autosub", "JOIN"),
             button("Создать группы", "create_groups", "PEOPLE"),
+        ),
+        (
             button("Авто-лайкинг", "autolike", "LIKE"),
-        ),
-        (
             button("Удалить сообщения", "delete_messages", "SWEEP"),
+        ),
+        (
             button("Парсинг чата", "parsing", "USERS"),
-        ),
-        (
             button("Скрипты", "scripts", "PLAY"),
+        ),
+        (
             button("AI Генератор", "ai_generator", "AI"),
-        ),
-        (
             button("Мои AI запросы", "ai_history", "CHART", 'default'),
-            button("Мои рассылки", "my_broadcasts", "CHART", 'default'),
         ),
         (
-            button(
-                "Мои автоответчики", "my_auto_responders", "BELL", 'default'
-            ),
+            button("Мои рассылки", "my_broadcasts", "CHART", 'default'),
+            button("Мои автоответчики", "my_auto_responders", "BELL", 'default'),
+        ),
+        (
             button("Назад", "main_menu", "BACK", 'default'),
         ),
     )
@@ -12349,6 +12399,12 @@ def _collecting_keyboard(count: int, max_count: int = 100) -> InlineKeyboardMark
             style='success',
             icon_custom_emoji_id=get_icon("CHECK")
         ))
+        builder.row(InlineKeyboardButton(
+            text="Добавить URL-кнопку к последнему",
+            callback_data="broadcast_add_button",
+            style='default',
+            icon_custom_emoji_id=get_icon("LINK")
+        ))
     builder.row(InlineKeyboardButton(
         text="Отмена",
         callback_data="broadcast",
@@ -12376,7 +12432,7 @@ async def process_broadcast_message(message: Message, state: FSMContext):
         )
         return
 
-    variants.append({'text': text, 'media': media_paths})
+    variants.append({'text': text, 'media': media_paths, 'buttons': []})
     await state.update_data(
         message_texts=variants,
         message_text=text,
@@ -12401,6 +12457,101 @@ async def process_broadcast_message(message: Message, state: FSMContext):
         f"«Готово». Можно добавить до 100 вариантов.",
         reply_markup=_collecting_keyboard(len(variants), 100)
     )
+
+
+@dp.callback_query(F.data == "broadcast_add_button")
+async def broadcast_add_button_start(callback: CallbackQuery, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state == BroadcastStates.waiting_for_message.state:
+        await state.set_state(BroadcastStates.waiting_for_button_text)
+    elif current_state == DMBroadcastStates.waiting_for_message.state:
+        await state.set_state(DMBroadcastStates.waiting_for_button_text)
+    else:
+        await callback.answer('Сначала добавьте сообщение', show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"{emoji('LINK')} <b>URL-кнопка</b>\n\nВведите текст кнопки (до 64 символов):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text='Отмена', callback_data='broadcast_button_cancel',
+                                 style='default', icon_custom_emoji_id=get_icon('BACK'))
+        ]])
+    )
+    await callback.answer()
+
+
+async def _save_broadcast_button(message: Message, state: FSMContext, button_text: str, button_url: str):
+    data = await state.get_data()
+    variants = list(data.get('message_texts') or [])
+    if not variants:
+        await message.answer('Нет сообщения для добавления кнопки.')
+        return
+    variants[-1] = dict(variants[-1])
+    variants[-1]['buttons'] = [{'text': button_text, 'url': button_url}]
+    await state.update_data(message_texts=variants)
+    await state.set_state(BroadcastStates.waiting_for_message if data.get('message_count') is not None
+                          else DMBroadcastStates.waiting_for_message)
+    await message.answer(
+        f"{emoji('CHECK')} Кнопка добавлена: <b>{escape(button_text)}</b>\n"
+        f"<code>{escape(button_url)}</code>",
+        reply_markup=_collecting_keyboard(len(variants), 100)
+    )
+
+
+@dp.message(BroadcastStates.waiting_for_button_text)
+async def broadcast_button_text(message: Message, state: FSMContext):
+    text = (message.text or '').strip()
+    if not text or len(text) > 64:
+        await message.answer('Введите текст кнопки длиной от 1 до 64 символов.')
+        return
+    await state.update_data(button_text=text)
+    await state.set_state(BroadcastStates.waiting_for_button_url)
+    await message.answer('Теперь отправьте URL, начинающийся с http:// или https://')
+
+
+@dp.message(BroadcastStates.waiting_for_button_url)
+async def broadcast_button_url(message: Message, state: FSMContext):
+    url = (message.text or '').strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        await message.answer('Некорректный URL. Используйте http:// или https://')
+        return
+    data = await state.get_data()
+    await _save_broadcast_button(message, state, data.get('button_text') or 'Открыть', url)
+
+
+@dp.message(DMBroadcastStates.waiting_for_button_text)
+async def dm_broadcast_button_text(message: Message, state: FSMContext):
+    text = (message.text or '').strip()
+    if not text or len(text) > 64:
+        await message.answer('Введите текст кнопки длиной от 1 до 64 символов.')
+        return
+    await state.update_data(button_text=text)
+    await state.set_state(DMBroadcastStates.waiting_for_button_url)
+    await message.answer('Теперь отправьте URL, начинающийся с http:// или https://')
+
+
+@dp.message(DMBroadcastStates.waiting_for_button_url)
+async def dm_broadcast_button_url(message: Message, state: FSMContext):
+    url = (message.text or '').strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        await message.answer('Некорректный URL. Используйте http:// или https://')
+        return
+    data = await state.get_data()
+    await _save_broadcast_button(message, state, data.get('button_text') or 'Открыть', url)
+
+
+@dp.callback_query(F.data == "broadcast_button_cancel")
+async def broadcast_button_cancel(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    variants = list(data.get('message_texts') or [])
+    await state.set_state(BroadcastStates.waiting_for_message if data.get('message_count') is not None
+                          else DMBroadcastStates.waiting_for_message)
+    await callback.message.edit_text(
+        f"{emoji('INFO')} Возврат к конструктору сообщений.",
+        reply_markup=_collecting_keyboard(len(variants), 100)
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "broadcast_messages_done")
@@ -12574,7 +12725,7 @@ async def scheduled_process_message(message: Message, state: FSMContext):
         )
         return
 
-    variants.append({'text': text, 'media': media_paths})
+    variants.append({'text': text, 'media': media_paths, 'buttons': []})
     await state.update_data(
         message_texts=variants,
         message_text=text,
@@ -13655,6 +13806,149 @@ async def cancel_chat_creation(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 # --- Вступление в чаты ---
+AUTOSUB_DELAY = 10
+
+
+def get_autosub_keyboard(account_id: int, active: bool = False) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    if active:
+        builder.row(InlineKeyboardButton(
+            text='Отключить Автосаб', callback_data=f'autosub_stop:{account_id}',
+            style='destructive', icon_custom_emoji_id=get_icon('STOP')
+        ))
+    builder.row(InlineKeyboardButton(
+        text='Назад', callback_data='functions', style='default',
+        icon_custom_emoji_id=get_icon('BACK')
+    ))
+    return builder.as_markup()
+
+
+def _extract_button_urls(message) -> List[str]:
+    urls = []
+    markup = getattr(message, 'reply_markup', None)
+    for row in getattr(markup, 'rows', []) or []:
+        for button in getattr(row, 'buttons', []) or []:
+            url = getattr(button, 'url', None)
+            if isinstance(url, str) and url.startswith(('https://t.me/', 'http://t.me/')):
+                urls.append(url)
+    return list(dict.fromkeys(urls))
+
+
+async def _autosub_join_url(client: TelegramClient, url: str) -> bool:
+    parsed = urlparse(url)
+    path = parsed.path.strip('/')
+    if not path:
+        return False
+    if path.startswith('+') or path.startswith('joinchat/'):
+        invite_hash = path[1:] if path.startswith('+') else path.split('/', 1)[1]
+        await client(ImportChatInviteRequest(invite_hash))
+    else:
+        username = path.split('/', 1)[0]
+        entity = await client.get_entity('@' + username.lstrip('@'))
+        await client(JoinChannelRequest(entity))
+    return True
+
+
+async def autosub_worker(account_id: int, user_id: int):
+    client = await get_client_for_account(account_id)
+    if not client:
+        return
+    me = await client.get_me()
+    username = (getattr(me, 'username', None) or '').lower()
+    if not username:
+        return
+    seen_urls = set()
+
+    @client.on(events.NewMessage(incoming=True))
+    async def handler(event):
+        if autosub_stop_flags.get(account_id):
+            return
+        text = event.raw_text or ''
+        if not re.search(r'(?<!\w)@' + re.escape(username) + r'\b', text, re.I):
+            return
+        for url in _extract_button_urls(event.message):
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            try:
+                await _autosub_join_url(client, url)
+                await add_account_log(account_id, url, 0, 'autosub_join', text[:100])
+            except FloodWaitError as ex:
+                await record_flood_wait(account_id, 0, ex.seconds)
+                await asyncio.sleep(min(ex.seconds, 3600))
+            except Exception as ex:
+                logger.info('Autosub skipped %s: %s', url, ex)
+            await asyncio.sleep(AUTOSUB_DELAY)
+
+    try:
+        while not autosub_stop_flags.get(account_id) and client.is_connected():
+            await asyncio.sleep(1)
+    finally:
+        client.remove_event_handler(handler)
+        autosub_stop_flags.pop(account_id, None)
+        autosub_tasks.pop(account_id, None)
+
+
+@dp.callback_query(F.data == 'autosub')
+async def autosub_menu(callback: CallbackQuery, state: FSMContext):
+    accounts = await get_user_accounts(callback.from_user.id)
+    if not accounts:
+        await callback.message.edit_text('У вас нет аккаунтов.', reply_markup=get_functions_keyboard())
+        await callback.answer()
+        return
+    await callback.message.edit_text(
+        f"{emoji('JOIN')} <b>Автосаб</b>\n\nВыберите аккаунт для запуска:",
+        reply_markup=get_accounts_list_keyboard(accounts, 'autosub_account')
+    )
+    await state.set_state(AutoSubStates.waiting_for_account)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('autosub_account_'), AutoSubStates.waiting_for_account)
+async def autosub_start(callback: CallbackQuery, state: FSMContext):
+    account_id = int(callback.data.rsplit('_', 1)[1])
+    account = await get_account(account_id)
+    if not account or account.get('user_id') != callback.from_user.id:
+        await callback.answer('Аккаунт не найден', show_alert=True)
+        return
+    old = autosub_tasks.get(account_id)
+    if old and not old.done():
+        await callback.answer('Автосаб уже запущен', show_alert=True)
+        return
+    autosub_stop_flags[account_id] = False
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            '''INSERT INTO autosub_configs (account_id, user_id, is_active)
+               VALUES ($1, $2, TRUE)
+               ON CONFLICT (account_id) DO UPDATE SET is_active = TRUE, updated_at = NOW()''',
+            account_id, callback.from_user.id
+        )
+    task = asyncio.create_task(autosub_worker(account_id, callback.from_user.id))
+    autosub_tasks[account_id] = task
+    await state.clear()
+    await callback.message.edit_text(
+        f"{emoji('CHECK')} <b>Автосаб запущен</b>\n\n"
+        f"Аккаунт: <code>{escape(account.get('phone') or str(account_id))}</code>\n"
+        f"Проверка упоминаний и URL-кнопок активна.\n"
+        f"Задержка между вступлениями: <b>{AUTOSUB_DELAY} секунд</b>",
+        reply_markup=get_autosub_keyboard(account_id, True)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('autosub_stop:'))
+async def autosub_stop(callback: CallbackQuery):
+    account_id = int(callback.data.split(':', 1)[1])
+    autosub_stop_flags[account_id] = True
+    task = autosub_tasks.get(account_id)
+    if task and not task.done():
+        task.cancel()
+    async with db_pool.acquire() as conn:
+        await conn.execute('UPDATE autosub_configs SET is_active = FALSE, updated_at = NOW() WHERE account_id = $1', account_id)
+    await callback.message.edit_text('Автосаб отключён.', reply_markup=get_functions_keyboard())
+    await callback.answer('Отключено')
+
+
 @dp.callback_query(F.data == "join_chats")
 async def join_chats_menu(callback: CallbackQuery, state: FSMContext):
     accounts = await get_user_accounts(callback.from_user.id)
