@@ -290,28 +290,44 @@ for _sym, _eid in (EMOJI[k] for k in EMOJI):
     _EMOJI_SYMBOL_TO_ID.setdefault(_sym, _eid)
 
 
-def _strip_leading_emoji(text: str) -> Tuple[str, Optional[str]]:
-    """Снимает обычный эмодзи в начале строки.
+_EMOJI_FORMATTING_CODEPOINTS = {
+    0x200D,  # zero-width joiner in compound emoji
+    0x20E3,  # keycap combining mark
+    0xFE0E,  # text presentation selector
+    0xFE0F,  # emoji presentation selector
+}
 
-    Возвращает кортеж (новый_текст, custom_emoji_id):
-      • новый_текст — строка без эмодзи и без следующего за ним пробела;
-      • custom_emoji_id — id из EMOJI, если эмодзи нашёлся, иначе None.
-    Если эмодзи в начале нет, возвращает (text, None) без изменений.
-    Если эмодзи есть, но его нет в EMOJI (например, 📜, 📄, 🛡) — текст
-    всё равно обрезается, чтобы обычный эмодзи не дублировал premium-
-    иконку, даже если её и не получится подставить.
+
+def _strip_button_emojis(text: str) -> Tuple[str, Optional[str]]:
+    """Удаляет обычные эмодзи из текста кнопки.
+
+    Telegram получает премиум-иконку через ``icon_custom_emoji_id``.
+    Обычные emoji в ``text`` больше не оставляем: они могут отображаться
+    как цветные символы или как ромб с вопросительным знаком на клиенте.
+    Если первый найденный символ есть в ``EMOJI``, его premium-id будет
+    использован автоматически, когда кнопка не задала иконку сама.
     """
     if not text:
         return text, None
-    first = text[0]
-    if _is_emoji_char(first):
-        rest = text[1:]
-        # Срезаем один ведущий пробел, если он есть — чтобы кнопка не
-        # начиналась с двойного отступа.
-        if rest.startswith(' '):
-            rest = rest[1:]
-        return rest, _EMOJI_SYMBOL_TO_ID.get(first)
-    return text, None
+
+    clean_chars: List[str] = []
+    found_id: Optional[str] = None
+    for char in str(text):
+        codepoint = ord(char)
+        is_emoji = (
+            _is_emoji_char(char)
+            or codepoint in _EMOJI_FORMATTING_CODEPOINTS
+        )
+        if is_emoji:
+            if found_id is None:
+                found_id = _EMOJI_SYMBOL_TO_ID.get(char)
+            continue
+        clean_chars.append(char)
+
+    # Удаление emoji часто оставляет двойные пробелы, например
+    # ``"🤖 С ИИ ✅"`` → ``"  С ИИ  "``.
+    clean_text = re.sub(r'\s+', ' ', ''.join(clean_chars)).strip()
+    return clean_text, found_id
 
 
 # Диапазоны codepoints, которые Unicode относит к эмодзи.
@@ -352,17 +368,15 @@ class InlineKeyboardButton(_OriginalInlineKeyboardButton):  # noqa: F811
             else:
                 kwargs['style'] = style
 
-        # Если в тексте кнопки в начале стоит обычный эмодзи (не premium) —
-        # убираем его. Telegram и так рисует premium-иконку через
-        # icon_custom_emoji_id, оставлять «👥 👥 Менеджер» — дубль.
+        # Убираем обычные emoji из любого места текста кнопки. Telegram
+        # рисует только premium-иконку через icon_custom_emoji_id.
         text = kwargs.get('text')
         if text:
-            new_text, found_id = _strip_leading_emoji(text)
-            if found_id is not None:
-                kwargs['text'] = new_text
-                # Если иконка не задана явно — подставим из словаря.
-                if not kwargs.get('icon_custom_emoji_id'):
-                    kwargs['icon_custom_emoji_id'] = found_id
+            new_text, found_id = _strip_button_emojis(text)
+            kwargs['text'] = new_text
+            # Если иконка не задана явно — подставим premium-id из словаря.
+            if found_id is not None and not kwargs.get('icon_custom_emoji_id'):
+                kwargs['icon_custom_emoji_id'] = found_id
 
         if kwargs.get('icon_custom_emoji_id') in (None, ''):
             kwargs.pop('icon_custom_emoji_id', None)
@@ -833,7 +847,7 @@ async def init_db():
             pass
         # Список сообщений для рандомной рассылки (JSONB-массив объектов
         # {text, media}). Если заполнен — execute_*_broadcast будет
-        # случайно выбират�� одно из сообщений при каждой отправке.
+        # случайно выбирать одно из сообщений при каждой отправке.
         try:
             await conn.execute(
                 "ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS message_texts JSONB DEFAULT '[]'::jsonb"
@@ -937,7 +951,7 @@ async def init_db():
         # model         — выбранная LLM (по умолчанию глобальная).
         # history       — JSONB, ключ = chat_id (str), значение = список пар
         #                 {role, content} последних ACCT_AR_HISTORY_PAIRS*2
-        #                 сообщений для этого с����беседника.
+        #                 сообщений для этого собеседника.
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS account_ai_responder (
                 account_id     INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
@@ -960,7 +974,7 @@ async def register_user(user_id: int, username: str, first_name: str):
             user_id, username, first_name
         )
 
-# --- ��огирование ---
+# --- Логирование ---
 async def add_account_log(
     account_id: int, chat_name: str, chat_id: int, 
     direction: str, message_text: str = ""
@@ -1039,7 +1053,7 @@ async def get_user_accounts(user_id: int) -> List[Dict]:
 
 
 async def get_user_llm_model(user_id: int) -> str:
-    """��озвращает выбранную пользователем LLM-модель или дефолт."""
+    """Возвращает выбранную пользователем LLM-модель или дефолт."""
     if db_pool is None:
         return LLM_DEFAULT_MODEL
     try:
@@ -1376,7 +1390,7 @@ def _format_warming_plan_message(plan: dict, narrative: str) -> str:
         f"Волн: <b>~{total}</b> · "
         f"Паузы: <b>{imin}–{imax} мин</b>\n",
         f"{emoji('CHART')} <b>Распределение действий:</b>\n"
-        f" • Чтение ��иалогов — <b>{pct(d.get('read_dialogs', 0))}%</b>\n"
+        f" • Чтение диалогов — <b>{pct(d.get('read_dialogs', 0))}%</b>\n"
         f" • Сторис — <b>{pct(d.get('view_stories', 0))}%</b>\n"
         f" • Реакции — <b>{pct(d.get('react', 0))}%</b>\n"
         f" • Заметки в Избранном — <b>{pct(d.get('saved_note', 0))}%</b>\n"
@@ -1447,7 +1461,7 @@ def _warming_plan_keyboard(plan_id: int, account_id: int) -> InlineKeyboardMarku
     ))
     builder.row(
         InlineKeyboardButton(
-            text="Пер��генерировать",
+            text="Перегенерировать",
             callback_data=f"regen_warming_{account_id}",
             style='primary',
             icon_custom_emoji_id=get_icon("REFRESH")
@@ -3184,7 +3198,7 @@ LLM_SYSTEM_PROMPT = (
     "5. Строго следуй параметрам пользователя: тема, длина, канал, "
     "аудитория, цель. Не выходи за рамки.\n\n"
     "Формат ответа — СТРОГО JSON, без markdown-обёрток, без пояснений, "
-    "без пре��иксов вроде \"Вот варианты:\":\n"
+    "без префиксов вроде \"Вот варианты:\":\n"
     "{\n"
     '  "variants": [\n'
     '    {"title": "короткий заголовок 1", "text": "текст 1"},\n'
@@ -3201,7 +3215,7 @@ LLM_SYSTEM_PROMPT = (
 #  - интервалы между волнами с учётом времени суток
 #  - распределение типов действий
 #  - почасовое расписание интенсивности
-#  - набор уника��ьных текстов для Избранного
+#  - набор уникальных текстов для Избранного
 #  - пул безопасных реакций
 #  - тихие часы
 # Возвращает СТРОГО JSON без markdown-обёрток.
@@ -3209,7 +3223,7 @@ WARMING_PLAN_SYSTEM_PROMPT = """Ты — эксперт по безопасно�
 Твоя задача — составить ДЕТАЛЬНЫЙ ПЛАН прогрева на заданное окно часов (по умолчанию 12). Цель — сделать аккаунт «живым» в глазах Telegram, избегая FloodWait.
 
 Что НЕЛЬЗЯ планировать:
-  • массовы�� рассылки, инвайты, спам
+  • массовые рассылки, инвайты, спам
   • резкие пики активности (все волны — плавные)
   • сообщения в чужие чаты (только self-PM, реакции, чтение, просмотр сторис)
 
@@ -3224,7 +3238,7 @@ WARMING_PLAN_SYSTEM_PROMPT = """Ты — эксперт по безопасно�
 Правила генерации:
   1. Интервалы между волнами (intervals) — В СЕКУНДАХ, в диапазоне 300..1800 (5..30 минут). Ночью интервалы длиннее, днём короче.
   2. distribution — сумма вероятностей примерно 1.0. Безопасные действия (read, view_stories) имеют больший вес.
-  3. saved_notes — МАССИВ из 8-12 КОРОТКИХ текстов на р��сском (как будто человек пишет самому себе). Каждый до 80 символов. БЕЗ спама, БЕЗ рекламы. Разнообразные: напоминалки, мысли, короткие заметки.
+  3. saved_notes — МАССИВ из 8-12 КОРОТКИХ текстов на русском (как будто человек пишет самому себе). Каждый до 80 символов. БЕЗ спама, БЕЗ рекламы. Разнообразные: напоминалки, мысли, короткие заметки.
   4. reaction_pool — 4-6 эмодзи из безопасного набора: «👍», «🔥», «❤️», «😂», «😢», «🙏».
   5. schedule — массив объектов {hour_offset, intensity, focus, actions_count_min, actions_count_max}. intensity ∈ {low, medium, high}. focus — короткая подсказка что делать (например «active_dialogs», «stories_only», «rest»).
   6. quiet_periods — массив строк вида «HH:MM-HH:MM» в МСК, когда активность минимальна (например ночь 00:00-07:00). Если время сейчас попадает в quiet_period — бот должен уйти в длинный сон.
@@ -3263,7 +3277,7 @@ WARMING_PLAN_SYSTEM_PROMPT = """Ты — эксперт по безопасно�
 
 
 # --- LLM: системный промпт для анализа риска бана аккаунта ---
-# Используется отдельной фич��й «Анализ логов аккаунта (оценка риска бана)».
+# Используется отдельной фичей «Анализ логов аккаунта (оценка риска бана)».
 # В отличие от копирайтерского промта — здесь модель возвращает связный
 # текст на русском, а не JSON-варианты.
 LLM_SECURITY_SYSTEM_PROMPT = (
@@ -3284,7 +3298,7 @@ LLM_SECURITY_SYSTEM_PROMPT = (
     "  • Советы: 3-5 конкретных действий (например, «увеличить задержку до "
     "30-60 сек», «сменить прокси», «не слать ночью 00:00-07:00 МСК», "
     "«уменьшить число активных чатов до 5-7»).\n"
-    "Тон — споко��ный, технический, без паники. Пиши по делу."
+    "Тон — спокойный, технический, без паники. Пиши по делу."
 )
 
 
@@ -3444,9 +3458,9 @@ async def call_llm_api_plain(
         raise RuntimeError(f"LLM API вернул статус {e.status_code}") from e
     except anthropic.APIError as e:
         logger.exception("LLM API (plain) anthropic error")
-        raise RuntimeError(f"LLM API оши��ка: {e}") from e
+        raise RuntimeError(f"LLM API ошибка: {e}") from e
 
-    # Собираем все text-блоки; если ес��ь thinking — отдадим его как fallback
+    # Собираем все text-блоки; если есть thinking — отдадим его как fallback
     # (на случай, если модель отдала только рассуждения).
     text_parts: List[str] = []
     thinking_parts: List[str] = []
@@ -3734,7 +3748,7 @@ async def acct_ar_reset_history(account_id: int) -> None:
 # ============================================================
 # Отдельная фича: по последним логам + истории флуд-вейтов аккаунта
 # формируем структурированный отчёт (уровень риска + причины + советы)
-# через LLM в режиме «эксперт по ��езопасности Telegram».
+# через LLM в режиме «эксперт по безопасности Telegram».
 
 def _format_log_line(log: Dict[str, Any]) -> str:
     """Одна строка лога для промта: время (МСК), направление, чат, превью."""
@@ -4219,7 +4233,7 @@ async def auto_responder_worker(responder: Dict, user_id: int):
 #   - изредка отправить что-то в Избранное (Saved Messages)
 #   - изредка подёргать статус (online / offline)
 #   - при тихом часе — вообще уйти в сон
-# Всё с адапт��вной задержкой (5–18 минут между волнами)
+# Всё с адаптивной задержкой (5–18 минут между волнами)
 # и множителем по времени суток (МСК).
 
 # Реакции, которые безопасно кидать в прогреве.
@@ -4238,13 +4252,13 @@ WARMING_SAVED_NOTES = [
     "Напоминалка самому себе",
     "Скину сюда идею, чтобы не потерять",
     "Тест прогрева",
-    "Записал мысль, чтобы не забы��ь",
+    "Записал мысль, чтобы не забыть",
     "Позже разберусь",
 ]
 
 
 def _is_quiet_hours() -> bool:
-    """Ночной режим по МСК: 0–7 и 23��24 — спим, активность минимальна."""
+    """Ночной режим по МСК: 0–7 и 23–24 — спим, активность минимальна."""
     hour = datetime.now(MSK_TZ).hour
     return hour < 7 or hour >= 23
 
@@ -4327,7 +4341,7 @@ def _build_weighted_pool(distribution: Dict[str, float]) -> List[str]:
         pool.extend([kind] * n)
         total += n
     if not pool:
-        # фолбек — равные веса д��я безопасных действий
+        # фолбек — равные веса для безопасных действий
         return ['read_dialogs', 'view_stories', 'react']
     return pool
 
@@ -4372,7 +4386,7 @@ def _actions_count_for_now(
 
 
 def _warming_random_cooldown() -> int:
-    """Случайная пауза между волнами с учётом времени с��ток."""
+    """Случайная пауза между волнами с учётом времени суток."""
     base = random.randint(
         WARMING_DEFAULT_COOLDOWN_MIN, WARMING_DEFAULT_COOLDOWN_MAX
     )
@@ -4661,7 +4675,7 @@ async def warming_worker(account_id: int, user_id: int) -> None:
             if not account or not account.get('warming_enabled'):
                 return
 
-            # ��роверка окончания плана (если был запущен с duration)
+            # Проверка окончания плана (если был запущен с duration)
             if (
                 plan is not None
                 and plan_start_ts is not None
@@ -4911,7 +4925,7 @@ async def execute_broadcast(broadcast_id: int, user_id: int):
     mode = broadcast['mode']
     # Список сообщений для рандомной рассылки (новый формат). Каждый
     # элемент — {"text": str, "media": [str, ...]}. Если заполнен — он
-    # использ��ется вместо одиночных message_text / message_media.
+    # используется вместо одиночных message_text / message_media.
     message_texts_raw = broadcast.get('message_texts') or []
     message_variants = _normalize_message_variants(
         message_texts_raw, message_text, message_media
@@ -5027,7 +5041,7 @@ async def execute_dm_broadcast_db(
             total, dm_id
         )
 
-    # Список вариантов соо��щений. Если передан message_texts (новый
+    # Список вариантов сообщений. Если передан message_texts (новый
     # формат с рандомной ротацией) — используем его, иначе собираем
     # один вариант из message_text / media_paths.
     message_variants = _normalize_message_variants(
@@ -5445,8 +5459,8 @@ async def execute_delete_messages(
 # Адаптивная задержка перед отправкой сообщения.
 # Снижает риск бана на ~30-50% за счёт:
 #   1) времени суток (ночью/пик вечером — медленнее)
-#   2) частоты аккаунта в конкретном чате (если только что писал — ��ауза)
-#   3) flood-wait истории аккаунта (если недавно ловил�� флуд — сильно медленнее)
+#   2) частоты аккаунта в конкретном чате (если только что писал — пауза)
+#   3) flood-wait истории аккаунта (если недавно ловил флуд — сильно медленнее)
 # Плюс всегда добавляется случайный джиттер ±15%, чтобы поведение
 # не выглядело роботизированным.
 SMART_DELAY_MIN = 2.0        # минимальный "хвост" задержки (сек)
@@ -5455,7 +5469,7 @@ SMART_DELAY_JITTER = 0.15    # ±15% джиттер
 
 
 def _time_of_day_multiplier() -> float:
-    """Множит��ль по часу МСК: ночью тормозим, днём норма, вечером осторожно."""
+    """Множитель по часу МСК: ночью тормозим, днём норма, вечером осторожно."""
     hour = datetime.now(MSK_TZ).hour
     if 0 <= hour < 7:        # ночь — Telegram-антиспам самый злой
         return 1.6
@@ -5550,7 +5564,7 @@ async def smart_delay(
 
     Учитывает:
       - время суток (МСК)
-      - когда аккаунт последний раз ��исал в этот чат
+      - когда аккаунт последний раз писал в этот чат
       - историю флуд-вейтов аккаунта
     Возвращённое значение уже включает джиттер ±15% и
     ограничено [min_delay, max_delay] секунд.
@@ -5821,7 +5835,7 @@ async def platega_create_transaction(
 
 
 async def platega_get_transaction(transaction_id: str) -> Dict[str, Any]:
-    """Проверяет статус СБП-транзак��ии в Platega."""
+    """Проверяет статус СБП-транзакции в Platega."""
     url = f"{PLATEGA_API}/transaction/{transaction_id}"
     try:
         async with aiohttp.ClientSession() as session:
@@ -6236,7 +6250,7 @@ def get_proxies_keyboard(proxies: List[Dict]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for p in proxies:
         label = p.get('label') or f"{p['host']}:{p['port']}"
-        # маскируем паро��ь в подписи
+        # маскируем пароль в подписи
         masked = f"{p['proxy_type']} | {label}"
         builder.row(InlineKeyboardButton(
             text=f"{masked}",
@@ -6369,7 +6383,7 @@ def get_llm_model_pick_keyboard(
     """Клавиатура выбора модели на старте генерации.
     Подсвечивает модель, выбранную пользователем (current).
     При include_back=False — нижняя кнопка не показывается
-    (и��пользуется, если вызываем из основного меню)."""
+    (используется, если вызываем из основного меню)."""
     builder = InlineKeyboardBuilder()
     for key, label in LLM_MODELS.items():
         mark = '✅ ' if key == current else ''
@@ -6502,7 +6516,7 @@ def get_functions_keyboard() -> InlineKeyboardMarkup:
         icon_custom_emoji_id=get_icon("LIKE")
     ))
     builder.row(InlineKeyboardButton(
-        text="Удаление сообщ��ний",
+        text="Удаление сообщений",
         callback_data="delete_messages",
         style='primary',
         icon_custom_emoji_id=get_icon("SWEEP")
@@ -7020,7 +7034,7 @@ def get_account_actions_keyboard(
         icon_custom_emoji_id=get_icon("STATS")
     ))
     warming_text = (
-        "Выключить прогрев" if warming_enabled else "Включи��ь прогрев"
+        "Выключить прогрев" if warming_enabled else "Включить прогрев"
     )
     builder.row(InlineKeyboardButton(
         text=warming_text,
@@ -7029,7 +7043,7 @@ def get_account_actions_keyboard(
         icon_custom_emoji_id=get_icon("FIRE")
     ))
     builder.row(InlineKeyboardButton(
-        text="План ��рогрева (ИИ)",
+        text="План прогрева (ИИ)",
         callback_data=f"show_warming_plan_{account_id}",
         style='default',
         icon_custom_emoji_id=get_icon("CLIPBOARD")
@@ -7427,7 +7441,7 @@ async def back_to_main(callback: CallbackQuery):
     await callback.message.edit_text(
         f"{emoji('SMILE')} <b>Главное меню</b>\n\n"
         f"{limits}\n\n"
-        f"Выберит�� действие:",
+        f"Выберите действие:",
         reply_markup=get_main_menu_keyboard()
     )
     await callback.answer()
@@ -7552,7 +7566,7 @@ async def script_select_account(
         "• <code>https://t.me/example_bot</code>\n"
         "• <code>https://t.me/example_bot?start=code</code>\n"
         "• <code>@example_bot</code>\n\n"
-        "После ��того аккаунт отправит боту <code>/start</code> "
+        "После этого аккаунт отправит боту <code>/start</code> "
         "и загрузит доступные кнопки.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
@@ -7862,7 +7876,7 @@ async def script_delete_ask(callback: CallbackQuery):
     try:
         script_id = int(callback.data.rsplit(':', 1)[1])
     except ValueError:
-        await callback.answer('Неко��ректный скрипт', show_alert=True)
+        await callback.answer('Некорректный скрипт', show_alert=True)
         return
     script = await get_user_script(script_id, callback.from_user.id)
     if not script:
@@ -7885,7 +7899,7 @@ async def script_delete_ask(callback: CallbackQuery):
     await callback.message.edit_text(
         f"{emoji('CROSS')} <b>Удалить скрипт?</b>\n\n"
         f"<b>{escape(script['name'])}</b>\n"
-        "История запус��ов этого скрипта также будет удалена.",
+        "История запусков этого скрипта также будет удалена.",
         reply_markup=keyboard,
     )
     await callback.answer()
@@ -7937,7 +7951,7 @@ async def help_handler(callback: CallbackQuery):
         f"{emoji('SWEEP')} <b>Удаление сообщений</b> — очистка истории.\n"
         f"{emoji('USERS')} <b>Парсинг чата</b> — сбор пользователей.\n"
         f"{emoji('PLAY')} <b>Скрипты</b> — запуск бота и нажатие сохранённой кнопки.\n"
-        f"{emoji('AI')} <b>AI Генератор</b> — 3 варианта т��кста на выбор.\n\n"
+        f"{emoji('AI')} <b>AI Генератор</b> — 3 варианта текста на выбор.\n\n"
         f"{emoji('SUPPORT')} <b>Поддержка:</b> {SUPPORT_USERNAME}"
     )
     await callback.message.edit_text(
@@ -8275,7 +8289,7 @@ async def format_limits_text(user_id: int) -> str:
         return f"{emoji('STAR')} <b>Лимиты:</b> Pro — без ограничений"
 
     # Счётчики использования — не критичны. Если БД недоступна или
-    # какой-то таблицы нет, ��оказываем нули вместо падения обработчика.
+    # какой-то таблицы нет, показываем нули вместо падения обработчика.
     try:
         ai_used = await count_ai_requests_today(user_id)
     except Exception as ex:
@@ -8653,7 +8667,7 @@ async def ai_generator_start(callback: CallbackQuery, state: FSMContext):
         f"{emoji('AI')} <b>AI Генератор текста</b>\n\n"
         f"{emoji('INFO')} Шаг 1 из 2. Выбери модель для генерации. "
         f"На шаге 2 опишешь задачу — бот пришлёт "
-        f"<b>3 раз��ых варианта</b> готового текста.\n\n"
+        f"<b>3 разных варианта</b> готового текста.\n\n"
         f"По умолчанию: <code>{escape(label)}</code>"
     )
     await callback.message.edit_text(
@@ -8748,7 +8762,7 @@ async def ai_generator_prompt(message: Message, state: FSMContext):
             f"{emoji('SPARK')} <b>Вариант {i}.</b> {escape(title)}\n"
             f"{emoji('INFO')} Длина: {len(body)} символов\n\n"
         )
-        # первая часть — с заголовк��м
+        # первая часть — с заголовком
         first_chunk = header + body[: max(0, 4000 - len(header))]
         await message.answer(first_chunk)
         rest = body[max(0, 4000 - len(header)):]
@@ -8813,7 +8827,7 @@ async def ai_generator_pick(callback: CallbackQuery, state: FSMContext):
     ))
     builder.row(
         InlineKeyboardButton(
-            text="Зано��о",
+            text="Заново",
             callback_data="llm_regen",
             style='default',
             icon_custom_emoji_id=get_icon("REFRESH")
@@ -9131,7 +9145,7 @@ async def ai_generator_history(callback: CallbackQuery, state: FSMContext):
     if not requests:
         await callback.message.edit_text(
             f"{emoji('INFO')} <b>История пуста.</b>\n\n"
-            f"Сгенерируйте первый текст ��� он сохранится автоматически.",
+            f"Сгенерируйте первый текст — он сохранится автоматически.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(
                     text="Создать запрос",
@@ -9179,7 +9193,7 @@ async def ai_generator_view(callback: CallbackQuery, state: FSMContext):
     created = req['created_at']
     when = created.strftime('%d.%m.%Y %H:%M') if hasattr(created, 'strftime') else str(created)[:16]
 
-    # Перешлём вариа��ты текстом
+    # Перешлём варианты текстом
     for i, v in enumerate(variants, 1):
         text = (v or {}).get('text') or ''
         title = (v or {}).get('title') or f'Вариант {i}'
@@ -9627,7 +9641,7 @@ async def process_code(message: Message, state: FSMContext):
         proxy = await get_proxy(proxy_id)
         if not proxy:
             await message.answer(
-                f"{emoji('CROSS')} Выб��анный прокси не найден. "
+                f"{emoji('CROSS')} Выбранный прокси не найден. "
                 f"Попробуйте добавить аккаунт заново."
             )
             await state.clear()
@@ -9839,7 +9853,7 @@ async def account_logs(callback: CallbackQuery):
     await callback.answer()
 
 
-# --- Анализ логов аккаунта (оценка риска бан��) ---
+# --- Анализ логов аккаунта (оценка риска бана) ---
 def _risk_analysis_keyboard(account_id: int) -> InlineKeyboardMarkup:
     """Клавиатура после отчёта: переанализ / назад / в логи."""
     builder = InlineKeyboardBuilder()
@@ -9874,7 +9888,7 @@ async def analyze_risk_handler(callback: CallbackQuery):
       1) Проверяем владельца.
       2) Тянем 50 последних логов + историю флудов.
       3) Зовём LLM в режиме «эксперт по безопасности Telegram».
-      4) Если LLM недоступна — отдаём эвристический отчё��.
+      4) Если LLM недоступна — отдаём эвристический отчёт.
     """
     if not await is_pro(callback.from_user.id):
         await callback.answer(
@@ -9922,7 +9936,7 @@ async def analyze_risk_handler(callback: CallbackQuery):
     flood = result.get('flood') or {}
     source = result.get('source') or 'heuristic'
     src_label = (
-        "LLM-эксперт" if source == 'llm' else "локальная ��вристика "
+        "LLM-эксперт" if source == 'llm' else "локальная эвристика "
         "(LLM недоступна)"
     )
     total = stats.get('total', 0)
@@ -9978,7 +9992,7 @@ async def analyze_risk_handler(callback: CallbackQuery):
 # ============================================================
 #  Редактирование профиля Telegram-аккаунта
 # ============================================================
-# Профиль (аватар, имя, фамилия, описан��е) хранится в самом
+# Профиль (аватар, имя, фамилия, описание) хранится в самом
 # Telegram, а не в нашей БД. Поэтому:
 #   - при открытии редактора читаем актуальные данные из Telegram;
 #   - все правки складываем в черновик внутри FSM;
@@ -10266,7 +10280,7 @@ async def _guard_profile_owner(
         return None
 
     # Состояние могло потеряться — восстанавливаем минимум, чтобы
-    # следующ��е шаги (ожидание текста/картинки) не падали.
+    # следующие шаги (ожидание текста/картинки) не падали.
     if not data.get('profile_account_id'):
         await state.update_data(profile_account_id=account_id)
     if isinstance(event, CallbackQuery):
@@ -10316,7 +10330,7 @@ async def profile_edit_field(callback: CallbackQuery, state: FSMContext):
 
     new_state, prompt = prompts[field]
     await state.set_state(new_state)
-    # Запоминаем id сообщения с промптом, чтобы потом уб��ать его из чата,
+    # Запоминаем id сообщения с промптом, чтобы потом убирать его из чата,
     # когда пользователь пришлёт картинку/текст.
     await state.update_data(
         prompt_chat_id=callback.message.chat.id,
@@ -10522,7 +10536,7 @@ async def _generate_profile_with_ai(prompt: str) -> Optional[Dict[str, str]]:
     system = (
         "Ты помогаешь оформить профиль Telegram-аккаунта. "
         "На основе запроса пользователя придумай реалистичные имя, "
-        "фамилию и короткое описан��е (about). "
+        "фамилию и короткое описание (about). "
         f"Имя — до {PROFILE_FIRST_NAME_LIMIT} символов, фамилия — до "
         f"{PROFILE_LAST_NAME_LIMIT} символов, описание — до "
         f"{PROFILE_ABOUT_LIMIT} символов. "
@@ -10599,7 +10613,7 @@ async def profile_ai_generate(message: Message, state: FSMContext):
     prompt = (message.text or '').strip()
     if not prompt:
         await message.answer(
-            f"{emoji('CROSS')} Опишите желаемый образ тек��том."
+            f"{emoji('CROSS')} Опишите желаемый образ текстом."
         )
         return
 
@@ -11082,7 +11096,7 @@ async def toggle_warming(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("confirm_warming_"))
 async def confirm_warming_plan(callback: CallbackQuery):
-    """Юзер подтвердил план — реально включаем прогрев и запускаем ворке��."""
+    """Юзер подтвердил план — реально включаем прогрев и запускаем воркер."""
     account_id = int(callback.data.split("_")[2])
     account = await get_account(account_id)
 
@@ -11222,7 +11236,7 @@ async def broadcast(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "scheduled_broadcast")
 async def scheduled_broadcast_menu(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
-        f"{emoji('CLOCK')} <b>Отл��женная рассылка</b>\n\n"
+        f"{emoji('CLOCK')} <b>Отложенная рассылка</b>\n\n"
         f"Выберите режим рассылки:",
         reply_markup=get_broadcast_mode_keyboard()
     )
@@ -11473,7 +11487,7 @@ async def process_count(message: Message, state: FSMContext):
         f"Можно прикрепить медиа (фото, видео, документы).",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
-                text="Наза��",
+                text="Назад",
                 callback_data="broadcast",
                 style='default',
                 icon_custom_emoji_id=get_icon("BACK")
@@ -11599,7 +11613,7 @@ async def broadcast_messages_done(callback: CallbackQuery, state: FSMContext):
     preview_text = (
         f"{emoji('EYE')} <b>Предпросмотр рассылки:</b>\n\n"
         f"{emoji('PROFILE')} Аккаунт ID: {data['account_id']}\n"
-        f"{emoji('PEOPLE')} Чат��в: {len(data['selected_chats'])}\n"
+        f"{emoji('PEOPLE')} Чатов: {len(data['selected_chats'])}\n"
         f"{emoji('CLOCK')} Задержка: {data['delay']} сек\n"
         f"{emoji('MAIL')} Сообщений в чат: {data['message_count']}\n"
         f"{emoji('GEAR')} Режим: "
@@ -11777,7 +11791,7 @@ async def scheduled_process_message(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "broadcast_messages_done",
                    ScheduledBroadcastStates.waiting_for_message)
 async def scheduled_messages_done(callback: CallbackQuery, state: FSMContext):
-    """Завершаем набор сообщений для отложенной рассы��ки."""
+    """Завершаем набор сообщений для отложенной рассылки."""
     data = await state.get_data()
     variants = list(data.get('message_texts') or [])
     if not variants:
@@ -11860,7 +11874,7 @@ async def scheduled_process_datetime(message: Message, state: FSMContext):
         
     except ValueError:
         await message.answer(
-            f"{emoji('CROSS')} Неверн��й формат. Используйте: ДД.ММ.ГГГГ ЧЧ:ММ"
+            f"{emoji('CROSS')} Неверный формат. Используйте: ДД.ММ.ГГГГ ЧЧ:ММ"
         )
     except Exception as ex:
         await message.answer(f"{emoji('CROSS')} Ошибка: {str(ex)}")
@@ -12055,7 +12069,7 @@ async def show_dm_broadcast_detail(callback: CallbackQuery, dm_id: int):
         f"{emoji('GEAR')} Статус: {bc['status']}\n"
         f"{emoji('STATS')} Прогресс: {progress}\n"
         f"{emoji('CLOCK')} Задержка: {bc['delay']} сек\n"
-        f"{emoji('PEOPLE')} П��лучателей: {len(bc.get('usernames', []))}\n"
+        f"{emoji('PEOPLE')} Получателей: {len(bc.get('usernames', []))}\n"
         f"{emoji('CALENDAR')} Создана: "
         f"{bc['created_at'].astimezone(MSK_TZ).strftime('%d.%m.%Y %H:%M')}"
     )
@@ -12305,7 +12319,7 @@ async def process_dm_file_invalid(message: Message):
 
 @dp.message(DMBroadcastStates.waiting_for_message)
 async def process_dm_message(message: Message, state: FSMContext):
-    """Набираем до 100 в��риантов сообщений для DM-рассылки."""
+    """Набираем до 100 вариантов сообщений для DM-рассылки."""
     text, media_paths = await _extract_message_payload(message, state)
 
     data = await state.get_data()
@@ -12482,7 +12496,7 @@ async def start_dm_broadcast(callback: CallbackQuery, state: FSMContext):
         f"{emoji('LOADING')} <b>Запускаю рассылку в ЛС...</b>\n\n"
         f"DM ID: {dm_id}\n"
         f"Получателей: {data['usernames_count']}\n"
-        f"Вариан��ов: {len(variants)} (случайный выбор)\n"
+        f"Вариантов: {len(variants)} (случайный выбор)\n"
         f"Это может занять некоторое время.",
         reply_markup=get_broadcast_control_keyboard(dm_id, 'dm')
     )
@@ -12846,7 +12860,7 @@ async def process_join_file(message: Message, state: FSMContext):
         ]
         
         if not links:
-            await message.answer(f"{emoji('CROSS')} Файл пу��т.")
+            await message.answer(f"{emoji('CROSS')} Файл пуст.")
             os.remove(file_path)
             return
         
@@ -13203,7 +13217,7 @@ async def show_responder(callback: CallbackQuery):
     ))
     
     text = (
-        f"{emoji('BELL')} <b>Автоответчи�� ID: {responder['id']}</b>\n\n"
+        f"{emoji('BELL')} <b>Автоответчик ID: {responder['id']}</b>\n\n"
         f"{emoji('EYE')} Статус: "
         f"{'Активен' if responder['is_active'] else 'Остановлен'}\n"
         f"{emoji('TAG')} Триггер: "
@@ -14582,7 +14596,7 @@ async def do_set_proxy(callback: CallbackQuery):
         await callback.answer(
             "Не удалось привязать (чужая запись?)", show_alert=True
         )
-    # Возвращаемся к к��рточке аккаунта
+    # Возвращаемся к карточке аккаунта
     account = await get_account(account_id)
     if not account:
         return
@@ -15000,7 +15014,7 @@ async def account_ai_responder_worker(account_id: int, user_id: int):
                         f"acct_ar: не удалось отправить ответ: {ex}"
                     )
 
-                # 7) Лог аккаунт��: что отправили
+                # 7) Лог аккаунта: что отправили
                 if sent_ok:
                     try:
                         await add_account_log(
@@ -15027,7 +15041,7 @@ async def account_ai_responder_worker(account_id: int, user_id: int):
                     pass
         return _handler
 
-    # --- основной цикл с авто-реконнек��ом ---
+    # --- основной цикл с авто-реконнектором ---
     try:
         account = await get_account(account_id)
         if not account:
