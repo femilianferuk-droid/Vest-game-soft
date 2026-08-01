@@ -33,7 +33,9 @@ from telethon.errors import (
 )
 from telethon.sessions import StringSession
 from telethon.tl.types import User, ReactionEmoji
-from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.channels import (
+    CreateChannelRequest, JoinChannelRequest
+)
 from telethon.tl.functions.messages import (
     ImportChatInviteRequest, DeleteHistoryRequest, SendReactionRequest
 )
@@ -132,6 +134,8 @@ dm_broadcast_stop_flags: Dict[int, bool] = {}
 dm_broadcast_tasks: Dict[int, asyncio.Task] = {}
 join_stop_flags: Dict[int, bool] = {}
 join_tasks: Dict[int, asyncio.Task] = {}
+channel_creation_stop_flags: Dict[int, bool] = {}
+channel_creation_tasks: Dict[int, asyncio.Task] = {}
 autolike_tasks: Dict[int, asyncio.Task] = {}
 autolike_stop_flags: Dict[int, bool] = {}
 delete_messages_stop_flags: Dict[int, bool] = {}
@@ -429,6 +433,13 @@ class JoinStates(StatesGroup):
     waiting_for_account = State()
     waiting_for_file = State()
     waiting_for_delay = State()
+    preview = State()
+
+
+class ChannelCreationStates(StatesGroup):
+    waiting_for_account = State()
+    waiting_for_count = State()
+    waiting_for_title = State()
     preview = State()
 
 class AutoLikeStates(StatesGroup):
@@ -5176,6 +5187,121 @@ async def execute_join(
     
     return {'total': total, 'joined': joined, 'failed': failed}
 
+
+# --- Создание каналов ---
+CHANNEL_CREATION_DELAY = 20
+
+
+def build_channel_title(base_title: str, index: int, total: int) -> str:
+    """Вернуть название канала, сохранив лимит Telegram в 128 символов."""
+    if total == 1:
+        return base_title[:128]
+    suffix = f" {index}"
+    return f"{base_title[:128 - len(suffix)]}{suffix}"
+
+
+async def execute_channel_creation(
+    account_id: int,
+    user_id: int,
+    count: int,
+    base_title: str,
+    progress_message: Message,
+) -> Dict[str, Any]:
+    """Последовательно создать приватные каналы с паузой 20 секунд."""
+    account = await get_account(account_id)
+    if not account or account['user_id'] != user_id:
+        raise RuntimeError('Аккаунт не найден или не принадлежит пользователю')
+
+    client = await get_client_for_account(account_id)
+    if not client or not await client.is_user_authorized():
+        raise RuntimeError('Не удалось подключить выбранный аккаунт')
+
+    created: List[str] = []
+    failed: List[Dict[str, str]] = []
+    channel_creation_stop_flags[user_id] = False
+
+    for index in range(1, count + 1):
+        if channel_creation_stop_flags.get(user_id, False):
+            break
+
+        channel_title = build_channel_title(base_title, index, count)
+        try:
+            await client(CreateChannelRequest(
+                title=channel_title,
+                about='',
+                broadcast=True,
+                megagroup=False,
+            ))
+            created.append(channel_title)
+            logger.info(
+                'Created channel %r for account_id=%s (%s/%s)',
+                channel_title, account_id, index, count,
+            )
+        except FloodWaitError as ex:
+            await record_flood_wait(account_id, 0, ex.seconds)
+            wait_seconds = max(CHANNEL_CREATION_DELAY, ex.seconds + 1)
+            try:
+                await progress_message.edit_text(
+                    f"{emoji('CLOCK')} <b>Telegram включил ограничение</b>\n\n"
+                    f"Ожидание: <b>{wait_seconds} сек.</b>\n"
+                    f"Создано: <b>{len(created)}/{count}</b>\n"
+                    f"Текущий канал: <code>{escape(channel_title)}</code>",
+                    reply_markup=get_channel_creation_control_keyboard(),
+                )
+            except Exception:
+                pass
+
+            await asyncio.sleep(wait_seconds)
+            if channel_creation_stop_flags.get(user_id, False):
+                break
+
+            try:
+                await client(CreateChannelRequest(
+                    title=channel_title,
+                    about='',
+                    broadcast=True,
+                    megagroup=False,
+                ))
+                created.append(channel_title)
+            except Exception as retry_ex:
+                failed.append({
+                    'title': channel_title,
+                    'error': str(retry_ex),
+                })
+                logger.warning(
+                    'Channel retry failed for %r: %s',
+                    channel_title, retry_ex,
+                )
+        except RPCError as ex:
+            failed.append({'title': channel_title, 'error': str(ex)})
+            logger.warning('Channel creation failed for %r: %s', channel_title, ex)
+        except Exception as ex:
+            failed.append({'title': channel_title, 'error': str(ex)})
+            logger.exception('Unexpected channel creation error for %r', channel_title)
+
+        processed = len(created) + len(failed)
+        try:
+            await progress_message.edit_text(
+                f"{emoji('LOADING')} <b>Создание каналов...</b>\n\n"
+                f"Создано: <b>{len(created)}/{count}</b>\n"
+                f"Ошибок: <b>{len(failed)}</b>\n"
+                f"Обработано: <b>{processed}/{count}</b>\n"
+                f"Следующий запуск через: <b>{CHANNEL_CREATION_DELAY} сек.</b>",
+                reply_markup=get_channel_creation_control_keyboard(),
+            )
+        except Exception:
+            pass
+
+        if index < count and not channel_creation_stop_flags.get(user_id, False):
+            await asyncio.sleep(CHANNEL_CREATION_DELAY)
+
+    return {
+        'total': count,
+        'created': created,
+        'failed': failed,
+        'stopped': channel_creation_stop_flags.get(user_id, False),
+    }
+
 # --- Авто-лайкинг ---
 async def execute_autolike(
     task_id: int, account_id: int, chat_ids: List[str],
@@ -6364,6 +6490,12 @@ def get_functions_keyboard() -> InlineKeyboardMarkup:
         icon_custom_emoji_id=get_icon("JOIN")
     ))
     builder.row(InlineKeyboardButton(
+        text="Создание каналов",
+        callback_data="create_channels",
+        style='primary',
+        icon_custom_emoji_id=get_icon("GLOBE")
+    ))
+    builder.row(InlineKeyboardButton(
         text="Авто-лайкинг",
         callback_data="autolike",
         style='primary',
@@ -6971,6 +7103,54 @@ def get_join_control_keyboard(task_id: int) -> InlineKeyboardMarkup:
         callback_data=f"stop_join_{task_id}",
         style='danger',
         icon_custom_emoji_id=get_icon("STOP")
+    ))
+    return builder.as_markup()
+
+
+def get_channel_creation_accounts_keyboard(
+    accounts: List[Dict],
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for account in accounts:
+        builder.row(InlineKeyboardButton(
+            text=str(account['phone']),
+            callback_data=f"select_channel_create_account_{account['id']}",
+            style='default',
+            icon_custom_emoji_id=get_icon("PROFILE"),
+        ))
+    builder.row(InlineKeyboardButton(
+        text="Отмена",
+        callback_data="channel_creation_cancel",
+        style='danger',
+        icon_custom_emoji_id=get_icon("CROSS"),
+    ))
+    return builder.as_markup()
+
+
+def get_channel_creation_preview_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text="Начать создание",
+        callback_data="start_channel_creation",
+        style='success',
+        icon_custom_emoji_id=get_icon("PLAY"),
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Отмена",
+        callback_data="channel_creation_cancel",
+        style='danger',
+        icon_custom_emoji_id=get_icon("CROSS"),
+    ))
+    return builder.as_markup()
+
+
+def get_channel_creation_control_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text="Остановить",
+        callback_data="stop_channel_creation",
+        style='danger',
+        icon_custom_emoji_id=get_icon("STOP"),
     ))
     return builder.as_markup()
 
@@ -12344,6 +12524,267 @@ async def start_dm_broadcast(callback: CallbackQuery, state: FSMContext):
     asyncio.create_task(wait_and_report())
     
     await state.clear()
+    await callback.answer()
+
+# --- Создание каналов ---
+@dp.callback_query(F.data == "create_channels")
+async def create_channels_menu(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    running_task = channel_creation_tasks.get(user_id)
+    if running_task and not running_task.done():
+        await callback.answer(
+            'Создание каналов уже запущено',
+            show_alert=True,
+        )
+        return
+
+    accounts = [
+        account for account in await get_user_accounts(user_id)
+        if account.get('is_active')
+    ]
+    if not accounts:
+        await callback.message.edit_text(
+            f"{emoji('CROSS')} У вас нет активных аккаунтов.",
+            reply_markup=get_functions_keyboard(),
+        )
+        await callback.answer()
+        return
+
+    await state.clear()
+    await state.set_state(ChannelCreationStates.waiting_for_account)
+    await callback.message.edit_text(
+        f"{emoji('PROFILE')} <b>Выберите аккаунт</b>\n\n"
+        "Каналы будут создаваться от имени выбранного аккаунта.",
+        reply_markup=get_channel_creation_accounts_keyboard(accounts),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("select_channel_create_account_"))
+async def select_channel_create_account(
+    callback: CallbackQuery, state: FSMContext
+):
+    try:
+        account_id = int(callback.data.rsplit('_', 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer('Некорректный аккаунт', show_alert=True)
+        return
+
+    account = await get_account(account_id)
+    if (
+        not account
+        or account['user_id'] != callback.from_user.id
+        or not account.get('is_active')
+    ):
+        await callback.answer('Аккаунт не найден', show_alert=True)
+        return
+
+    await state.update_data(account_id=account_id, account_phone=account['phone'])
+    await state.set_state(ChannelCreationStates.waiting_for_count)
+    await callback.message.edit_text(
+        f"{emoji('NAMES')} <b>Количество каналов</b>\n\n"
+        "Введите число от <b>1</b> до <b>100</b>.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="Отмена",
+                callback_data="channel_creation_cancel",
+                style='danger',
+                icon_custom_emoji_id=get_icon("CROSS"),
+            )
+        ]]),
+    )
+    await callback.answer()
+
+
+@dp.message(ChannelCreationStates.waiting_for_count)
+async def process_channel_creation_count(
+    message: Message, state: FSMContext
+):
+    try:
+        count = int((message.text or '').strip())
+    except ValueError:
+        await message.answer(
+            f"{emoji('CROSS')} Введите целое число от 1 до 100."
+        )
+        return
+
+    if not 1 <= count <= 100:
+        await message.answer(
+            f"{emoji('CROSS')} Количество должно быть от 1 до 100."
+        )
+        return
+
+    await state.update_data(count=count)
+    await state.set_state(ChannelCreationStates.waiting_for_title)
+    await message.answer(
+        f"{emoji('WRITE')} <b>Название каналов</b>\n\n"
+        "Введите базовое название. Если каналов несколько, бот добавит "
+        "номера: <code>Название 1</code>, <code>Название 2</code> и т.д.\n\n"
+        "Максимальная длина базового названия — 120 символов.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="Отмена",
+                callback_data="channel_creation_cancel",
+                style='danger',
+                icon_custom_emoji_id=get_icon("CROSS"),
+            )
+        ]]),
+    )
+
+
+@dp.message(ChannelCreationStates.waiting_for_title)
+async def process_channel_creation_title(
+    message: Message, state: FSMContext
+):
+    title = ' '.join((message.text or '').split()).strip()
+    if not title:
+        await message.answer(
+            f"{emoji('CROSS')} Отправьте название обычным текстом."
+        )
+        return
+    if len(title) > 120:
+        await message.answer(
+            f"{emoji('CROSS')} Название слишком длинное. Максимум 120 символов."
+        )
+        return
+
+    await state.update_data(base_title=title)
+    data = await state.get_data()
+    count = data['count']
+    if count == 1:
+        names_preview = f"<code>{escape(title)}</code>"
+    else:
+        first_title = build_channel_title(title, 1, count)
+        last_title = build_channel_title(title, count, count)
+        names_preview = (
+            f"<code>{escape(first_title)}</code> … "
+            f"<code>{escape(last_title)}</code>"
+        )
+
+    await state.set_state(ChannelCreationStates.preview)
+    await message.answer(
+        f"{emoji('EYE')} <b>Проверьте параметры</b>\n\n"
+        f"{emoji('PHONE')} Аккаунт: <code>{escape(str(data['account_phone']))}</code>\n"
+        f"{emoji('NAMES')} Количество: <b>{count}</b>\n"
+        f"{emoji('WRITE')} Названия: {names_preview}\n"
+        f"{emoji('CLOCK')} Задержка: <b>{CHANNEL_CREATION_DELAY} секунд</b>\n\n"
+        "Каналы будут приватными. Telegram может применить собственные "
+        "лимиты или дополнительную паузу.",
+        reply_markup=get_channel_creation_preview_keyboard(),
+    )
+
+
+@dp.callback_query(
+    F.data == "start_channel_creation", ChannelCreationStates.preview
+)
+async def start_channel_creation(
+    callback: CallbackQuery, state: FSMContext
+):
+    user_id = callback.from_user.id
+    running_task = channel_creation_tasks.get(user_id)
+    if running_task and not running_task.done():
+        await callback.answer(
+            'Создание каналов уже запущено',
+            show_alert=True,
+        )
+        return
+
+    data = await state.get_data()
+    account = await get_account(data['account_id'])
+    if not account or account['user_id'] != user_id:
+        await callback.answer('Аккаунт не найден', show_alert=True)
+        await state.clear()
+        return
+
+    await callback.message.edit_text(
+        f"{emoji('LOADING')} <b>Создание каналов запущено</b>\n\n"
+        f"Количество: <b>{data['count']}</b>\n"
+        f"Задержка: <b>{CHANNEL_CREATION_DELAY} секунд</b>\n"
+        "Первый канал создаётся сейчас.",
+        reply_markup=get_channel_creation_control_keyboard(),
+    )
+    await state.clear()
+
+    async def run_creation() -> None:
+        try:
+            result = await execute_channel_creation(
+                account_id=data['account_id'],
+                user_id=user_id,
+                count=data['count'],
+                base_title=data['base_title'],
+                progress_message=callback.message,
+            )
+            failed = result['failed']
+            error_text = ''
+            if failed:
+                items = []
+                for item in failed[:5]:
+                    error = item['error'].replace('\n', ' ')[:160]
+                    items.append(
+                        f"• <code>{escape(item['title'])}</code>: "
+                        f"{escape(error)}"
+                    )
+                error_text = "\n\n<b>Первые ошибки:</b>\n" + "\n".join(items)
+
+            status = 'остановлено' if result['stopped'] else 'завершено'
+            await callback.message.edit_text(
+                f"{emoji('CHECK')} <b>Создание каналов {status}</b>\n\n"
+                f"Запрошено: <b>{result['total']}</b>\n"
+                f"Создано: <b>{len(result['created'])}</b>\n"
+                f"Ошибок: <b>{len(failed)}</b>"
+                f"{error_text}",
+                reply_markup=get_functions_keyboard(),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            logger.exception('Channel creation task failed for user_id=%s', user_id)
+            try:
+                await callback.message.edit_text(
+                    f"{emoji('CROSS')} <b>Не удалось создать каналы</b>\n\n"
+                    f"<code>{escape(str(ex))}</code>",
+                    reply_markup=get_functions_keyboard(),
+                )
+            except Exception:
+                pass
+        finally:
+            current_task = asyncio.current_task()
+            if channel_creation_tasks.get(user_id) is current_task:
+                channel_creation_tasks.pop(user_id, None)
+            channel_creation_stop_flags.pop(user_id, None)
+
+    task = asyncio.create_task(run_creation())
+    channel_creation_tasks[user_id] = task
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "stop_channel_creation")
+async def stop_channel_creation(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    task = channel_creation_tasks.get(user_id)
+    if not task or task.done():
+        await callback.answer('Активной задачи нет', show_alert=True)
+        return
+
+    channel_creation_stop_flags[user_id] = True
+    task.cancel()
+    try:
+        await callback.message.edit_text(
+            f"{emoji('STOP')} <b>Создание каналов остановлено</b>",
+            reply_markup=get_functions_keyboard(),
+        )
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "channel_creation_cancel")
+async def cancel_channel_creation(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text(
+        f"{emoji('APPS')} <b>Функции</b>\n\nВыберите функцию:",
+        reply_markup=get_functions_keyboard(),
+    )
     await callback.answer()
 
 # --- Вступление в чаты ---
