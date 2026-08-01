@@ -56,7 +56,7 @@ from telethon.tl.functions.stories import (
 )
 from telethon.tl.types import (
     Dialog, PeerChat, PeerUser, PeerChannel, InputPeerUser,
-    InputPeerChannel, InputPeerChat, Message
+    InputPeerChannel, InputPeerChat
 )
 
 # --- Настройка логирования ---
