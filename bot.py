@@ -615,7 +615,7 @@ ACCT_AR_MODE_LABELS = {
     ACCT_AR_MODE_AI:  '🤖 С ИИ',
 }
 
-# Личность ИИ по умолчанию. Используется, если system_prompt пустой.
+# Личность ИИ по умолчанию. Использу��тся, если system_prompt пустой.
 ACCT_AR_DEFAULT_SYSTEM_PROMPT = (
     'Ты дружелюбный Telegram-бот, ведущий диалог в личных сообщениях с пользователем. '
     'Отвечай кратко, по-человечески, по существу. '
@@ -953,7 +953,7 @@ async def init_db():
             pass
         # Список сообщений для рандомной рассылки (JSONB-массив объектов
         # {text, media}). Если заполнен — execute_*_broadcast будет
-        # случайно выбирать одно из сообщений при каждой отправке.
+        # случайно выбирать одно из сообщений при каждой отправк��.
         try:
             await conn.execute(
                 "ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS message_texts JSONB DEFAULT '[]'::jsonb"
@@ -1919,7 +1919,7 @@ PROXY_CHECK_TARGETS = (
 
 
 def _check_proxy_connection_sync(proxy: Dict[str, Any]) -> Dict[str, Any]:
-    """Проверить TCP-подключение к Telegram через указанный прокси."""
+    """Проверить TCP-подключение к Telegram чер��з указанный прокси."""
     proxy_types = {
         'socks5': socks.SOCKS5,
         'socks4': socks.SOCKS4,
@@ -3620,7 +3620,7 @@ LLM_SYSTEM_PROMPT = (
     "варианта готового текста на русском.\n"
     "2. Варианты должны заметно отличаться по стилю/тону/подаче — "
     "например: дружелюбный, деловой, продающий.\n"
-    "3. Пиши НЕБОЛЬШОЙ текст, подбирай длину под параметры пользователя. "
+    "3. Пиши НЕБОЛЬШОЙ текст, ��одбирай длину под параметры пользователя. "
     "Никаких огромных полотен. Если пользователь не задал длину — "
     "ориентируйся на 2–5 предложений, до 600 символов.\n"
     "4. Активно используй эмодзи (1–3 на короткий текст, 3–6 на длинный), "
@@ -4500,7 +4500,7 @@ async def analyze_account_logs_security(
     account_id: int,
     user_id: int,
 ) -> Dict[str, Any]:
-    """Главная точка входа: тянет 50 логов + флуды, выдаёт отчёт.
+    """Главная точка входа: тянет 50 лог��в + флуды, выдаёт отчёт.
 
     Возвращает dict:
       {
@@ -4699,7 +4699,7 @@ def _is_quiet_hours() -> bool:
 def _is_in_quiet_period(periods: List[str]) -> bool:
     """Проверяет, попадает ли текущее время (МСК) хотя бы в один
     из тихих периодов вида "HH:MM-HH:MM".
-    Если в плане нет ни одного периода — считаем, что тишины нет.
+    Если в плане нет ни одного периода — считаем, ��то тишины нет.
     """
     if not periods:
         return False
@@ -6329,7 +6329,7 @@ async def wallet_topup_start(callback: CallbackQuery, state: FSMContext):
     ))
     await callback.message.edit_text(
         f"{emoji('MONEY_SEND')} <b>Пополнение баланса</b>\n\n"
-        f"Выберите способ пополнения:",
+        f"Выберите спос��б пополнения:",
         reply_markup=builder.as_markup()
     )
     await callback.answer()
@@ -6380,7 +6380,7 @@ async def wallet_topup_amount(message: Message, state: FSMContext):
     if not result.get('ok'):
         await state.clear()
         await message.answer(
-            f"{emoji('CROSS')} Не удалось создать счёт. Попробуйте позже.",
+            f"{emoji('CROSS')} Не удалось создать счёт. Попро��уйте позже.",
             reply_markup=get_balance_keyboard()
         )
         return
@@ -8275,7 +8275,7 @@ async def present_section(
     message: Message, section: str, text: str,
     reply_markup: InlineKeyboardMarkup, replace: bool = False,
 ) -> None:
-    """Показывает экран одним сообщением: медиа используется как вложение,
+    """Показывает экран одним сообщением: меди�� используется как вложение,
     а текст становится caption и получает ту же inline-клавиатуру."""
     media = await get_section_media(section)
     if not media:
@@ -8454,7 +8454,7 @@ async def build_admin_panel() -> tuple:
     ))
 
     admin_text = (
-        f"{emoji('BOT')} <b>Админ-панель</b>\n\n"
+        f"{emoji('BOT')} <b>Адм��н-панель</b>\n\n"
         f"{emoji('PEOPLE')} Пользователей: <b>{stats['total_users']}</b>\n"
         f"{emoji('PROFILE')} Аккаунтов: <b>{stats['total_accounts']}</b>\n"
         f"{emoji('MEGAPHONE')} Всего рассылок: <b>{stats['total_broadcasts']}</b>\n"
@@ -9023,7 +9023,7 @@ async def help_accounts_handler(callback: CallbackQuery):
         f"<b>Что это:</b> добавление Telegram-аккаунтов (Telethon-сессии) и "
         f"прокси к ним. Все остальные функции работают через эти аккаунты.\n\n"
         f"<b>Как запустить:</b>\n"
-        f"1. Главное меню → «Менеджер аккаунтов».\n"
+        f"1. Главное меню → «Мене��жер аккаунтов».\n"
         f"2. Нажмите «Добавить аккаунт».\n"
         f"3. Отправьте номер телефона в международном формате "
         f"(например <code>+79991234567</code>).\n"
@@ -9075,7 +9075,7 @@ async def help_dm_broadcast_handler(callback: CallbackQuery):
     text = (
         f"{emoji('CHAT')} <b>Рассылка в ЛС (личные сообщения)</b>\n\n"
         f"<b>Что это:</b> массовая отправка сообщений в личку пользователям, "
-        f"которых вы спарсили из чата.\n\n"
+        f"которых вы спарсили из ча��а.\n\n"
         f"<b>Как запустить:</b>\n"
         f"1. Сначала соберите базу: «Парсинг чата» → выгрузите <code>.txt</code>.\n"
         f"2. Главное меню → «Рассылка в ЛС».\n"
@@ -9136,7 +9136,7 @@ async def help_autoresponder_handler(callback: CallbackQuery):
         f"Можно добавлять несколько через запятую.\n"
         f"   • <b>AI-ответ</b> — модель сама формирует ответ в заданном "
         f"стиле (введите системный промпт).\n"
-        f"4. Укажите задержку ответа (например <code>5-25</code> сек).\n"
+        f"4. Укажите задержку ответа (наприм��р <code>5-25</code> сек).\n"
         f"5. Включите тумблер «Активен».\n\n"
         f"<b>Советы:</b>\n"
         f"• Не отвечайте на сообщения от ботов — включите фильтр в настройках.\n"
@@ -9191,7 +9191,7 @@ async def help_join_handler(callback: CallbackQuery):
         f"(например <code>60-180</code> сек).\n"
         f"5. «Запустить» — воркер пойдёт по списку.\n\n"
         f"<b>Советы:</b>\n"
-        f"• Не вступайте в десятки чатов за раз — Telegram склеит и забанит.\n"
+        f"• Не вступайт�� в десятки чатов за раз — Telegram склеит и забанит.\n"
         f"• Сначала прогрейте аккаунт хотя бы день.\n"
         f"• Вступайте в тематику, куда потом будете рассылать."
     )
@@ -10414,7 +10414,7 @@ async def ai_generator_resend(callback: CallbackQuery, state: FSMContext):
     """Прислать конкретный файл из истории."""
     parts = callback.data.split('_')
     if len(parts) < 4:
-        await callback.answer('Некорректный запрос', show_alert=True)
+        await callback.answer('Некорре��тный запрос', show_alert=True)
         return
     try:
         request_id = int(parts[2])
@@ -10502,7 +10502,7 @@ async def ai_generator_clear_confirm(callback: CallbackQuery, state: FSMContext)
     n = await clear_ai_history(callback.from_user.id)
     await state.clear()
     await callback.message.edit_text(
-        f"{emoji('CHECK')} <b>Готово.</b> Удалено записей: <b>{n}</b>.",
+        f"{emoji('CHECK')} <b>Гото��о.</b> Удалено записей: <b>{n}</b>.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
                 text="Создать новый запрос",
@@ -10635,7 +10635,7 @@ async def _finalize_account_addition(
     client: TelegramClient,
     proxy_id: Optional[int],
 ):
-    """Общая логика: INSERT аккаунта + уведомления + сообщение об успехе."""
+    """Общая логика: INSERT аккаунта + уведо��ления + сообщение об успехе."""
     try:
         async with db_pool.acquire() as conn:
             await conn.execute(
@@ -11095,25 +11095,22 @@ async def manage_account(callback: CallbackQuery):
 
     status_icon = "🟢" if account['is_active'] else "🔴"
 
+    premium_badge = (
+        f"{emoji('STAR')} Telegram Premium: <b>активен</b>\n"
+        if account.get('telegram_premium') else ""
+    )
+    validation_str = escape(account.get('validation_status') or 'unknown')
+    last_check_str = (
+        account['last_validated_at'].strftime('%d.%m.%Y %H:%M')
+        if account.get('last_validated_at') else "ещё не выполнялась"
+    )
+
     text = (
-<<<<<<< HEAD
-        f"{emoji('PROFILE')} <b>Аккаунт:</b>\n"
-        f"{emoji('PHONE')} Телефон: <code>{account['phone']}</code>\n"
-        f"{emoji('EYE')} Статус: "
-        f"{'Активен' if account['is_active'] else 'Неактивен'}\n"
-        f"{emoji('STAR') if account.get('telegram_premium') else emoji('INFO')} "
-        f"Telegram Premium: {'активен' if account.get('telegram_premium') else 'нет'}\n"
-        f"{emoji('CHECK')} Проверка: {escape(account.get('validation_status') or 'unknown')}\n"
-        f"{emoji('CLOCK')} Последняя проверка: "
-        f"{account['last_validated_at'].strftime('%d.%m.%Y %H:%M') if account.get('last_validated_at') else 'ещё не выполнялась'}\n"
-        f"{emoji('FIRE')} Прогрев: {warming_status}{warming_stats}\n"
-        f"{emoji('LINK')} Прокси: {proxy_line}\n"
-        f"{emoji('CLOCK')} Создан: "
-        f"{account['created_at'].strftime('%d.%m.%Y %H:%M')}"
-=======
         f"{emoji('PROFILE')} <b>Аккаунт {escape(account['phone'])}</b>\n"
         f"{'─' * 30}\n"
         f"{status_icon} Статус: <b>{'Активен' if account['is_active'] else 'Неактивен'}</b>\n"
+        f"{premium_badge}"
+        f"{emoji('CHECK')} Проверка: <b>{validation_str}</b> (последняя: {last_check_str})\n"
         f"{emoji('CLOCK')} Добавлен: <b>{account['created_at'].strftime('%d.%m.%Y %H:%M')}</b>\n\n"
         f"{emoji('LINK')} Прокси: {proxy_line}{proxy_status_badge}\n"
         f"{emoji('PHONE')} Отпечаток: {fp_line}\n\n"
@@ -11125,7 +11122,6 @@ async def manage_account(callback: CallbackQuery):
         f"  • Риск-скор: <b>{risk_score}/100</b> — {risk_label}\n\n"
         f"{emoji('CLOCK')} Последнее действие: {last_action_str}\n"
         f"{emoji('AI')} ИИ-автоответчик: {ai_line}"
->>>>>>> v0/balance-replenishment-system-807c4165
     )
 
     await callback.message.edit_text(
@@ -11828,7 +11824,7 @@ async def profile_set_avatar(message: Message, state: FSMContext):
         await message.answer_photo(
             BufferedInputFile(avatar_bytes, filename=f"draft_{account_id}.jpg"),
             caption=(
-                f"{emoji('MEDIA')} <b>Новая аватарка в черновике</b>\n"
+                f"{emoji('MEDIA')} <b>Новая аватарка в черн��вике</b>\n"
                 f"{emoji('INFO')} Нажмите «Сохранить», чтобы применить."
             ),
         )
@@ -12160,7 +12156,7 @@ async def profile_edit_save(callback: CallbackQuery, state: FSMContext):
     #    GetUserPhotosRequest + DeletePhotosRequest мы раньше делали
     #    сразу после UpdateProfileRequest — это регулярно валилось
     #    «TAKEOUT_INIT_FAIL_X» / «FLOOD_WAIT_X». Ставим только новое
-    #    фото, историю (если она есть) Telegram сам перетрёт главной
+    #    фото, историю (если она есть) Telegram сам п��ретрёт главной
     #    аватаркой, а старая останется в photo-history без видимого
     #    эффекта на сам профиль.
     if not flood_wait_seconds and not steps_failed and avatar_changed:
@@ -16928,7 +16924,7 @@ async def account_ai_responder_worker(account_id: int, user_id: int):
                         )
 
             except Exception as ex:
-                # Абсолютный catch-all: handler не должен ронять воркер.
+                # Абсолютный catch-all: handler не до��жен ронять воркер.
                 logger.exception(
                     f"acct_ar: необработанное исключение в handler: {ex}"
                 )
@@ -17554,7 +17550,7 @@ async def cb_acct_ar_dialog_clear(callback: CallbackQuery):
     chat_id_str = parts[3]
     account = await get_account(account_id)
     if not account or account['user_id'] != callback.from_user.id:
-        await callback.answer("Аккаунт не найден", show_alert=True)
+        await callback.answer("А��каунт не найден", show_alert=True)
         return
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
