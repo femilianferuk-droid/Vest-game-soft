@@ -756,7 +756,7 @@ async def init_db():
             )
         ''')
 
-        # Ч��ты аккаунта, кэшируемые для Telegram Mini App
+        # ����ты аккаунта, кэшируемые для Telegram Mini App
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS account_chats (
                 id BIGSERIAL PRIMARY KEY,
@@ -3706,7 +3706,7 @@ LLM_SECURITY_SYSTEM_PROMPT = (
 
 
 def _parse_llm_variants(content: str) -> List[Dict[str, str]]:
-    """Достаём 3 варианта из ответа модели. Терпимо к лишнему тексту вокруг JSON."""
+    """Достаём 3 варианта из ответа модели. Терпим�� к лишнему тексту вокруг JSON."""
     if not content:
         return []
 
@@ -3783,7 +3783,7 @@ async def call_llm_api(
             ],
         )
         # SmartAPI-прокси поддерживает Anthropic thinking-блок через
-        # отдельный параметр; пробрасываем только если включено.
+        # отдельный параметр; пробрасываем то��ько если включено.
         if LLM_THINKING:
             kwargs['thinking'] = {'type': 'enabled', 'budget_tokens': 1024}
 
@@ -4994,7 +4994,7 @@ async def _warming_action_typing(
             action=SendMessageTypingAction()
         ))
         await asyncio.sleep(random.uniform(1.5, 4.0))
-        # отменяем typing
+        # отменяе�� typing
         await client(SetTypingRequest(
             peer=target.peer,
             action=SendMessageCancelAction()
@@ -7011,6 +7011,12 @@ async def check_scheduled_broadcasts():
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(
+        text="Открыть мини-апп",
+        url="https://vestgamesoft.shop",
+        style='primary',
+        icon_custom_emoji_id=get_icon("APPS")
+    ))
+    builder.row(InlineKeyboardButton(
         text="Менеджер аккаунтов",
         callback_data="account_manager",
         style='primary',
@@ -7084,23 +7090,35 @@ def get_account_manager_keyboard() -> InlineKeyboardMarkup:
     ))
     return builder.as_markup()
 
-def get_proxies_keyboard(proxies: List[Dict]) -> InlineKeyboardMarkup:
+def get_proxies_keyboard(
+    proxies: List[Dict],
+    accounts_by_proxy: Optional[Dict[int, List[str]]] = None,
+) -> InlineKeyboardMarkup:
+    """Список прокси с пометкой о привязанных аккаунтах."""
     builder = InlineKeyboardBuilder()
     for p in proxies:
         label = p.get('label') or f"{p['host']}:{p['port']}"
-        # маскируем пароль в подписи
-        masked = f"{p['proxy_type']} | {label}"
+        bound = (accounts_by_proxy or {}).get(p['id'], [])
+        badge = f" [{len(bound)} акк.]" if bound else ""
         builder.row(InlineKeyboardButton(
-            text=f"{masked}",
+            text=f"{p['proxy_type']} | {label}{badge}",
             callback_data=f"manage_proxy_{p['id']}",
             style='default'
         ))
-    builder.row(InlineKeyboardButton(
-        text="Добавить прокси",
-        callback_data="add_proxy",
-        style='success',
-        icon_custom_emoji_id=get_icon("ADD_TEXT")
-    ))
+    builder.row(
+        InlineKeyboardButton(
+            text="Добавить прокси",
+            callback_data="add_proxy",
+            style='success',
+            icon_custom_emoji_id=get_icon("ADD_TEXT")
+        ),
+        InlineKeyboardButton(
+            text="Проверить все",
+            callback_data="check_all_proxies",
+            style='primary',
+            icon_custom_emoji_id=get_icon("REFRESH")
+        )
+    )
     builder.row(InlineKeyboardButton(
         text="Назад",
         callback_data="account_manager",
@@ -7111,6 +7129,12 @@ def get_proxies_keyboard(proxies: List[Dict]) -> InlineKeyboardMarkup:
 
 def get_proxy_actions_keyboard(proxy_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text="Проверить соединение",
+        callback_data=f"check_proxy_{proxy_id}",
+        style='primary',
+        icon_custom_emoji_id=get_icon("REFRESH")
+    ))
     builder.row(InlineKeyboardButton(
         text="Удалить",
         callback_data=f"delete_proxy_{proxy_id}",
@@ -8930,7 +8954,7 @@ async def help_handler(callback: CallbackQuery):
         f"{emoji('JOIN')} <b>Вступление в чаты</b> — массовое подключение.\n"
         f"{emoji('LIKE')} <b>Авто-лайкинг</b> — ре��кции на новые сообщения.\n"
         f"{emoji('SWEEP')} <b>Удаление сообщений</b> — очистка истории.\n"
-        f"{emoji('USERS')} <b>Парсинг чата</b> — сбор пользователей.\n"
+        f"{emoji('USERS')} <b>Па��синг чата</b> — сбор пользователей.\n"
         f"{emoji('PLAY')} <b>Скрипты</b> — запуск бота и нажатие сохранённой кнопки.\n"
         f"{emoji('AI')} <b>AI Генератор</b> — 3 варианта текста на выбор.\n\n"
         f"{emoji('SUPPORT')} <b>Поддержка:</b> {SUPPORT_USERNAME}"
@@ -9673,7 +9697,7 @@ async def ai_api_add(callback: CallbackQuery, state: FSMContext):
         f"{emoji('LINK')} <b>Новый AI API</b>\n\n"
         "Отправьте base URL Anthropic-совместимого API (https://...):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text='Отмена', callback_data='ai_api_settings', style='default',
+            InlineKeyboardButton(text='Отме��а', callback_data='ai_api_settings', style='default',
                                  icon_custom_emoji_id=get_icon('BACK'))
         ]])
     )
@@ -10222,7 +10246,7 @@ async def llm_cancel_pick(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "llm_back_to_variants")
 async def llm_back_to_variants(callback: CallbackQuery, state: FSMContext):
-    """Возврат к клавиатуре вариантов из меню модели."""
+    """Возврат к клавиа��уре вариантов из меню модели."""
     data = await state.get_data()
     variants = data.get('variants') or []
     request_id = data.get('request_id')
@@ -10870,44 +10894,128 @@ async def manage_account(callback: CallbackQuery):
         await callback.answer("Аккаунт не найден", show_alert=True)
         return
 
-    warming_status = (
-        "Включен" if account.get('warming_enabled') else "Выключен"
-    )
-
-    # Доп. статистика прогрева: сколько циклов и когда последний раз активничал.
-    warming_stats = ""
-    cycles = account.get('warming_cycles') or 0
-    if account.get('warming_enabled') and cycles:
-        last_active = account.get('warming_last_active')
-        last_str = (
-            last_active.astimezone(MSK_TZ).strftime('%d.%m %H:%M')
-            if last_active else "—"
-        )
-        warming_stats = (
-            f"\n{emoji('CHART')} Циклов: <b>{cycles}</b>"
-            f" • Последний: {last_str}"
-        )
-    elif cycles:
-        warming_stats = f"\n{emoji('CHART')} Циклов отработано: <b>{cycles}</b>"
-
-    proxy_line = "—"
+    # --- Прокси ---
+    proxy_line = "не привязан"
     has_proxy = False
+    proxy_status_badge = ""
     if account.get('proxy_id'):
         proxy = await get_proxy(account['proxy_id'])
         if proxy:
             label = proxy.get('label') or f"{proxy['host']}:{proxy['port']}"
-            proxy_line = f"{proxy['proxy_type']} | {label}"
+            proxy_line = f"<code>{proxy['proxy_type']} {label}</code>"
             has_proxy = True
+            proxy_status_badge = " ✅"
+        else:
+            proxy_line = "<i>удалён</i>"
+
+    # --- Прогрев ---
+    cycles = account.get('warming_cycles') or 0
+    last_active = account.get('warming_last_active')
+    if account.get('warming_enabled'):
+        warming_status = "включён"
+        if cycles:
+            last_str = (
+                last_active.astimezone(MSK_TZ).strftime('%d.%m %H:%M')
+                if last_active else "—"
+            )
+            warming_line = f"включён — {cycles} цикл(ов), последний: {last_str}"
+        else:
+            warming_line = "включён, ещё не запускался"
+    else:
+        warming_line = f"выключен" + (f" ({cycles} цикл(ов) всего)" if cycles else "")
+
+    # --- Активность за 24ч / 7д ---
+    async with db_pool.acquire() as conn:
+        sent_today = await conn.fetchval(
+            "SELECT COUNT(*) FROM account_logs "
+            "WHERE account_id=$1 AND direction='outgoing' AND created_at > NOW()-INTERVAL '24 hours'",
+            account_id
+        ) or 0
+        sent_week = await conn.fetchval(
+            "SELECT COUNT(*) FROM account_logs "
+            "WHERE account_id=$1 AND direction='outgoing' AND created_at > NOW()-INTERVAL '7 days'",
+            account_id
+        ) or 0
+        flood_week = await conn.fetchval(
+            "SELECT COUNT(*) FROM flood_wait_history "
+            "WHERE account_id=$1 AND occurred_at > NOW()-INTERVAL '7 days'",
+            account_id
+        ) or 0
+        flood_sum = await conn.fetchval(
+            "SELECT COALESCE(SUM(seconds),0) FROM flood_wait_history "
+            "WHERE account_id=$1 AND occurred_at > NOW()-INTERVAL '7 days'",
+            account_id
+        ) or 0
+        last_log = await conn.fetchrow(
+            "SELECT created_at, direction, chat_name FROM account_logs "
+            "WHERE account_id=$1 ORDER BY created_at DESC LIMIT 1",
+            account_id
+        )
+        # ИИ-автоответчик
+        ai_row = await conn.fetchrow(
+            "SELECT mode, system_prompt FROM account_ai_responder WHERE account_id=$1",
+            account_id
+        )
+
+    # --- Риск-скор ---
+    if flood_week == 0:
+        risk_score = 0
+        risk_label = "🟢 Низкий"
+    elif flood_week < 3:
+        risk_score = min(20 + flood_sum // 60, 40)
+        risk_label = "🟡 Умеренный"
+    elif flood_week < 6:
+        risk_score = 40 + min(flood_sum // 30, 30)
+        risk_label = "🟠 Повышенный"
+    else:
+        risk_score = min(70 + flood_sum // 20, 100)
+        risk_label = "🔴 Высокий"
+
+    # --- ИИ-автоответчик ---
+    if ai_row:
+        mode = ai_row['mode'] or 'off'
+        ai_line = "ИИ активен" if mode == 'ai' else "выключен"
+        if mode == 'ai' and ai_row.get('system_prompt'):
+            ai_preview = (ai_row['system_prompt'] or '')[:40].replace('\n', ' ')
+            ai_line += f" — <i>{escape(ai_preview)}…</i>"
+    else:
+        ai_line = "не настроен"
+
+    # --- Последнее действие ---
+    if last_log:
+        direction_icon = "→" if last_log['direction'] == 'outgoing' else "←"
+        last_action_str = (
+            f"{last_log['created_at'].astimezone(MSK_TZ).strftime('%d.%m %H:%M')} "
+            f"{direction_icon} <b>{escape(last_log['chat_name'] or '—')}</b>"
+        )
+    else:
+        last_action_str = "нет данных"
+
+    # --- Отпечаток ---
+    fingerprint = await get_account_fingerprint(account_id)
+    fp_line = (
+        f"<code>{escape(fingerprint.get('device_model','—'))}</code> / "
+        f"<code>{escape(fingerprint.get('system_version','—'))}</code>"
+        if fingerprint else "не задан"
+    )
+
+    status_icon = "🟢" if account['is_active'] else "🔴"
 
     text = (
-        f"{emoji('PROFILE')} <b>Аккаунт:</b>\n"
-        f"{emoji('PHONE')} Телефон: <code>{account['phone']}</code>\n"
-        f"{emoji('EYE')} Статус: "
-        f"{'Активен' if account['is_active'] else 'Неактивен'}\n"
-        f"{emoji('FIRE')} Прогрев: {warming_status}{warming_stats}\n"
-        f"{emoji('LINK')} Прокси: {proxy_line}\n"
-        f"{emoji('CLOCK')} Создан: "
-        f"{account['created_at'].strftime('%d.%m.%Y %H:%M')}"
+        f"{emoji('PROFILE')} <b>Аккаунт {escape(account['phone'])}</b>\n"
+        f"{'─' * 30}\n"
+        f"{status_icon} Статус: <b>{'Активен' if account['is_active'] else 'Неактивен'}</b>\n"
+        f"{emoji('CLOCK')} Добавлен: <b>{account['created_at'].strftime('%d.%m.%Y %H:%M')}</b>\n\n"
+        f"{emoji('LINK')} Прокси: {proxy_line}{proxy_status_badge}\n"
+        f"{emoji('PHONE')} Отпечаток: {fp_line}\n\n"
+        f"{emoji('FIRE')} Прогрев: {warming_line}\n\n"
+        f"{emoji('CHART')} <b>Активность:</b>\n"
+        f"  • отправлено за 24ч: <b>{sent_today}</b>\n"
+        f"  • отправлено за 7д: <b>{sent_week}</b>\n"
+        f"  • FloodWait за 7д: <b>{flood_week}</b> шт. (<b>{flood_sum}с</b>)\n"
+        f"  • Риск-скор: <b>{risk_score}/100</b> — {risk_label}\n\n"
+        f"{emoji('CLOCK')} Последнее действие: {last_action_str}\n"
+        f"{emoji('AI')} ИИ-автоответчик: {ai_line}"
     )
 
     await callback.message.edit_text(
@@ -13253,7 +13361,7 @@ async def show_chat_broadcast_detail(
     
     text = (
         f"{emoji('CHART')} <b>Рассылка ID: {bc['id']}</b>\n"
-        f"Тип: Рассылка в чаты\n\n"
+        f"Тип: Рассылка в ч��ты\n\n"
         f"{emoji('GEAR')} Статус: {bc['status']}{scheduled_text}\n"
         f"{emoji('STATS')} Прогресс: {progress}\n"
         f"{emoji('CLOCK')} Задержка: {bc['delay']} сек\n"
@@ -13866,7 +13974,7 @@ async def process_chat_creation_count(
 
     if not 1 <= count <= 100:
         await message.answer(
-            f"{emoji('CROSS')} Количество должно быть от 1 до 100."
+            f"{emoji('CROSS')} Количество дол��но быть от 1 до 100."
         )
         return
 
@@ -14529,7 +14637,7 @@ async def create_auto_responder(callback: CallbackQuery, state: FSMContext):
     await start_auto_responder(responder_id, user_id)
     
     await callback.message.edit_text(
-        f"{emoji('CHECK')} <b>Автоответчик создан и запущен!</b>\n\n"
+        f"{emoji('CHECK')} <b>Автоотв��тчик создан и запущен!</b>\n\n"
         f"ID: {responder_id}\n"
         f"Триггер: {escape(data['trigger'])}",
         reply_markup=get_functions_keyboard()
@@ -14990,7 +15098,7 @@ async def start_delete_messages(callback: CallbackQuery, state: FSMContext):
                 )
             elif result:
                 await callback.message.edit_text(
-                    f"{emoji('CHECK')} <b>Удаление завершено!</b>\n\n"
+                    f"{emoji('CHECK')} <b>Уд��ление завершено!</b>\n\n"
                     f"Удалено: {result['deleted']}\n"
                     f"Ошибок: {result['errors']}",
                     reply_markup=get_functions_keyboard()
@@ -15419,7 +15527,7 @@ async def admin_users_list(callback: CallbackQuery):
 
     builder = InlineKeyboardBuilder()
     for u in rows:
-        name = u.get('first_name') or u.get('username') or 'Без имени'
+        name = u.get('first_name') or u.get('username') or 'Без им��ни'
         badge = "🔥" if u.get('tier') == 'pro' else "•"
         builder.row(InlineKeyboardButton(
             text=f"{badge} {name} (ID {u['user_id']})",
@@ -15733,6 +15841,18 @@ async def admin_revoke_process(message: Message, state: FSMContext):
 async def my_proxies(callback: CallbackQuery):
     proxies = await get_user_proxies(callback.from_user.id)
 
+    # Загружаем привязки: proxy_id -> [phone, ...]
+    accounts_by_proxy: Dict[int, List[str]] = {}
+    if proxies:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT proxy_id, phone FROM accounts "
+                "WHERE user_id=$1 AND proxy_id IS NOT NULL",
+                callback.from_user.id
+            )
+        for r in rows:
+            accounts_by_proxy.setdefault(r['proxy_id'], []).append(r['phone'])
+
     if not proxies:
         text = (
             f"{emoji('LINK')} <b>Прокси</b>\n\n"
@@ -15744,19 +15864,21 @@ async def my_proxies(callback: CallbackQuery):
         text = f"{emoji('LINK')} <b>Ваши прокси ({len(proxies)}):</b>\n\n"
         for p in proxies[:20]:
             label = p.get('label') or f"{p['host']}:{p['port']}"
-            auth = (
-                f" (auth: {p['username']})"
-                if p.get('username') else ""
+            auth_badge = " 🔑" if p.get('username') else ""
+            bound = accounts_by_proxy.get(p['id'], [])
+            bound_str = (
+                f"привязан к: {', '.join(bound[:3])}"
+                + (" и др." if len(bound) > 3 else "")
+                if bound else "не привязан"
             )
-            status = "" if p.get('is_active') else ""
             text += (
-                f"{status} <b>{escape(label)}</b>\n"
-                f"   <code>{p['proxy_type']}://"
-                f"{p['host']}:{p['port']}</code>{auth}\n"
+                f"<b>{escape(label)}</b>{auth_badge}\n"
+                f"   <code>{p['proxy_type']}://{p['host']}:{p['port']}</code>\n"
+                f"   {bound_str}\n\n"
             )
 
     await callback.message.edit_text(
-        text, reply_markup=get_proxies_keyboard(proxies)
+        text, reply_markup=get_proxies_keyboard(proxies, accounts_by_proxy)
     )
     await callback.answer()
 
@@ -15813,7 +15935,7 @@ async def process_proxy_string(message: Message, state: FSMContext):
             f"Ошибка: <code>"
             f"{escape(str(check_result.get('error') or 'нет соединения'))}"
             f"</code>\n\n"
-            "Прокси не сохранён. Отправьте другой прокси.",
+            "Прокси не сохранён. Отправьте ��ругой прокси.",
         )
         return
 
@@ -15920,27 +16042,143 @@ async def manage_proxy(callback: CallbackQuery):
         await callback.answer("Прокси не найден", show_alert=True)
         return
 
-    auth = (
-        f"Логин: <code>{escape(proxy['username'])}</code>\n"
-        f"Пароль: <code>{'•' * len(proxy['password'])}</code>\n"
+    # Привязанные аккаунты
+    async with db_pool.acquire() as conn:
+        bound_accounts = await conn.fetch(
+            "SELECT phone FROM accounts WHERE proxy_id=$1 AND user_id=$2",
+            proxy_id, callback.from_user.id
+        )
+
+    auth_line = (
+        f"{emoji('KEY')} Аутентификация: <code>{escape(proxy['username'])}</code> / "
+        f"<code>{'•' * min(len(proxy.get('password') or ''), 8)}</code>\n"
         if proxy.get('username') else ""
     )
     label = proxy.get('label') or '—'
+    bound_str = (
+        ", ".join(f"<code>{r['phone']}</code>" for r in bound_accounts)
+        if bound_accounts else "<i>ни один</i>"
+    )
 
     text = (
-        f"{emoji('LINK')} <b>Прокси</b>\n\n"
-        f"Подпись: {escape(label)}\n"
-        f"Тип: <code>{proxy['proxy_type']}</code>\n"
-        f"Адрес: <code>{proxy['host']}:{proxy['port']}</code>\n"
-        f"{auth}"
-        f"Создан: "
-        f"{proxy['created_at'].strftime('%d.%m.%Y %H:%M')}"
+        f"{emoji('LINK')} <b>Прокси</b>\n"
+        f"{'─' * 28}\n"
+        f"{emoji('INFO')} Подпись: <b>{escape(label)}</b>\n"
+        f"{emoji('LINK')} Тип: <code>{proxy['proxy_type']}</code>\n"
+        f"{emoji('LINK')} Адрес: <code>{proxy['host']}:{proxy['port']}</code>\n"
+        f"{auth_line}"
+        f"{emoji('CLOCK')} Добавлен: <b>{proxy['created_at'].strftime('%d.%m.%Y %H:%M')}</b>\n\n"
+        f"{emoji('PEOPLE')} Привязан к аккаунтам: {bound_str}\n\n"
+        f"{emoji('INFO')} Нажмите «Проверить соединение» чтобы убедиться, что прокси работает."
     )
 
     await callback.message.edit_text(
         text, reply_markup=get_proxy_actions_keyboard(proxy_id)
     )
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("check_proxy_"))
+async def check_proxy_handler(callback: CallbackQuery):
+    """Проверяет конкретный прокси в реальном времени."""
+    proxy_id = int(callback.data.split("_")[2])
+    proxy = await get_proxy(proxy_id)
+
+    if not proxy or proxy['user_id'] != callback.from_user.id:
+        await callback.answer("Прокси не найден", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"{emoji('LOADING')} <b>Проверяю прокси…</b>\n\n"
+        f"<code>{proxy['proxy_type']}://{proxy['host']}:{proxy['port']}</code>",
+        reply_markup=None
+    )
+    await callback.answer()
+
+    proxy_dict = {
+        'proxy_type': proxy['proxy_type'],
+        'host': proxy['host'],
+        'port': proxy['port'],
+        'username': proxy.get('username'),
+        'password': proxy.get('password'),
+    }
+    result = await check_proxy_connection(proxy_dict)
+
+    label = proxy.get('label') or f"{proxy['host']}:{proxy['port']}"
+    if result.get('ok'):
+        status_text = (
+            f"{emoji('CHECK')} <b>Прокси работает</b>\n\n"
+            f"<code>{proxy['proxy_type']}://{proxy['host']}:{proxy['port']}</code>\n"
+            f"Подпись: <b>{escape(label)}</b>\n"
+            f"Отклик: <b>{result['latency_ms']} мс</b>\n"
+            f"Проверено через: <code>{escape(str(result.get('target', '—')))}</code>"
+        )
+    else:
+        status_text = (
+            f"{emoji('CROSS')} <b>Прокси не работает</b>\n\n"
+            f"<code>{proxy['proxy_type']}://{proxy['host']}:{proxy['port']}</code>\n"
+            f"Подпись: <b>{escape(label)}</b>\n"
+            f"Ошибка: <code>{escape(str(result.get('error', 'нет соединения')))}</code>"
+        )
+
+    await callback.message.edit_text(
+        status_text, reply_markup=get_proxy_actions_keyboard(proxy_id)
+    )
+
+
+@dp.callback_query(F.data == "check_all_proxies")
+async def check_all_proxies_handler(callback: CallbackQuery):
+    """Проверяет все прокси пользователя последовательно."""
+    proxies = await get_user_proxies(callback.from_user.id)
+    if not proxies:
+        await callback.answer("У вас нет прокси", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"{emoji('LOADING')} <b>Проверяю {len(proxies)} прокси…</b>\n\n"
+        f"Это может занять до {len(proxies) * 10} сек.",
+        reply_markup=None
+    )
+    await callback.answer()
+
+    results = []
+    for p in proxies:
+        proxy_dict = {
+            'proxy_type': p['proxy_type'],
+            'host': p['host'],
+            'port': p['port'],
+            'username': p.get('username'),
+            'password': p.get('password'),
+        }
+        res = await check_proxy_connection(proxy_dict)
+        label = p.get('label') or f"{p['host']}:{p['port']}"
+        if res.get('ok'):
+            results.append(f"✅ <b>{escape(label)}</b> — {res['latency_ms']} мс")
+        else:
+            err = escape(str(res.get('error', '—'))[:40])
+            results.append(f"❌ <b>{escape(label)}</b> — {err}")
+
+    ok_count = sum(1 for r in results if r.startswith("✅"))
+    text = (
+        f"{emoji('LINK')} <b>Результаты проверки прокси</b>\n"
+        f"Работают: <b>{ok_count}/{len(proxies)}</b>\n\n"
+        + "\n".join(results)
+    )
+
+    # Получаем привязки для клавиатуры
+    accounts_by_proxy: Dict[int, List[str]] = {}
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT proxy_id, phone FROM accounts "
+            "WHERE user_id=$1 AND proxy_id IS NOT NULL",
+            callback.from_user.id
+        )
+    for r in rows:
+        accounts_by_proxy.setdefault(r['proxy_id'], []).append(r['phone'])
+
+    await callback.message.edit_text(
+        text, reply_markup=get_proxies_keyboard(proxies, accounts_by_proxy)
+    )
 
 
 @dp.callback_query(F.data.startswith("delete_proxy_"))
@@ -15953,13 +16191,24 @@ async def delete_proxy_handler(callback: CallbackQuery):
         await callback.answer("Не удалось удалить", show_alert=True)
 
     proxies = await get_user_proxies(callback.from_user.id)
+    accounts_by_proxy: Dict[int, List[str]] = {}
+    if proxies:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT proxy_id, phone FROM accounts "
+                "WHERE user_id=$1 AND proxy_id IS NOT NULL",
+                callback.from_user.id
+            )
+        for r in rows:
+            accounts_by_proxy.setdefault(r['proxy_id'], []).append(r['phone'])
+
     text = (
         f"{emoji('LINK')} <b>Ваши прокси ({len(proxies)}):</b>"
         if proxies else
         f"{emoji('LINK')} Прокси удалены. Добавьте новые при необходимости."
     )
     await callback.message.edit_text(
-        text, reply_markup=get_proxies_keyboard(proxies)
+        text, reply_markup=get_proxies_keyboard(proxies, accounts_by_proxy)
     )
 
 
@@ -16207,7 +16456,7 @@ async def start_account_ai_responder(account_id: int, user_id: int):
         await stop_account_ai_responder(account_id, user_id)
         return
 
-    # Если уже запущен — ничего
+    # Если уже запущ��н — ничего
     if user_id in active_account_ai_responders \
             and account_id in active_account_ai_responders[user_id]:
         return
@@ -16333,7 +16582,7 @@ async def account_ai_responder_worker(account_id: int, user_id: int):
                 except Exception:
                     sender_name = str(chat_id)
 
-                # 2) СРАЗУ логируем входящее — чтобы оно появилось в
+                # 2) СРАЗУ логируем входящее — чтобы оно появило��ь в
                 #    «Логах аккаунта» даже если LLM упадёт. Это и есть
                 #    та самая «история диалогов», которую ждёт юзер.
                 try:
@@ -16540,7 +16789,7 @@ async def account_ai_responder_worker(account_id: int, user_id: int):
                         break  # в outer while для реконнекта
 
                 reconnect_tries += 1
-                await asyncio.sleep(5)  # пауза перед реконнектом
+                await asyncio.sleep(5)  # пауза перед реконнект��м
             except asyncio.CancelledError:
                 raise
             except Exception as ex:
@@ -17060,7 +17309,7 @@ async def cb_acct_ar_dialog_view(callback: CallbackQuery):
         icon_custom_emoji_id=get_icon("SWEEP"),
     ))
     builder.row(InlineKeyboardButton(
-        text="К списку диалогов",
+        text="К списку ��иалогов",
         callback_data=f"acct_ar:dialogs:{account_id}:0",
         style='default',
         icon_custom_emoji_id=get_icon("BACK"),
