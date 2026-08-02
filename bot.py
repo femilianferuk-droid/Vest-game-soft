@@ -533,6 +533,10 @@ class UserLLMConfigStates(StatesGroup):
     waiting_for_api_key = State()
     waiting_for_models = State()
 
+
+class BroadcastTemplateStates(StatesGroup):
+    waiting_for_name = State()
+
 class ParsingStates(StatesGroup):
     waiting_for_account = State()
     waiting_for_chat = State()
@@ -680,6 +684,9 @@ async def init_db():
             'lang_code TEXT',
             'system_lang_code TEXT',
             'fingerprint_updated_at TIMESTAMP',
+            'telegram_premium BOOLEAN DEFAULT FALSE',
+            'validation_status TEXT DEFAULT \'unknown\'',
+            'last_validated_at TIMESTAMP',
         ):
             try:
                 await conn.execute(
@@ -1010,6 +1017,23 @@ async def init_db():
             )
         ''')
         await conn.execute('''
+            CREATE TABLE IF NOT EXISTS broadcast_templates (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                message_variants JSONB NOT NULL DEFAULT '[]'::jsonb,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        try:
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_broadcast_templates_user '
+                'ON broadcast_templates (user_id, created_at DESC)'
+            )
+        except Exception:
+            pass
+        await conn.execute('''
             CREATE TABLE IF NOT EXISTS autosub_configs (
                 account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
                 user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
@@ -1229,7 +1253,10 @@ async def get_user_accounts(user_id: int) -> List[Dict]:
             '''SELECT id, phone, is_active,
             COALESCE(warming_enabled, FALSE) as warming_enabled,
             COALESCE(warming_cycles, 0) as warming_cycles,
-            warming_last_active
+            warming_last_active,
+            COALESCE(telegram_premium, FALSE) AS telegram_premium,
+            COALESCE(validation_status, 'unknown') AS validation_status,
+            last_validated_at
             FROM accounts WHERE user_id = $1''',
             user_id
         )
@@ -7369,6 +7396,7 @@ def get_functions_keyboard() -> InlineKeyboardMarkup:
             button("Мои автоответчики", "my_auto_responders", "BELL", 'default'),
         ),
         (
+            button("Шаблоны", "broadcast_templates", "CLIPBOARD", 'default'),
             button("Назад", "main_menu", "BACK", 'default'),
         ),
     )
@@ -7675,6 +7703,12 @@ def get_broadcast_mode_keyboard() -> InlineKeyboardMarkup:
         icon_custom_emoji_id=get_icon("TIME_PAST")
     ))
     builder.row(InlineKeyboardButton(
+        text="Шаблоны рассылок",
+        callback_data="broadcast_templates",
+        style='default',
+        icon_custom_emoji_id=get_icon("CLIPBOARD")
+    ))
+    builder.row(InlineKeyboardButton(
         text="Назад",
         callback_data="functions",
         style='default',
@@ -7689,6 +7723,12 @@ def get_broadcast_preview_keyboard() -> InlineKeyboardMarkup:
         callback_data="start_broadcast",
         style='success',
         icon_custom_emoji_id=get_icon("PLAY")
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Сохранить как шаблон",
+        callback_data="broadcast_template_save",
+        style='default',
+        icon_custom_emoji_id=get_icon("CLIPBOARD")
     ))
     builder.row(InlineKeyboardButton(
         text="Отмена",
@@ -7789,11 +7829,13 @@ def get_accounts_list_keyboard(
     for acc in accounts:
         warming = "" if acc.get('warming_enabled') else ""
         status = "" if acc['is_active'] else ""
+        premium = " Premium" if acc.get('telegram_premium') else ""
+        validity = " Проверен" if acc.get('validation_status') == 'valid' else ""
         builder.row(InlineKeyboardButton(
-            text=f"{acc['phone']} {status} {warming}",
+            text=f"{acc['phone']}{premium}{validity} {status} {warming}",
             callback_data=f"{callback_prefix}_{acc['id']}",
             style='default',
-            icon_custom_emoji_id=get_icon("PROFILE")
+            icon_custom_emoji_id=get_icon("STAR" if acc.get('telegram_premium') else "PROFILE")
         ))
     builder.row(InlineKeyboardButton(
         text="Назад",
@@ -7808,6 +7850,12 @@ def get_account_actions_keyboard(
     has_proxy: bool = False
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text="Проверить валидность",
+        callback_data=f"validate_account_{account_id}",
+        style='primary',
+        icon_custom_emoji_id=get_icon("CHECK")
+    ))
     builder.row(InlineKeyboardButton(
         text="Логи аккаунта",
         callback_data=f"account_logs_{account_id}",
@@ -10843,6 +10891,52 @@ async def process_2fa(message: Message, state: FSMContext):
         await state.clear()
 
 # --- Мои аккаунты ---
+async def validate_account(account_id: int, user_id: int) -> Dict[str, Any]:
+    account = await get_account(account_id)
+    if not account or account.get('user_id') != user_id:
+        return {'valid': False, 'error': 'Аккаунт не найден'}
+    client = await get_client_for_account(account_id)
+    valid = bool(client and client.is_connected() and await client.is_user_authorized())
+    premium = False
+    username = ''
+    error = ''
+    if valid:
+        try:
+            me = await client.get_me()
+            premium = bool(getattr(me, 'premium', False))
+            username = getattr(me, 'username', None) or ''
+        except Exception as ex:
+            valid, error = False, str(ex)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            '''UPDATE accounts SET is_active = $1, telegram_premium = $2,
+               validation_status = $3, last_validated_at = NOW() WHERE id = $4''',
+            valid, premium, 'valid' if valid else 'invalid', account_id
+        )
+    return {'valid': valid, 'premium': premium, 'username': username, 'error': error}
+
+
+@dp.callback_query(F.data.startswith('validate_account_'))
+async def validate_account_handler(callback: CallbackQuery):
+    account_id = int(callback.data.rsplit('_', 1)[1])
+    await callback.answer('Проверяю подключение...')
+    result = await validate_account(account_id, callback.from_user.id)
+    if not result['valid']:
+        await callback.message.edit_text(
+            f"{emoji('CROSS')} <b>Сессия невалидна</b>\n\n"
+            f"{escape(result.get('error') or 'Требуется повторная авторизация.')}",
+            reply_markup=get_account_actions_keyboard(account_id)
+        )
+        return
+    premium_text = 'Telegram Premium активен' if result.get('premium') else 'Telegram Premium отсутствует'
+    await callback.message.edit_text(
+        f"{emoji('CHECK')} <b>Аккаунт валиден</b>\n\n"
+        f"Username: <code>@{escape(result.get('username') or 'нет')}</code>\n"
+        f"{emoji('STAR') if result.get('premium') else emoji('INFO')} {premium_text}",
+        reply_markup=get_account_actions_keyboard(account_id)
+    )
+
+
 @dp.callback_query(F.data == "my_accounts")
 async def my_accounts(callback: CallbackQuery):
     accounts = await get_user_accounts(callback.from_user.id)
@@ -10904,6 +10998,11 @@ async def manage_account(callback: CallbackQuery):
         f"{emoji('PHONE')} Телефон: <code>{account['phone']}</code>\n"
         f"{emoji('EYE')} Статус: "
         f"{'Активен' if account['is_active'] else 'Неактивен'}\n"
+        f"{emoji('STAR') if account.get('telegram_premium') else emoji('INFO')} "
+        f"Telegram Premium: {'активен' if account.get('telegram_premium') else 'нет'}\n"
+        f"{emoji('CHECK')} Проверка: {escape(account.get('validation_status') or 'unknown')}\n"
+        f"{emoji('CLOCK')} Последняя проверка: "
+        f"{account['last_validated_at'].strftime('%d.%m.%Y %H:%M') if account.get('last_validated_at') else 'ещё не выполнялась'}\n"
         f"{emoji('FIRE')} Прогрев: {warming_status}{warming_stats}\n"
         f"{emoji('LINK')} Прокси: {proxy_line}\n"
         f"{emoji('CLOCK')} Создан: "
@@ -12342,8 +12441,109 @@ async def delete_account_handler(callback: CallbackQuery):
     await callback.answer()
 
 # --- Рассылка ---
+async def get_broadcast_templates(user_id: int) -> List[Dict[str, Any]]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            'SELECT id, name, message_variants, created_at FROM broadcast_templates '
+            'WHERE user_id = $1 ORDER BY created_at DESC LIMIT 30', user_id
+        )
+    return [dict(row) for row in rows]
+
+
+def get_broadcast_templates_keyboard(templates: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for item in templates:
+        count = len(item.get('message_variants') or [])
+        builder.row(InlineKeyboardButton(
+            text=f"{item['name']} ({count})", callback_data=f"broadcast_template_use:{item['id']}",
+            style='primary', icon_custom_emoji_id=get_icon('CLIPBOARD')
+        ))
+    builder.row(InlineKeyboardButton(text='Назад', callback_data='broadcast', style='default',
+                                     icon_custom_emoji_id=get_icon('BACK')))
+    return builder.as_markup()
+
+
+@dp.callback_query(F.data == 'broadcast_templates')
+async def broadcast_templates_menu(callback: CallbackQuery, state: FSMContext):
+    templates = await get_broadcast_templates(callback.from_user.id)
+    await callback.message.edit_text(
+        f"{emoji('CLIPBOARD')} <b>Шаблоны рассылок</b>\n\n"
+        f"Сохранено: <b>{len(templates)}</b>\nВыберите шаблон для применения.",
+        reply_markup=get_broadcast_templates_keyboard(templates)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('broadcast_template_use:'))
+async def broadcast_template_use(callback: CallbackQuery, state: FSMContext):
+    template_id = int(callback.data.split(':', 1)[1])
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            'SELECT * FROM broadcast_templates WHERE id = $1 AND user_id = $2',
+            template_id, callback.from_user.id
+        )
+    if not row:
+        await callback.answer('Шаблон не найден', show_alert=True)
+        return
+    variants = list(row['message_variants'] or [])[:30]
+    await state.clear()
+    await state.update_data(message_texts=variants, applied_template=row['name'])
+    await callback.message.edit_text(
+        f"{emoji('CHECK')} Шаблон <b>{escape(row['name'])}</b> применён.\n\n"
+        f"Сообщений: <b>{len(variants)}</b>. Выберите режим рассылки:",
+        reply_markup=get_broadcast_mode_keyboard()
+    )
+    await callback.answer('Шаблон применён')
+
+
+@dp.callback_query(F.data == 'broadcast_template_save')
+async def broadcast_template_save_start(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data.get('message_texts'):
+        await callback.answer('Нет сообщений для шаблона', show_alert=True)
+        return
+    await state.set_state(BroadcastTemplateStates.waiting_for_name)
+    await callback.message.edit_text(
+        f"{emoji('CLIPBOARD')} <b>Сохранение шаблона</b>\n\nВведите название шаблона:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text='Отмена', callback_data='functions', style='default',
+                                 icon_custom_emoji_id=get_icon('BACK'))
+        ]])
+    )
+    await callback.answer()
+
+
+@dp.message(BroadcastTemplateStates.waiting_for_name)
+async def broadcast_template_save_name(message: Message, state: FSMContext):
+    name = ' '.join((message.text or '').split())[:80]
+    data = await state.get_data()
+    variants = list(data.get('message_texts') or [])[:30]
+    if not name or not variants:
+        await message.answer('Введите название шаблона.')
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            '''INSERT INTO broadcast_templates (user_id, name, message_variants)
+               VALUES ($1, $2, $3::jsonb)''',
+            message.from_user.id, name, json.dumps(variants, ensure_ascii=False)
+        )
+    await state.clear()
+    await message.answer(
+        f"{emoji('CHECK')} Шаблон <b>{escape(name)}</b> сохранён.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text='К шаблонам', callback_data='broadcast_templates',
+                                 style='primary', icon_custom_emoji_id=get_icon('CLIPBOARD')),
+            InlineKeyboardButton(text='В функции', callback_data='functions',
+                                 style='default', icon_custom_emoji_id=get_icon('BACK'))
+        ]])
+    )
+
+
 @dp.callback_query(F.data == "broadcast")
 async def broadcast(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data.get('message_texts'):
+        await state.clear()
     await callback.message.edit_text(
         f"{emoji('SEND')} <b>Рассылка</b>\n\nВыберите режим рассылки:",
         reply_markup=get_broadcast_mode_keyboard()
@@ -12597,7 +12797,17 @@ async def process_count(message: Message, state: FSMContext):
         return
     
     await state.update_data(message_count=count)
-    
+    existing = list((await state.get_data()).get('message_texts') or [])
+    if existing:
+        await message.answer(
+            f"{emoji('CLIPBOARD')} <b>Шаблон загружен</b>\n\n"
+            f"Сообщений: <b>{len(existing)}</b>. Они будут выбираться случайно. "
+            f"Можно добавить ещё сообщения или сразу нажать «Готово».",
+            reply_markup=_collecting_keyboard(len(existing), 30)
+        )
+        await state.set_state(BroadcastStates.waiting_for_message)
+        return
+
     await message.answer(
         f"{emoji('WRITE')} <b>Введите сообщение для рассылки:</b>\n\n"
         f"Поддерживается HTML и премиум эмодзи.\n"
@@ -12639,7 +12849,7 @@ async def _extract_message_payload(message: Message, state: FSMContext):
     return text, media_paths
 
 
-def _collecting_keyboard(count: int, max_count: int = 100) -> InlineKeyboardMarkup:
+def _collecting_keyboard(count: int, max_count: int = 30) -> InlineKeyboardMarkup:
     """Клавиатура для режима набора нескольких сообщений: кнопка
     «Готово» появляется только если уже есть минимум одно сообщение,
     и блокируется при достижении лимита."""
@@ -12671,20 +12881,20 @@ def _collecting_keyboard(count: int, max_count: int = 100) -> InlineKeyboardMark
 
 
 async def process_broadcast_message(message: Message, state: FSMContext):
-    """Набираем до 100 сообщений подряд. После каждого сообщения
+    """Набираем до 30 сообщений подряд. После каждого сообщения
     показываем счётчик и кнопку «Готово». Сами варианты хранятся в
     state['message_texts'] как список dict {text, media}."""
     text, media_paths = await _extract_message_payload(message, state)
 
     data = await state.get_data()
     variants = list(data.get('message_texts') or [])
-    if len(variants) >= 100:
+    if len(variants) >= 30:
         # Лимит — просто показываем клавиатуру с Готово и не добавляем
         # ничего нового. Можно считать, что state уже не доверяет.
         await message.answer(
-            f"{emoji('CROSS')} Достигнут лимит в 100 сообщений. "
+            f"{emoji('CROSS')} Достигнут лимит в 30 сообщений. "
             f"Нажмите «Готово», чтобы продолжить.",
-            reply_markup=_collecting_keyboard(len(variants), 100)
+            reply_markup=_collecting_keyboard(len(variants), 30)
         )
         return
 
@@ -12710,8 +12920,8 @@ async def process_broadcast_message(message: Message, state: FSMContext):
         f"{emoji('MAIL')} <b>Сообщение #{len(variants)} добавлено.</b>\n\n"
         f"Отправьте следующее сообщение — оно будет добавлено в список "
         f"и при рассылке выберется случайно. Когда закончите — нажмите "
-        f"«Готово». Можно добавить до 100 вариантов.",
-        reply_markup=_collecting_keyboard(len(variants), 100)
+        f"«Готово». Можно добавить до 30 вариантов.",
+        reply_markup=_collecting_keyboard(len(variants), 30)
     )
 
 
@@ -12749,7 +12959,7 @@ async def _save_broadcast_button(message: Message, state: FSMContext, button_tex
     await message.answer(
         f"{emoji('CHECK')} Кнопка добавлена: <b>{escape(button_text)}</b>\n"
         f"<code>{escape(button_url)}</code>",
-        reply_markup=_collecting_keyboard(len(variants), 100)
+        reply_markup=_collecting_keyboard(len(variants), 30)
     )
 
 
@@ -12805,7 +13015,7 @@ async def broadcast_button_cancel(callback: CallbackQuery, state: FSMContext):
                           else DMBroadcastStates.waiting_for_message)
     await callback.message.edit_text(
         f"{emoji('INFO')} Возврат к конструктору сообщений.",
-        reply_markup=_collecting_keyboard(len(variants), 100)
+        reply_markup=_collecting_keyboard(len(variants), 30)
     )
     await callback.answer()
 
@@ -12968,16 +13178,16 @@ async def scheduled_process_count(message: Message, state: FSMContext):
 
 @dp.message(ScheduledBroadcastStates.waiting_for_message)
 async def scheduled_process_message(message: Message, state: FSMContext):
-    """Набираем до 100 сообщений для отложенной рассылки."""
+    """Набираем до 30 сообщений для отложенной рассылки."""
     text, media_paths = await _extract_message_payload(message, state)
 
     data = await state.get_data()
     variants = list(data.get('message_texts') or [])
-    if len(variants) >= 100:
+    if len(variants) >= 30:
         await message.answer(
-            f"{emoji('CROSS')} Достигнут лимит в 100 сообщений. "
+            f"{emoji('CROSS')} Достигнут лимит в 30 сообщений. "
             f"Нажмите «Готово», чтобы продолжить.",
-            reply_markup=_collecting_keyboard(len(variants), 100)
+            reply_markup=_collecting_keyboard(len(variants), 30)
         )
         return
 
@@ -13001,8 +13211,8 @@ async def scheduled_process_message(message: Message, state: FSMContext):
     await message.answer(
         f"{emoji('MAIL')} <b>Сообщение #{len(variants)} добавлено.</b>\n\n"
         f"Отправьте следующее или нажмите «Готово», чтобы перейти к "
-        f"выбору даты. Можно добавить до 100 вариантов.",
-        reply_markup=_collecting_keyboard(len(variants), 100)
+        f"выбору даты. Можно добавить до 30 вариантов.",
+        reply_markup=_collecting_keyboard(len(variants), 30)
     )
 
 
@@ -13537,16 +13747,16 @@ async def process_dm_file_invalid(message: Message):
 
 @dp.message(DMBroadcastStates.waiting_for_message)
 async def process_dm_message(message: Message, state: FSMContext):
-    """Набираем до 100 вариантов сообщений для DM-рассылки."""
+    """Набираем до 30 вариантов сообщений для DM-рассылки."""
     text, media_paths = await _extract_message_payload(message, state)
 
     data = await state.get_data()
     variants = list(data.get('message_texts') or [])
-    if len(variants) >= 100:
+    if len(variants) >= 30:
         await message.answer(
-            f"{emoji('CROSS')} Достигнут лимит в 100 сообщений. "
+            f"{emoji('CROSS')} Достигнут лимит в 30 сообщений. "
             f"Нажмите «Готово», чтобы продолжить.",
-            reply_markup=_collecting_keyboard(len(variants), 100)
+            reply_markup=_collecting_keyboard(len(variants), 30)
         )
         return
 
@@ -13570,8 +13780,8 @@ async def process_dm_message(message: Message, state: FSMContext):
     await message.answer(
         f"{emoji('MAIL')} <b>Сообщение #{len(variants)} добавлено.</b>\n\n"
         f"Отправьте следующее или нажмите «Готово», чтобы перейти к "
-        f"выбору задержки. Можно добавить до 100 вариантов.",
-        reply_markup=_collecting_keyboard(len(variants), 100)
+        f"выбору задержки. Можно добавить до 30 вариантов.",
+        reply_markup=_collecting_keyboard(len(variants), 30)
     )
 
 
