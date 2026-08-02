@@ -953,7 +953,7 @@ async def init_db():
             pass
         # Список сообщений для рандомной рассылки (JSONB-массив объектов
         # {text, media}). Если заполнен — execute_*_broadcast будет
-        # случайно выбирать одно из сообщений при каждой отправк��.
+        # случайно выбирать одно из сообщений при каждой отправк���.
         try:
             await conn.execute(
                 "ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS message_texts JSONB DEFAULT '[]'::jsonb"
@@ -2241,7 +2241,7 @@ def format_fingerprint_text(fingerprint: Optional[Dict[str, Any]]) -> str:
         f"<code>{fingerprint.get('lang_code') or '—'}</code>\n"
         f"{emoji('GLOBE')} <b>Язык системы:</b> "
         f"<code>{fingerprint.get('system_lang_code') or '—'}</code>\n"
-        f"{emoji('CLOCK')} <b>Обновлён:</b> {updated_str}"
+        f"{emoji('CLOCK')} <b>Обновл��н:</b> {updated_str}"
     )
 
 
@@ -2583,7 +2583,7 @@ async def fingerprint_menu(callback: CallbackQuery):
     fingerprint = await get_account_fingerprint(account_id)
     text = (
         f"{emoji('PHONE')} <b>Отпечаток устройства</b>\n\n"
-        f"Это параметры, под которыми Telegram видит этот аккаунт. "
+        f"Это параметры, под которыми Telegram видит этот аккаун��. "
         f"У разных аккаунтов должны быть разные — иначе антифрод "
         f"свяжет их между собой.\n\n"
         f"{format_fingerprint_text(fingerprint)}"
@@ -3641,7 +3641,7 @@ LLM_SYSTEM_PROMPT = (
 
 
 # --- LLM: системный промпт для генерации плана прогрева ---
-# Генерирует ПОЛНЫЙ план на заданное окно (по умолчанию 12 часов):
+# Генерирует ПО��НЫЙ план на заданное окно (по умолчанию 12 часов):
 #  - интервалы между волнами с учётом времени суток
 #  - распределение типов действий
 #  - почасовое расписание интенсивности
@@ -3783,7 +3783,7 @@ async def call_llm_api(
     запроса/ответа — нативный Anthropic Messages API.
 
     Модель берётся из явного аргумента `model`, иначе из настройки пользователя,
-    иначе из глобального дефолта (LLM_DEFAULT_MODEL).
+    иначе из глобал��ного дефолта (LLM_DEFAULT_MODEL).
     Возвращает <=3 вариантов {'title','text'}.
     """
     if not model:
@@ -4699,7 +4699,7 @@ def _is_quiet_hours() -> bool:
 def _is_in_quiet_period(periods: List[str]) -> bool:
     """Проверяет, попадает ли текущее время (МСК) хотя бы в один
     из тихих периодов вида "HH:MM-HH:MM".
-    Если в плане нет ни одного периода — считаем, ��то тишины нет.
+    Если в плане нет ни одного ��ериода — считаем, ��то тишины нет.
     """
     if not periods:
         return False
@@ -7546,7 +7546,7 @@ def get_script_actions_keyboard(script_id: int) -> InlineKeyboardMarkup:
 def format_script_card(script: Dict[str, Any]) -> str:
     status_labels = {
         'completed': 'Выполнен',
-        'failed': 'Ошибка',
+        'failed': 'О��ибка',
         'running': 'Выполняется',
         'never': 'Ещё не запускался',
     }
@@ -8068,7 +8068,7 @@ def get_parsing_mode_keyboard() -> InlineKeyboardMarkup:
         icon_custom_emoji_id=get_icon("TAG")
     ))
     builder.row(InlineKeyboardButton(
-        text="Только имена",
+        text="Тол��ко имена",
         callback_data="parse_mode_names",
         style='primary',
         icon_custom_emoji_id=get_icon("NAMES")
@@ -9190,7 +9190,7 @@ async def help_join_handler(callback: CallbackQuery):
         f"4. Укажите задержку между вступлениями "
         f"(например <code>60-180</code> сек).\n"
         f"5. «Запустить» — воркер пойдёт по списку.\n\n"
-        f"<b>Советы:</b>\n"
+        f"<b>Сове��ы:</b>\n"
         f"• Не вступайт�� в десятки чатов за раз — Telegram склеит и забанит.\n"
         f"• Сначала прогрейте аккаунт хотя бы день.\n"
         f"• Вступайте в тематику, куда потом будете рассылать."
@@ -9516,7 +9516,7 @@ async def buy_pro_crypto(callback: CallbackQuery):
     amount = inv.get("amount", PRO_PRICE_USD)
     asset = inv.get("asset", "USDT")
     edited = await callback.message.edit_text(
-        f"{emoji('MONEY_SEND')} <b>Счёт на оплату Pro</b>\n\n"
+        f"{emoji('MONEY_SEND')} <b>Счёт на ��плату Pro</b>\n\n"
         f"Тариф: <b>Pro</b> ({PRO_PRICE_LABEL})\n"
         f"Сумма: <b>{amount} {asset}</b>\n\n"
         f"{emoji('CLOCK')} Оплата проверяется автоматически...",
@@ -16158,7 +16158,7 @@ async def process_proxy_string(message: Message, state: FSMContext):
 
     await state.update_data(proxy=parsed, proxy_check=check_result)
     await checking_message.edit_text(
-        f"{emoji('CHECK')} <b>Прокси работает</b>\n\n"
+        f"{emoji('CHECK')} <b>Пр��кси работает</b>\n\n"
         f"<code>{parsed['proxy_type']}://"
         f"{escape(str(parsed['host']))}:{parsed['port']}</code>\n"
         f"Отклик: <b>{check_result['latency_ms']} мс</b>\n"
@@ -17731,9 +17731,45 @@ async def on_startup():
     asyncio.create_task(task_queue_worker())
 
 async def main():
-    await on_startup()
+    # --- Защита от запуска нескольких экземпляров ---
+    import fcntl
+    token_hash = hashlib.md5(BOT_TOKEN.encode()).hexdigest()[:12]
+    lock_path = f"/tmp/bot_{token_hash}.lock"
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        logger.critical(
+            "Другой экземпляр бота уже запущен (lock: %s). Завершение.", lock_path
+        )
+        return
+
+    # Сбрасываем вебхук и накопившиеся апдейты
     await bot(DeleteWebhook(drop_pending_updates=True))
-    await dp.start_polling(bot)
+    await on_startup()
+
+    # Полинг с автоматическим backoff при TelegramRetryAfter
+    from aiogram.exceptions import TelegramRetryAfter as _TelegramRetryAfter
+    backoff = 0
+    while True:
+        try:
+            await dp.start_polling(
+                bot,
+                allowed_updates=dp.resolve_used_update_types(),
+                handle_signals=True,
+            )
+            break  # нормальное завершение
+        except _TelegramRetryAfter as e:
+            backoff = max(e.retry_after, backoff) + 1
+            logger.warning(
+                "GetUpdates flood: ждём %d сек перед повторным запуском поллинга.",
+                backoff,
+            )
+            await asyncio.sleep(backoff)
+        except Exception as e:
+            logger.exception("Критическая ошибка поллинга: %s", e)
+            await asyncio.sleep(5)
+            break
 
 if __name__ == "__main__":
     asyncio.run(main())
