@@ -90,6 +90,8 @@ PLATEGA_SECRET = "sh7BhDGLhBnqJxECAGBGkSd68hZ9Xdaqdb1Wmu1SXMbIAR6alPk5F9AyV34VRC
 PLATEGA_PAYMENT_METHOD_SBP = 2
 # Pro-подписка по СБП: 40₽/мес.
 PRO_PRICE_RUB = 40
+# Курс пополнения баланса: 1 USDT = 80₽
+TOPUP_RUB_PER_USDT = 80
 
 # --- LLM (AI-генератор текста) ---
 # Официальный Anthropic Python SDK, направленный на Anthropic-совместимый
@@ -521,7 +523,9 @@ class AdminStates(StatesGroup):
 
 
 class BalanceStates(StatesGroup):
-    waiting_for_amount = State()
+    waiting_for_method = State()
+    waiting_for_amount = State()       # USDT (Crypto Pay)
+    waiting_for_amount_rub = State()   # рубли (СБП)
 
 
 class UserLLMConfigStates(StatesGroup):
@@ -752,7 +756,7 @@ async def init_db():
             )
         ''')
 
-        # Чаты аккаунта, кэшируемые для Telegram Mini App
+        # Ч��ты аккаунта, кэшируемые для Telegram Mini App
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS account_chats (
                 id BIGSERIAL PRIMARY KEY,
@@ -1102,6 +1106,22 @@ async def init_db():
             await conn.execute(
                 'ALTER TABLE subscriptions '
                 'ADD COLUMN IF NOT EXISTS last_platega_id TEXT'
+            )
+        except Exception:
+            pass
+        # СБП пополнение баланса: Platega transaction id в balance_invoices.
+        try:
+            await conn.execute(
+                'ALTER TABLE balance_invoices '
+                'ADD COLUMN IF NOT EXISTS sbp_platega_id TEXT'
+            )
+        except Exception:
+            pass
+        # Сумма в рублях для СБП-пополнений.
+        try:
+            await conn.execute(
+                'ALTER TABLE balance_invoices '
+                'ADD COLUMN IF NOT EXISTS amount_rub NUMERIC(12, 2)'
             )
         except Exception:
             pass
@@ -1518,7 +1538,7 @@ def _safe_plan_defaults(base: dict) -> dict:
     p.setdefault('total_cycles', 24)
     p.setdefault('intervals_min_sec', 5 * 60)
     p.setdefault('intervals_max_sec', 18 * 60)
-    # Нормируем интервалы в безопасный диапазон 300..1800 сек.
+    # Нормируем интерва��ы в безопасный диапазон 300..1800 сек.
     try:
         imin = int(p['intervals_min_sec'])
         imax = int(p['intervals_max_sec'])
@@ -2845,7 +2865,7 @@ async def fingerprint_regen(callback: CallbackQuery):
         f"  • аккаунт перезайдёт с новым устройством\n\n"
         f"<i>Запущенные рассылки/прогрев продолжатся после "
         f"переподключения. Старая сессия останется в списке "
-        f"устройств до ручного завершения — это норма.</i>"
+        f"устройств до ручного завершения — это ��орма.</i>"
     )
     try:
         await callback.message.edit_text(
@@ -4132,7 +4152,7 @@ async def acct_ar_reset_history(account_id: int) -> None:
 # ============================================================
 #  Анализ логов аккаунта (оценка риска бана)
 # ============================================================
-# Отдельная фича: по последним логам + истории флуд-вейтов аккаунта
+# Отдель��ая фича: по последним логам + истории флуд-вейтов аккаунта
 # формируем структурированный отчёт (уровень риска + причины + советы)
 # через LLM в режиме «эксперт по безопасности Telegram».
 
@@ -6255,17 +6275,44 @@ async def wallet_screen(callback: CallbackQuery):
     balance = await get_wallet_balance(callback.from_user.id)
     await callback.message.edit_text(
         f"{emoji('MONEY_SEND')} <b>Баланс</b>\n\n"
-        f"Доступно: <b>{balance:.2f} USDT</b>",
+        f"Доступно: <b>{balance:.2f} ₽</b>",
         reply_markup=get_balance_keyboard()
     )
     await callback.answer()
 
 
+# ---- Выбор способа пополнения ----
+
 @dp.callback_query(F.data == 'wallet_topup')
 async def wallet_topup_start(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(BalanceStates.waiting_for_amount)
+    """Экран выбора метода пополнения: Crypto Pay (USDT) или СБП (₽)."""
+    await state.set_state(BalanceStates.waiting_for_method)
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text='Crypto Pay (USDT)', callback_data='topup_method:crypto',
+        style='primary', icon_custom_emoji_id=get_icon('MONEY_SEND')
+    ))
+    builder.row(InlineKeyboardButton(
+        text='СБП (₽)', callback_data='topup_method:sbp',
+        style='primary', icon_custom_emoji_id=get_icon('MONEY_SEND')
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Отмена', callback_data='wallet',
+        style='default', icon_custom_emoji_id=get_icon('BACK')
+    ))
     await callback.message.edit_text(
         f"{emoji('MONEY_SEND')} <b>Пополнение баланса</b>\n\n"
+        f"Выберите способ пополнения:",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == 'topup_method:crypto', BalanceStates.waiting_for_method)
+async def topup_choose_crypto(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(BalanceStates.waiting_for_amount)
+    await callback.message.edit_text(
+        f"{emoji('MONEY_SEND')} <b>Пополнение через Crypto Pay</b>\n\n"
         "Введите сумму в USDT от 0.10 до 1000:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text='Отмена', callback_data='wallet',
@@ -6274,6 +6321,22 @@ async def wallet_topup_start(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
+
+@dp.callback_query(F.data == 'topup_method:sbp', BalanceStates.waiting_for_method)
+async def topup_choose_sbp(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(BalanceStates.waiting_for_amount_rub)
+    await callback.message.edit_text(
+        f"{emoji('MONEY_SEND')} <b>Пополнение через СБП</b>\n\n"
+        "Введите сумму в рублях от 10 до 80000:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text='Отмена', callback_data='wallet',
+                                 style='default', icon_custom_emoji_id=get_icon('BACK'))
+        ]])
+    )
+    await callback.answer()
+
+
+# ---- Ввод суммы USDT → Crypto Pay ----
 
 @dp.message(BalanceStates.waiting_for_amount)
 async def wallet_topup_amount(message: Message, state: FSMContext):
@@ -6308,49 +6371,240 @@ async def wallet_topup_amount(message: Message, state: FSMContext):
     if pay_url:
         builder.row(InlineKeyboardButton(text='Оплатить через Crypto Pay', url=pay_url,
                                          style='primary', icon_custom_emoji_id=get_icon('MONEY_SEND')))
-    builder.row(InlineKeyboardButton(text='Проверить оплату', callback_data=f'wallet_check:{invoice_id}',
-                                     style='success', icon_custom_emoji_id=get_icon('CHECK')))
     builder.row(InlineKeyboardButton(text='Назад', callback_data='wallet', style='default',
                                      icon_custom_emoji_id=get_icon('BACK')))
-    await message.answer(
-        f"{emoji('MONEY_SEND')} <b>Счёт создан</b>\n\nСумма: <b>{amount:.6f} USDT</b>",
+    sent = await message.answer(
+        f"{emoji('MONEY_SEND')} <b>Счёт создан</b>\n\n"
+        f"Сумма: <b>{amount:.6f} USDT</b>\n\n"
+        f"{emoji('CLOCK')} Оплата проверяется автоматически...",
         reply_markup=builder.as_markup()
     )
+    # Запускаем автопроверку в фоне (каждые 2 сек, до 10 минут)
+    asyncio.create_task(_auto_check_crypto_topup(
+        user_id=message.from_user.id,
+        invoice_id=int(invoice_id),
+        amount_usdt=amount,
+        chat_id=message.chat.id,
+        msg_id=sent.message_id,
+    ))
 
 
-@dp.callback_query(F.data.startswith('wallet_check:'))
-async def wallet_check_payment(callback: CallbackQuery):
+async def _auto_check_crypto_topup(
+    user_id: int, invoice_id: int, amount_usdt: float,
+    chat_id: int, msg_id: int
+) -> None:
+    """Автоматически проверяет оплату Crypto Pay каждые 2 сек до 10 минут."""
+    deadline = time.monotonic() + 10 * 60  # 10 минут
+    while time.monotonic() < deadline:
+        await asyncio.sleep(2)
+        try:
+            # Проверяем, не закрыт ли уже инвойс в БД
+            async with db_pool.acquire() as conn:
+                status_db = await conn.fetchval(
+                    "SELECT status FROM balance_invoices WHERE invoice_id = $1",
+                    invoice_id
+                )
+            if status_db == 'paid':
+                return  # уже зачислено другим путём
+
+            result = await cryptopay_get_invoices(str(invoice_id))
+            item = ((result.get('result') or {}).get('items') or [None])[0] if result.get('ok') else None
+            if not item or item.get('status') != 'paid':
+                continue
+
+            async with db_pool.acquire() as conn:
+                claimed = await conn.fetchrow(
+                    "UPDATE balance_invoices SET status = 'paid', paid_at = NOW() "
+                    "WHERE invoice_id = $1 AND status = 'active' RETURNING amount_usdt",
+                    invoice_id
+                )
+            if claimed:
+                # Баланс хранится в рублях: конвертируем USDT → ₽
+                credited_rub = round(float(claimed['amount_usdt']) * TOPUP_RUB_PER_USDT, 2)
+                await add_wallet_balance(user_id, credited_rub)
+            balance = await get_wallet_balance(user_id)
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg_id,
+                    text=(
+                        f"{emoji('CHECK')} <b>Баланс пополнен!</b>\n\n"
+                        f"Зачислено: <b>{amount_usdt:.6f} USDT</b>\n"
+                        f"Текущий баланс: <b>{balance:.2f} ₽</b>"
+                    ),
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text='Назад', callback_data='wallet',
+                                             style='default', icon_custom_emoji_id=get_icon('BACK'))
+                    ]])
+                )
+            except Exception:
+                pass
+            return
+        except Exception as ex:
+            logger.warning(f"[auto_check_crypto_topup] error: {ex}")
+    # Время вышло — обновляем сообщение
     try:
-        invoice_id = int(callback.data.split(':', 1)[1])
-    except (ValueError, IndexError):
-        await callback.answer('Некорректный счёт', show_alert=True)
-        return
-    async with db_pool.acquire() as conn:
-        invoice = await conn.fetchrow(
-            'SELECT * FROM balance_invoices WHERE invoice_id = $1 AND user_id = $2',
-            invoice_id, callback.from_user.id
+        async with db_pool.acquire() as conn:
+            status_db = await conn.fetchval(
+                "SELECT status FROM balance_invoices WHERE invoice_id = $1", invoice_id
+            )
+        if status_db == 'paid':
+            return
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=msg_id,
+            text=(
+                f"{emoji('CROSS')} Время ожидания оплаты истекло.\n"
+                f"Если вы оплатили — напишите в поддержку: {SUPPORT_USERNAME}"
+            ),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text='Назад', callback_data='wallet',
+                                     style='default', icon_custom_emoji_id=get_icon('BACK'))
+            ]])
         )
-    if not invoice:
-        await callback.answer('Счёт не найден', show_alert=True)
+    except Exception:
+        pass
+
+
+# ---- Ввод суммы в рублях → СБП ----
+
+@dp.message(BalanceStates.waiting_for_amount_rub)
+async def wallet_topup_amount_rub(message: Message, state: FSMContext):
+    try:
+        amount_rub = round(float((message.text or '').replace(',', '.')), 2)
+        if amount_rub < 10 or amount_rub > 80000:
+            raise ValueError
+    except ValueError:
+        await message.answer('Введите сумму в рублях от 10 до 80 000.')
         return
-    if invoice['status'] == 'paid':
-        await wallet_screen(callback)
-        return
-    result = await cryptopay_get_invoices(str(invoice_id))
-    item = ((result.get('result') or {}).get('items') or [None])[0] if result.get('ok') else None
-    if not item or item.get('status') != 'paid':
-        await callback.answer('Счёт ещё не оплачен', show_alert=True)
-        return
-    async with db_pool.acquire() as conn:
-        claimed = await conn.fetchrow(
-            "UPDATE balance_invoices SET status = 'paid', paid_at = NOW() "
-            "WHERE invoice_id = $1 AND status = 'active' RETURNING amount_usdt",
-            invoice_id
+    amount_usdt = round(amount_rub / TOPUP_RUB_PER_USDT, 6)
+
+    result = await platega_create_transaction(
+        user_id=message.from_user.id,
+        amount=int(amount_rub),
+        payload='wallet_topup_sbp'
+    )
+    if not result.get('ok'):
+        await state.clear()
+        await message.answer(
+            f"{emoji('CROSS')} Не удалось создать счёт СБП. Попробуйте позже.",
+            reply_markup=get_balance_keyboard()
         )
-    if claimed:
-        await add_wallet_balance(callback.from_user.id, float(claimed['amount_usdt']))
-    await callback.answer('Баланс пополнен')
-    await wallet_screen(callback)
+        return
+    tx = result['result']
+    transaction_id = tx.get('transactionId')
+    pay_url = tx.get('redirect')
+
+    # Создаём запись в balance_invoices с искусственным id = hash от transaction_id
+    fake_invoice_id = abs(hash(transaction_id)) % (10 ** 15)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            '''INSERT INTO balance_invoices
+               (invoice_id, user_id, amount_usdt, amount_rub, sbp_platega_id)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (invoice_id) DO NOTHING''',
+            fake_invoice_id, message.from_user.id, amount_usdt, amount_rub, transaction_id
+        )
+    await state.clear()
+    builder = InlineKeyboardBuilder()
+    if pay_url:
+        builder.row(InlineKeyboardButton(
+            text='Оплатить по СБП', url=pay_url,
+            style='primary', icon_custom_emoji_id=get_icon('MONEY_SEND')
+        ))
+    builder.row(InlineKeyboardButton(text='Назад', callback_data='wallet', style='default',
+                                     icon_custom_emoji_id=get_icon('BACK')))
+    sent = await message.answer(
+        f"{emoji('MONEY_SEND')} <b>Счёт СБП создан</b>\n\n"
+        f"Сумма: <b>{amount_rub:.0f} ₽</b>\n\n"
+        f"{emoji('CLOCK')} Оплата проверяется автоматически...",
+        reply_markup=builder.as_markup()
+    )
+    # Запускаем автопроверку в фоне (каждые 2 сек, до 30 минут)
+    asyncio.create_task(_auto_check_sbp_topup(
+        user_id=message.from_user.id,
+        fake_invoice_id=fake_invoice_id,
+        transaction_id=transaction_id,
+        amount_rub=amount_rub,
+        amount_usdt=amount_usdt,
+        chat_id=message.chat.id,
+        msg_id=sent.message_id,
+    ))
+
+
+async def _auto_check_sbp_topup(
+    user_id: int, fake_invoice_id: int, transaction_id: str,
+    amount_rub: float, amount_usdt: float,
+    chat_id: int, msg_id: int
+) -> None:
+    """Автоматически проверяет оплату СБП (Platega) каждые 2 сек до 30 минут."""
+    deadline = time.monotonic() + 30 * 60  # 30 минут
+    while time.monotonic() < deadline:
+        await asyncio.sleep(2)
+        try:
+            async with db_pool.acquire() as conn:
+                status_db = await conn.fetchval(
+                    "SELECT status FROM balance_invoices WHERE invoice_id = $1",
+                    fake_invoice_id
+                )
+            if status_db == 'paid':
+                return
+
+            result = await platega_get_transaction(transaction_id)
+            if not result.get('ok'):
+                continue
+            status = (result['result'].get('status') or '').upper()
+            if status != 'CONFIRMED':
+                continue
+
+            async with db_pool.acquire() as conn:
+                claimed = await conn.fetchrow(
+                    "UPDATE balance_invoices SET status = 'paid', paid_at = NOW() "
+                    "WHERE invoice_id = $1 AND status = 'active' RETURNING amount_rub, amount_usdt",
+                    fake_invoice_id
+                )
+            if claimed:
+                # Зачисляем рубли напрямую (баланс хранится в рублях)
+                credited = float(claimed['amount_rub'] or amount_rub)
+                await add_wallet_balance(user_id, credited)
+            balance = await get_wallet_balance(user_id)
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg_id,
+                    text=(
+                        f"{emoji('CHECK')} <b>Баланс пополнен!</b>\n\n"
+                        f"Зачислено: <b>{amount_rub:.0f} ₽</b>\n"
+                        f"Текущий баланс: <b>{balance:.2f} ₽</b>"
+                    ),
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text='Назад', callback_data='wallet',
+                                             style='default', icon_custom_emoji_id=get_icon('BACK'))
+                    ]])
+                )
+            except Exception:
+                pass
+            return
+        except Exception as ex:
+            logger.warning(f"[auto_check_sbp_topup] error: {ex}")
+    # Время вышло
+    try:
+        async with db_pool.acquire() as conn:
+            status_db = await conn.fetchval(
+                "SELECT status FROM balance_invoices WHERE invoice_id = $1", fake_invoice_id
+            )
+        if status_db == 'paid':
+            return
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=msg_id,
+            text=(
+                f"{emoji('CROSS')} Время ожидания оплаты истекло.\n"
+                f"Если вы оплатили — напишите в поддержку: {SUPPORT_USERNAME}"
+            ),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text='Назад', callback_data='wallet',
+                                     style='default', icon_custom_emoji_id=get_icon('BACK'))
+            ]])
+        )
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------
@@ -6374,10 +6628,15 @@ async def platega_create_transaction(
         return_url = f"https://t.me/{bot_me.username}"
     except Exception:
         return_url = "https://t.me"
+    description = (
+        "Vest Game Soft — пополнение баланса"
+        if payload == "wallet_topup_sbp"
+        else "Vest Game Soft — Pro подписка (30 дней)"
+    )
     body = {
         "paymentMethod": PLATEGA_PAYMENT_METHOD_SBP,
         "paymentDetails": {"amount": int(amount), "currency": "RUB"},
-        "description": "Vest Game Soft — Pro подписка (30 дней)",
+        "description": description,
         "return": return_url,
         "failedUrl": return_url,
         "payload": f"{payload}:{user_id}",
@@ -8669,7 +8928,7 @@ async def help_handler(callback: CallbackQuery):
         f"{emoji('CHAT')} <b>Рассылка в ЛС</b> — личные сообщения пользователям.\n"
         f"{emoji('BELL')} <b>Автоответчик</b> — авто-ответ на ключевые слова или AI.\n"
         f"{emoji('JOIN')} <b>Вступление в чаты</b> — массовое подключение.\n"
-        f"{emoji('LIKE')} <b>Авто-лайкинг</b> — реакции на новые сообщения.\n"
+        f"{emoji('LIKE')} <b>Авто-лайкинг</b> — ре��кции на новые сообщения.\n"
         f"{emoji('SWEEP')} <b>Удаление сообщений</b> — очистка истории.\n"
         f"{emoji('USERS')} <b>Парсинг чата</b> — сбор пользователей.\n"
         f"{emoji('PLAY')} <b>Скрипты</b> — запуск бота и нажатие сохранённой кнопки.\n"
@@ -8837,7 +9096,7 @@ async def help_autolike_handler(callback: CallbackQuery):
         f"<b>Советы:</b>\n"
         f"• Ставьте 2–3 разные реакции, чередуя — бот не лайкает всё подряд.\n"
         f"• Не запускайте автолайкинг одновременно с рассылкой на одном "
-        f"аккаунте — это красный флаг для Telegram."
+        f"аккаунте — это красный ��лаг для Telegram."
     )
     await callback.message.edit_text(text, reply_markup=get_help_feature_keyboard())
     await callback.answer()
@@ -9141,7 +9400,7 @@ async def buy_pro_crypto(callback: CallbackQuery):
         await my_subscription(callback)
         return
 
-    status_msg = await callback.message.edit_text(
+    await callback.message.edit_text(
         f"{emoji('CLOCK')} Создаю счёт в Crypto Pay...",
         reply_markup=None
     )
@@ -9162,7 +9421,6 @@ async def buy_pro_crypto(callback: CallbackQuery):
         or inv.get("bot_invoice_url")
         or inv.get("web_app_invoice_url")
     )
-    # Сохраняем инвойс, чтобы потом проверять оплату.
     await set_subscription(
         callback.from_user.id, "free", None,
         invoice_id=invoice_id, invoice_payload=f"pro_30d:{callback.from_user.id}"
@@ -9177,12 +9435,6 @@ async def buy_pro_crypto(callback: CallbackQuery):
             icon_custom_emoji_id=get_icon("MONEY_SEND")
         ))
     builder.row(InlineKeyboardButton(
-        text="Я оплатил — проверить",
-        callback_data="check_pro_payment",
-        style='success',
-        icon_custom_emoji_id=get_icon("CHECK")
-    ))
-    builder.row(InlineKeyboardButton(
         text="Назад",
         callback_data="my_subscription",
         style='default',
@@ -9191,76 +9443,21 @@ async def buy_pro_crypto(callback: CallbackQuery):
 
     amount = inv.get("amount", PRO_PRICE_USD)
     asset = inv.get("asset", "USDT")
-    await callback.message.edit_text(
+    edited = await callback.message.edit_text(
         f"{emoji('MONEY_SEND')} <b>Счёт на оплату Pro</b>\n\n"
         f"Тариф: <b>Pro</b> ({PRO_PRICE_LABEL})\n"
-        f"Сумма: <b>{amount} {asset}</b>\n"
-        f"🆔 ID счёта: <code>{invoice_id}</code>\n\n"
-        f"{emoji('INFO')} Нажмите кнопку ниже, оплатите в @CryptoBot, "
-        f"затем вернитесь сюда и нажмите «Я оплатил — проверить».",
+        f"Сумма: <b>{amount} {asset}</b>\n\n"
+        f"{emoji('CLOCK')} Оплата проверяется автоматически...",
         reply_markup=builder.as_markup()
     )
+    asyncio.create_task(_auto_check_pro_crypto(
+        user_id=callback.from_user.id,
+        invoice_id=int(invoice_id),
+        chat_id=callback.message.chat.id,
+        msg_id=edited.message_id,
+    ))
 
-
-@dp.callback_query(F.data == "check_pro_payment")
-async def check_pro_payment(callback: CallbackQuery):
-    await callback.answer()
-    sub = await get_subscription(callback.from_user.id)
-    invoice_id = sub.get("last_invoice_id")
-    if not invoice_id:
-        await callback.message.edit_text(
-            f"{emoji('INFO')} У вас нет активного счёта. Нажмите «Купить Pro».",
-            reply_markup=get_subscription_keyboard(sub.get("tier", "free"))
-        )
-        return
-
-    result = await cryptopay_get_invoices(str(invoice_id))
-    if not result.get("ok") or not result.get("result"):
-        await callback.message.edit_text(
-            f"{emoji('CROSS')} Не удалось проверить оплату. Попробуйте позже.\n\n"
-            f"<code>{result.get('error')}</code>",
-            reply_markup=get_subscription_keyboard(sub.get("tier", "free"))
-        )
-        return
-
-    items = result["result"].get("items", [])
-    if not items:
-        await callback.message.edit_text(
-            f"{emoji('CLOCK')} Счёт ещё не оплачен.\n"
-            f"Оплатите в @CryptoBot и нажмите «Проверить» снова.",
-            reply_markup=get_subscription_keyboard(sub.get("tier", "free"))
-        )
-        return
-
-    inv = items[0]
-    status = inv.get("status")
-    if status == "paid":
-        expires = datetime.now(MSK_TZ).replace(tzinfo=None) + timedelta(days=PRO_DURATION_DAYS)
-        await set_subscription(
-            callback.from_user.id, "pro", expires,
-            invoice_id=invoice_id,
-            invoice_payload=f"pro_30d:{callback.from_user.id}"
-        )
-        new_sub = await get_subscription(callback.from_user.id)
-        await callback.message.edit_text(
-            f"{emoji('FIRE')} <b>Оплата получена!</b>\n\n"
-            + _format_sub_text(new_sub),
-            reply_markup=get_subscription_keyboard("pro")
-        )
-    elif status == "active":
-        await callback.message.edit_text(
-            f"{emoji('CLOCK')} Счёт ещё не оплачен.\n"
-            f"Оплатите в @CryptoBot и нажмите «Проверить» снова.",
-            reply_markup=get_subscription_keyboard(sub.get("tier", "free"))
-        )
-    else:
-        await callback.message.edit_text(
-            f"{emoji('INFO')} Статус счёта: <b>{status}</b>.\n"
-            f"Если возникла проблема — напишите в поддержку: {SUPPORT_USERNAME}",
-            reply_markup=get_subscription_keyboard(sub.get("tier", "free"))
-        )
-
-# --- СБП (Platega) ---
+# --- СБП (Platega) для Pro-подписки ---
 @dp.callback_query(F.data == "buy_pro_sbp")
 async def buy_pro_sbp(callback: CallbackQuery):
     await callback.answer()
@@ -9286,7 +9483,6 @@ async def buy_pro_sbp(callback: CallbackQuery):
     tx = result["result"]
     transaction_id = tx.get("transactionId")
     pay_url = tx.get("redirect")
-    # Сохраняем ID транзакции, чтобы потом проверять оплату.
     await set_subscription(
         callback.from_user.id, "free", None,
         platega_id=transaction_id
@@ -9301,74 +9497,134 @@ async def buy_pro_sbp(callback: CallbackQuery):
             icon_custom_emoji_id=get_icon("MONEY_SEND")
         ))
     builder.row(InlineKeyboardButton(
-        text="Я оплатил — проверить",
-        callback_data="check_sbp_payment",
-        style='success',
-        icon_custom_emoji_id=get_icon("CHECK")
-    ))
-    builder.row(InlineKeyboardButton(
         text="Назад",
         callback_data="my_subscription",
         style='default',
         icon_custom_emoji_id=get_icon("BACK")
     ))
-    await callback.message.edit_text(
+    edited = await callback.message.edit_text(
         f"{emoji('MONEY_SEND')} <b>Счёт на оплату Pro (СБП)</b>\n\n"
         f"Тариф: <b>Pro</b> ({PRO_PRICE_LABEL})\n"
-        f"Сумма: <b>{PRO_PRICE_RUB} ₽</b>\n"
-        f"🆔 ID транзакции: <code>{escape(str(transaction_id))}</code>\n\n"
-        f"{emoji('INFO')} Нажмите кнопку ниже, оплатите через СБП (QR-код / Sberpay), "
-        f"затем вернитесь сюда и нажмите «Я оплатил — проверить».",
+        f"Сумма: <b>{PRO_PRICE_RUB} ₽</b>\n\n"
+        f"{emoji('CLOCK')} Оплата проверяется автоматически...",
         reply_markup=builder.as_markup()
     )
+    asyncio.create_task(_auto_check_pro_sbp(
+        user_id=callback.from_user.id,
+        transaction_id=transaction_id,
+        chat_id=callback.message.chat.id,
+        msg_id=edited.message_id,
+    ))
 
 
-@dp.callback_query(F.data == "check_sbp_payment")
-async def check_sbp_payment(callback: CallbackQuery):
-    await callback.answer()
-    sub = await get_subscription(callback.from_user.id)
-    transaction_id = sub.get("last_platega_id")
-    if not transaction_id:
-        await callback.message.edit_text(
-            f"{emoji('INFO')} У вас нет активного счёта СБП. Нажмите «Купить Pro».",
+async def _auto_check_pro_crypto(
+    user_id: int, invoice_id: int,
+    chat_id: int, msg_id: int
+) -> None:
+    """Автоматически проверяет оплату Pro через Crypto Pay каждые 2 сек до 10 минут."""
+    deadline = time.monotonic() + 10 * 60
+    while time.monotonic() < deadline:
+        await asyncio.sleep(2)
+        try:
+            sub = await get_subscription(user_id)
+            if sub.get("tier") == "pro":
+                return  # уже активирована
+            result = await cryptopay_get_invoices(str(invoice_id))
+            items = (result.get('result') or {}).get('items', []) if result.get('ok') else []
+            if not items:
+                continue
+            status = items[0].get('status')
+            if status == 'paid':
+                expires = datetime.now(MSK_TZ).replace(tzinfo=None) + timedelta(days=PRO_DURATION_DAYS)
+                await set_subscription(
+                    user_id, "pro", expires,
+                    invoice_id=invoice_id,
+                    invoice_payload=f"pro_30d:{user_id}"
+                )
+                new_sub = await get_subscription(user_id)
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id, message_id=msg_id,
+                        text=(
+                            f"{emoji('FIRE')} <b>Оплата получена!</b>\n\n"
+                            + _format_sub_text(new_sub)
+                        ),
+                        reply_markup=get_subscription_keyboard("pro")
+                    )
+                except Exception:
+                    pass
+                return
+        except Exception as ex:
+            logger.warning(f"[auto_check_pro_crypto] error: {ex}")
+    # Время вышло
+    try:
+        sub = await get_subscription(user_id)
+        if sub.get("tier") == "pro":
+            return
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=msg_id,
+            text=(
+                f"{emoji('CROSS')} Время ожидания оплаты истекло.\n"
+                f"Если вы оплатили — напишите в поддержку: {SUPPORT_USERNAME}"
+            ),
             reply_markup=get_subscription_keyboard(sub.get("tier", "free"))
         )
-        return
+    except Exception:
+        pass
 
-    result = await platega_get_transaction(str(transaction_id))
-    if not result.get("ok") or not result.get("result"):
-        await callback.message.edit_text(
-            f"{emoji('CROSS')} Не удалось проверить оплату. Попробуйте позже.\n\n"
-            f"<code>{escape(str(result.get('error')))}</code>",
-            reply_markup=get_subscription_keyboard(sub.get("tier", "free"))
-        )
-        return
 
-    status = (result["result"].get("status") or "").upper()
-    if status == "CONFIRMED":
-        expires = datetime.now(MSK_TZ).replace(tzinfo=None) + timedelta(days=PRO_DURATION_DAYS)
-        await set_subscription(
-            callback.from_user.id, "pro", expires,
-            platega_id=transaction_id
-        )
-        new_sub = await get_subscription(callback.from_user.id)
-        await callback.message.edit_text(
-            f"{emoji('FIRE')} <b>Оплата получена!</b>\n\n"
-            + _format_sub_text(new_sub),
-            reply_markup=get_subscription_keyboard("pro")
-        )
-    elif status == "PENDING":
-        await callback.message.edit_text(
-            f"{emoji('CLOCK')} Счёт ещё не оплачен.\n"
-            f"Оплатите по СБП и нажмите «Проверить» снова.",
+async def _auto_check_pro_sbp(
+    user_id: int, transaction_id: str,
+    chat_id: int, msg_id: int
+) -> None:
+    """Автоматически проверяет оплату Pro через СБП (Platega) каждые 2 сек до 30 минут."""
+    deadline = time.monotonic() + 30 * 60
+    while time.monotonic() < deadline:
+        await asyncio.sleep(2)
+        try:
+            sub = await get_subscription(user_id)
+            if sub.get("tier") == "pro":
+                return  # уже активирована
+            result = await platega_get_transaction(transaction_id)
+            if not result.get('ok'):
+                continue
+            status = (result['result'].get('status') or '').upper()
+            if status == 'CONFIRMED':
+                expires = datetime.now(MSK_TZ).replace(tzinfo=None) + timedelta(days=PRO_DURATION_DAYS)
+                await set_subscription(
+                    user_id, "pro", expires,
+                    platega_id=transaction_id
+                )
+                new_sub = await get_subscription(user_id)
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id, message_id=msg_id,
+                        text=(
+                            f"{emoji('FIRE')} <b>Оплата получена!</b>\n\n"
+                            + _format_sub_text(new_sub)
+                        ),
+                        reply_markup=get_subscription_keyboard("pro")
+                    )
+                except Exception:
+                    pass
+                return
+        except Exception as ex:
+            logger.warning(f"[auto_check_pro_sbp] error: {ex}")
+    # Время вышло
+    try:
+        sub = await get_subscription(user_id)
+        if sub.get("tier") == "pro":
+            return
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=msg_id,
+            text=(
+                f"{emoji('CROSS')} Время ожидания оплаты истекло.\n"
+                f"Если вы оплатили — напишите в поддержку: {SUPPORT_USERNAME}"
+            ),
             reply_markup=get_subscription_keyboard(sub.get("tier", "free"))
         )
-    else:
-        await callback.message.edit_text(
-            f"{emoji('INFO')} Статус счёта: <b>{escape(status)}</b>.\n"
-            f"Если возникла проблема — напишите в поддержку: {SUPPORT_USERNAME}",
-            reply_markup=get_subscription_keyboard(sub.get("tier", "free"))
-        )
+    except Exception:
+        pass
 
 
 # --- Пользовательские AI API ---
@@ -10242,7 +10498,7 @@ async def process_phone(message: Message, state: FSMContext):
     if not phone.startswith('+'):
         phone = '+' + phone
 
-    # Подтягиваем прокси из state, если юзер выбирал
+    # Подтягиваем прокси из state, если юзер ��ыбирал
     data = await state.get_data()
     proxy_id: Optional[int] = data.get('pending_proxy_id')
     proxy = None
@@ -11827,7 +12083,7 @@ async def toggle_warming(callback: CallbackQuery):
         )
         return
 
-    # Шаг 1: сразу отвечаем «Думаю...» и обновляем сообщение по таймеру.
+    # Шаг 1: сразу отв��чаем «Думаю...» и обновляем сообщение по таймеру.
     started = time.monotonic()
     try:
         await callback.message.edit_text(
@@ -15981,7 +16237,7 @@ async def stop_account_ai_responder(account_id: int, user_id: int):
 
 # --- Сам воркер: Telethon listener на входящие ЛС ---
 async def account_ai_responder_worker(account_id: int, user_id: int):
-    """Слушает входящие ЛС на аккаунте и отвечает через LLM.
+    """Слушает входящие ЛС на аккаунте �� отвечает через LLM.
 
     • Только личные сообщения (event.is_private).
     • Только текст (стикеры/фото/голос пока игнорим).
@@ -16186,7 +16442,7 @@ async def account_ai_responder_worker(account_id: int, user_id: int):
                         )
                 except Exception as ex:
                     logger.exception(
-                        f"acct_ar: не удалось отправить ответ: {ex}"
+                        f"acct_ar: не удалось отправить ��твет: {ex}"
                     )
 
                 # 7) Лог аккаунта: что отправили
