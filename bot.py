@@ -37,8 +37,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from telethon import TelegramClient, events, Button
 from telethon.errors import (
     SessionPasswordNeededError, FloodWaitError, BadRequestError, RPCError,
-    AuthKeyUnregisteredError, SessionRevokedError, UserDeactivatedError,
-    UserDeactivatedBanError,
 )
 from telethon.sessions import StringSession
 from telethon.tl.types import User, ReactionEmoji
@@ -12600,6 +12598,25 @@ async def process_2fa(message: Message, state: FSMContext):
         await state.clear()
 
 # --- Мои аккаунты ---
+CONFIRMED_INVALID_SESSION_ERROR_NAMES = {
+    'AuthKeyUnregisteredError',
+    'SessionRevokedError',
+    'UserDeactivatedError',
+    'UserDeactivatedBanError',
+}
+
+
+def _is_confirmed_invalid_session_error(ex: Exception) -> bool:
+    """Только ошибки Telegram об отозванной сессии разрешают автоудаление."""
+    if ex.__class__.__name__ in CONFIRMED_INVALID_SESSION_ERROR_NAMES:
+        return True
+    code = str(ex).upper()
+    return any(marker in code for marker in (
+        'AUTH_KEY_UNREGISTERED', 'SESSION_REVOKED',
+        'USER_DEACTIVATED', 'USER_DEACTIVATED_BAN',
+    ))
+
+
 async def validate_account(account_id: int, user_id: int) -> Dict[str, Any]:
     """Проверяет авторизацию, не удаляя аккаунт при кратковременной ошибке сети.
 
@@ -12659,15 +12676,15 @@ async def validate_account(account_id: int, user_id: int) -> Dict[str, Any]:
                 'premium': premium,
                 'username': username,
             })
-    except (
-        AuthKeyUnregisteredError, SessionRevokedError,
-        UserDeactivatedError, UserDeactivatedBanError,
-    ) as ex:
-        result.update({
-            'status': 'invalid',
-            'removable': True,
-            'error': str(ex) or 'Telegram отозвал авторизацию сессии.',
-        })
+    except RPCError as ex:
+        if _is_confirmed_invalid_session_error(ex):
+            result.update({
+                'status': 'invalid',
+                'removable': True,
+                'error': str(ex) or 'Telegram отозвал авторизацию сессии.',
+            })
+        else:
+            result['error'] = str(ex)[:1000]
     except Exception as ex:
         # Ошибка подключения не доказывает, что сессия умерла: оставляем
         # аккаунт и повторим проверку в следующий плановый час.
