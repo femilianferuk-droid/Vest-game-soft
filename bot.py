@@ -141,6 +141,18 @@ GLOBAL_LLM_RUNTIME: Dict[str, Any] = {
 }
 GLOBAL_LLM_RUNTIME_READY = False
 
+# --- Чат с нейросетями ---
+AI_CHAT_FREE_DAILY_LIMIT = 3
+AI_CHAT_PRO_DAILY_LIMIT = 15
+AI_CHAT_HISTORY_MESSAGES_LIMIT = 16  # 8 пар user/assistant
+AI_CHAT_HISTORY_CONTENT_LIMIT = 2000
+AI_CHAT_SYSTEM_PROMPT = (
+    'Ты полезный русскоязычный AI-ассистент в Telegram. '
+    'Отвечай по существу, дружелюбно и безопасно. '
+    'Если данных недостаточно, задай уточняющий вопрос. '
+    'Не выдумывай факты и не выдавай себя за человека.'
+)
+
 # Пять независимых разделов, для которых администратор может закрепить
 # одно медиа Telegram (file_id хранится в БД, файл не копируется на диск).
 MEDIA_SECTIONS = {
@@ -575,6 +587,10 @@ class UserLLMConfigStates(StatesGroup):
     waiting_for_models = State()
 
 
+class AIChatStates(StatesGroup):
+    waiting_for_message = State()
+
+
 class BroadcastTemplateStates(StatesGroup):
     waiting_for_name = State()
 
@@ -914,6 +930,31 @@ async def init_db():
             await conn.execute(
                 'CREATE INDEX IF NOT EXISTS idx_ai_requests_user_created '
                 'ON ai_requests (user_id, created_at DESC)'
+            )
+        except Exception:
+            pass
+
+        # История диалогов и дневные лимиты отдельного «Чата с нейросетями».
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS ai_chat_sessions (
+                user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+                history JSONB NOT NULL DEFAULT '[]'::jsonb,
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS ai_chat_usage (
+                user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                usage_date DATE NOT NULL,
+                request_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (user_id, usage_date)
+            )
+        ''')
+        try:
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_ai_chat_usage_date '
+                'ON ai_chat_usage (usage_date, user_id)'
             )
         except Exception:
             pass
@@ -1880,6 +1921,163 @@ async def delete_admin_llm_model(model_id: int) -> Optional[int]:
                 )
     await refresh_global_llm_runtime()
     return api_id
+
+
+async def get_admin_llm_api_secret(api_id: int) -> Optional[Dict[str, Any]]:
+    """Возвращает секрет только для серверного теста модели, не для UI."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            '''SELECT id, name, base_url, api_key_ciphertext, is_active
+               FROM admin_llm_apis WHERE id = $1''',
+            api_id,
+        )
+    if not row:
+        return None
+    data = dict(row)
+    data['api_key'] = _decrypt_llm_secret(data.pop('api_key_ciphertext'))
+    return data
+
+
+def _extract_llm_response_text(response: Any) -> str:
+    parts: List[str] = []
+    try:
+        for block in (response.content or []):
+            if getattr(block, 'type', None) == 'text':
+                text = (getattr(block, 'text', '') or '').strip()
+                if text:
+                    parts.append(text)
+    except Exception:
+        pass
+    return '\n'.join(parts).strip()
+
+
+async def test_llm_provider_model(
+    *,
+    base_url: str,
+    api_key: str,
+    api_model_name: str,
+    display_name: str,
+) -> Dict[str, Any]:
+    """Отправляет короткий тест модели и сохраняет конкретную ошибку API."""
+    started = time.monotonic()
+    result: Dict[str, Any] = {
+        'api_model_name': api_model_name,
+        'display_name': display_name,
+        'ok': False,
+        'response': '',
+        'error': '',
+        'elapsed': 0.0,
+    }
+    try:
+        client = anthropic.AsyncAnthropic(
+            api_key=api_key,
+            base_url=base_url.rstrip('/'),
+            timeout=min(LLM_TIMEOUT, 45),
+        )
+        response = await client.messages.create(
+            model=api_model_name,
+            max_tokens=32,
+            system='You are a connection test. Reply with exactly: OK',
+            messages=[{'role': 'user', 'content': 'Connection test'}],
+        )
+        result['response'] = _extract_llm_response_text(response) or 'Модель ответила без text-блока'
+        result['ok'] = True
+    except anthropic.APIStatusError as ex:
+        result['error'] = f"HTTP {ex.status_code}: {str(ex)[:700]}"
+    except anthropic.APIError as ex:
+        result['error'] = f"{ex.__class__.__name__}: {str(ex)[:700]}"
+    except asyncio.TimeoutError:
+        result['error'] = 'Timeout: модель не ответила за отведённое время'
+    except Exception as ex:
+        result['error'] = f"{ex.__class__.__name__}: {str(ex)[:700]}"
+    result['elapsed'] = time.monotonic() - started
+    return result
+
+
+async def test_admin_llm_model(model_id: int) -> Optional[Dict[str, Any]]:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            '''SELECT m.id AS model_id, m.api_model_name, m.display_name,
+                      a.id AS api_id, a.base_url, a.api_key_ciphertext
+               FROM admin_llm_models m
+               JOIN admin_llm_apis a ON a.id = m.api_id
+               WHERE m.id = $1''',
+            model_id,
+        )
+    if not row:
+        return None
+    result = await test_llm_provider_model(
+        base_url=str(row['base_url']),
+        api_key=_decrypt_llm_secret(row['api_key_ciphertext']),
+        api_model_name=str(row['api_model_name']),
+        display_name=str(row['display_name']),
+    )
+    result['api_id'] = int(row['api_id'])
+    return result
+
+
+async def test_admin_llm_api_models(api_id: int) -> Optional[List[Dict[str, Any]]]:
+    api = await get_admin_llm_api_secret(api_id)
+    if not api:
+        return None
+    models = await get_admin_llm_models(api_id)
+    results = []
+    for model in models:
+        results.append(await test_llm_provider_model(
+            base_url=str(api['base_url']),
+            api_key=str(api['api_key']),
+            api_model_name=str(model['api_model_name']),
+            display_name=str(model['display_name']),
+        ))
+    return results
+
+
+async def test_builtin_llm_models() -> List[Dict[str, Any]]:
+    results = []
+    for api_model_name, display_name in LLM_FALLBACK_MODELS.items():
+        results.append(await test_llm_provider_model(
+            base_url=LLM_BASE_URL,
+            api_key=LLM_API_KEY,
+            api_model_name=api_model_name,
+            display_name=display_name,
+        ))
+    return results
+
+
+def format_llm_models_test_report(
+    title: str, results: List[Dict[str, Any]], detailed: bool = False,
+) -> str:
+    lines = [f"{emoji('AI')} <b>{escape(title)}</b>", '']
+    if not results:
+        lines.append('У провайдера нет сохранённых моделей для теста.')
+        return '\n'.join(lines)
+
+    error_limit = 650 if detailed else 110
+    response_limit = 180 if detailed else 70
+    for index, result in enumerate(results):
+        display = escape(str(result.get('display_name') or result.get('api_model_name') or 'Модель'))
+        api_name = escape(str(result.get('api_model_name') or '—'))
+        elapsed = float(result.get('elapsed') or 0)
+        if result.get('ok'):
+            preview = str(result.get('response') or 'OK').replace('\n', ' ')[:response_limit]
+            item = (
+                f"{emoji('CHECK')} <b>{display}</b> (<code>{api_name}</code>) — OK за {elapsed:.1f}с\n"
+                f"<i>{escape(preview)}</i>"
+            )
+        else:
+            error = str(result.get('error') or 'Неизвестная ошибка')[:error_limit]
+            item = (
+                f"{emoji('CROSS')} <b>{display}</b> (<code>{api_name}</code>) — ошибка за {elapsed:.1f}с\n"
+                f"<code>{escape(error)}</code>"
+            )
+        # Не режем HTML-теги посередине: для массового теста оставляем
+        # место под понятную пометку о неприведённых строках.
+        candidate = '\n\n'.join(lines + [item])
+        if len(candidate) > 3700 and not detailed:
+            lines.append(f"… ещё моделей: <b>{len(results) - index}</b>")
+            break
+        lines.append(item)
+    return '\n\n'.join(lines)
 
 
 async def get_account(account_id: int) -> Optional[Dict]:
@@ -5329,6 +5527,161 @@ async def call_llm_api_with_history(
     return ''
 
 
+# --- Чат с нейросетями ---
+async def get_ai_chat_limit(user_id: int) -> int:
+    return AI_CHAT_PRO_DAILY_LIMIT if await is_pro(user_id) else AI_CHAT_FREE_DAILY_LIMIT
+
+
+def _ai_chat_usage_date():
+    return datetime.now(MSK_TZ).date()
+
+
+async def get_ai_chat_usage(user_id: int) -> int:
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval(
+            'SELECT request_count FROM ai_chat_usage '
+            'WHERE user_id = $1 AND usage_date = $2',
+            user_id, _ai_chat_usage_date(),
+        )
+    return int(count or 0)
+
+
+async def reserve_ai_chat_request(user_id: int) -> Tuple[bool, int, int]:
+    """Атомарно резервирует запрос в дневном лимите чата."""
+    limit = await get_ai_chat_limit(user_id)
+    usage_date = _ai_chat_usage_date()
+    async with db_pool.acquire() as conn:
+        used = await conn.fetchval(
+            '''INSERT INTO ai_chat_usage (user_id, usage_date, request_count, updated_at)
+               VALUES ($1, $2, 1, NOW())
+               ON CONFLICT (user_id, usage_date) DO UPDATE SET
+                 request_count = ai_chat_usage.request_count + 1,
+                 updated_at = NOW()
+               WHERE ai_chat_usage.request_count < $3
+               RETURNING request_count''',
+            user_id, usage_date, limit,
+        )
+        if used is not None:
+            return True, int(used), limit
+        current = await conn.fetchval(
+            'SELECT request_count FROM ai_chat_usage '
+            'WHERE user_id = $1 AND usage_date = $2',
+            user_id, usage_date,
+        )
+    return False, int(current or limit), limit
+
+
+async def release_ai_chat_request(user_id: int) -> None:
+    """Возвращает лимит, если API не дал ответа и пользователь его не получил."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            '''UPDATE ai_chat_usage
+               SET request_count = GREATEST(request_count - 1, 0), updated_at = NOW()
+               WHERE user_id = $1 AND usage_date = $2''',
+            user_id, _ai_chat_usage_date(),
+        )
+
+
+async def get_ai_chat_history(user_id: int) -> List[Dict[str, str]]:
+    async with db_pool.acquire() as conn:
+        history = await conn.fetchval(
+            'SELECT history FROM ai_chat_sessions WHERE user_id = $1', user_id,
+        )
+    if isinstance(history, str):
+        try:
+            history = json.loads(history)
+        except Exception:
+            history = []
+    if not isinstance(history, list):
+        return []
+    result: List[Dict[str, str]] = []
+    for item in history[-AI_CHAT_HISTORY_MESSAGES_LIMIT:]:
+        if not isinstance(item, dict):
+            continue
+        role = item.get('role')
+        content = item.get('content')
+        if role in ('user', 'assistant') and isinstance(content, str) and content.strip():
+            result.append({'role': role, 'content': content[:AI_CHAT_HISTORY_CONTENT_LIMIT]})
+    return result
+
+
+async def save_ai_chat_history(user_id: int, history: List[Dict[str, str]]) -> None:
+    clean = [
+        {'role': item['role'], 'content': item['content'][:AI_CHAT_HISTORY_CONTENT_LIMIT]}
+        for item in history[-AI_CHAT_HISTORY_MESSAGES_LIMIT:]
+        if item.get('role') in ('user', 'assistant') and item.get('content')
+    ]
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            '''INSERT INTO ai_chat_sessions (user_id, history, updated_at)
+               VALUES ($1, $2::jsonb, NOW())
+               ON CONFLICT (user_id) DO UPDATE SET
+                 history = EXCLUDED.history, updated_at = NOW()''',
+            user_id, json.dumps(clean, ensure_ascii=False),
+        )
+
+
+async def clear_ai_chat_history(user_id: int) -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            '''INSERT INTO ai_chat_sessions (user_id, history, updated_at)
+               VALUES ($1, '[]'::jsonb, NOW())
+               ON CONFLICT (user_id) DO UPDATE SET
+                 history = '[]'::jsonb, updated_at = NOW()''',
+            user_id,
+        )
+
+
+def get_ai_chat_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text='Очистить диалог',
+        callback_data='ai_chat_clear',
+        style='default',
+        icon_custom_emoji_id=get_icon('SWEEP'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='В главное меню',
+        callback_data='ai_chat_exit',
+        style='default',
+        icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    return builder.as_markup()
+
+
+async def render_ai_chat_screen(user_id: int) -> str:
+    used = await get_ai_chat_usage(user_id)
+    limit = await get_ai_chat_limit(user_id)
+    model = await get_user_llm_model(user_id)
+    model_label = LLM_MODELS.get(model, model)
+    tier = 'Pro' if await is_pro(user_id) else 'Free'
+    return (
+        f"{emoji('AI')} <b>Чат с нейросетями</b>\n\n"
+        f"Модель: <b>{escape(str(model_label))}</b>\n"
+        f"Тариф: <b>{tier}</b>\n"
+        f"Запросов сегодня: <b>{used}/{limit}</b>\n\n"
+        "Отправьте сообщение — я сохраню контекст последних реплик. "
+        "Кнопка «Очистить диалог» удалит историю, но не дневной счётчик."
+    )
+
+
+def _split_ai_chat_answer(text: str, limit: int = 3000) -> List[str]:
+    text = (text or '').strip()
+    if not text:
+        return []
+    parts: List[str] = []
+    while text:
+        if len(text) <= limit:
+            parts.append(text)
+            break
+        cut = text.rfind('\n', 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        parts.append(text[:cut])
+        text = text[cut:].lstrip('\n')
+    return parts
+
+
 # --- AI: история запросов (БД) ---
 
 async def save_ai_request(
@@ -8577,12 +8930,20 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
         style='primary',
         icon_custom_emoji_id=get_icon("APPS")
     ))
-    builder.row(InlineKeyboardButton(
-        text="Моя подписка",
-        callback_data="my_subscription",
-        style='success',
-        icon_custom_emoji_id=get_icon("MONEY_SEND")
-    ))
+    builder.row(
+        InlineKeyboardButton(
+            text="Чат с нейросетями",
+            callback_data="ai_chat",
+            style='primary',
+            icon_custom_emoji_id=get_icon("AI")
+        ),
+        InlineKeyboardButton(
+            text="Моя подписка",
+            callback_data="my_subscription",
+            style='success',
+            icon_custom_emoji_id=get_icon("MONEY_SEND")
+        )
+    )
     builder.row(
         InlineKeyboardButton(
             text="Баланс",
@@ -9966,6 +10327,12 @@ async def render_admin_llm_menu() -> Tuple[str, InlineKeyboardMarkup]:
         style='primary',
         icon_custom_emoji_id=get_icon('ADD_TEXT'),
     ))
+    builder.row(InlineKeyboardButton(
+        text='Проверить модели API из кода',
+        callback_data='admin_llm_test_builtin',
+        style='default',
+        icon_custom_emoji_id=get_icon('REFRESH'),
+    ))
     for api in apis:
         mark = 'Используется' if api.get('is_active') else 'Сохранён'
         builder.row(InlineKeyboardButton(
@@ -10024,6 +10391,20 @@ async def render_admin_llm_api_card(api_id: int) -> Tuple[Optional[str], Optiona
             style='success',
             icon_custom_emoji_id=get_icon('CHECK'),
         ))
+    if models:
+        builder.row(InlineKeyboardButton(
+            text='Проверить все модели',
+            callback_data=f'admin_llm_test_all:{api_id}',
+            style='primary',
+            icon_custom_emoji_id=get_icon('REFRESH'),
+        ))
+        for item in models:
+            builder.row(InlineKeyboardButton(
+                text=f"Тест: {str(item['display_name'])[:48]}",
+                callback_data=f"admin_llm_test_model:{item['id']}",
+                style='default',
+                icon_custom_emoji_id=get_icon('AI'),
+            ))
     for item in models:
         builder.row(InlineKeyboardButton(
             text=f"Удалить модель: {item['display_name']}",
@@ -10666,7 +11047,8 @@ async def help_handler(callback: CallbackQuery):
         f"{emoji('SWEEP')} <b>Удаление сообщений</b> — очистка истории.\n"
         f"{emoji('USERS')} <b>Па��синг чата</b> — сбор пользователей.\n"
         f"{emoji('PLAY')} <b>Скрипты</b> — запуск бота и нажатие сохранённой кнопки.\n"
-        f"{emoji('AI')} <b>AI Генератор</b> — 3 варианта текста на выбор.\n\n"
+        f"{emoji('AI')} <b>AI Генератор</b> — 3 варианта текста на выбор.\n"
+        f"{emoji('AI')} <b>Чат с нейросетями</b> — диалог с сохранением контекста.\n\n"
         f"{emoji('SUPPORT')} <b>Поддержка:</b> {SUPPORT_USERNAME}"
     )
     await callback.message.edit_text(
@@ -11001,7 +11383,15 @@ def get_subscription_keyboard(tier: str) -> InlineKeyboardMarkup:
 async def format_limits_text(user_id: int) -> str:
     """Returns a short usage-counter block to embed in subscription/menu messages."""
     if await is_pro(user_id):
-        return f"{emoji('STAR')} <b>Лимиты:</b> Pro — без ограничений"
+        try:
+            chat_used = await get_ai_chat_usage(user_id)
+        except Exception:
+            chat_used = 0
+        return (
+            f"{emoji('STAR')} <b>Лимиты:</b> Pro\n"
+            f"  AI-генератор: без ограничений\n"
+            f"  Чат с нейросетями: {chat_used}/{AI_CHAT_PRO_DAILY_LIMIT} сегодня"
+        )
 
     # Счётчики использования — не критичны. Если БД недоступна или
     # какой-то таблицы нет, показываем нули вместо падения обработчика.
@@ -11026,10 +11416,16 @@ async def format_limits_text(user_id: int) -> str:
     broadcast_bar = "█" * bar_filled + "░" * max(0, broadcast_limit_h - bar_filled)
     # Reset time: midnight UTC 7 days from the oldest broadcast start this week
     reset_info = "обновляется через 7 дней"
+    try:
+        chat_used = await get_ai_chat_usage(user_id)
+    except Exception as ex:
+        logger.error(f"get_ai_chat_usage failed for {user_id}: {ex}")
+        chat_used = 0
 
     return (
         f"📊 <b>Использование (Free):</b>\n"
         f"  AI-запросы сегодня: <code>{ai_bar}</code> {ai_used}/{ai_limit}\n"
+        f"  Чат с нейросетями: {chat_used}/{AI_CHAT_FREE_DAILY_LIMIT}\n"
         f"  Рассылка на неделе: {broadcast_used_h:.1f}/{broadcast_limit_h} ч "
         f"({reset_info})"
     )
@@ -11542,6 +11938,112 @@ async def ai_generator_start(callback: CallbackQuery, state: FSMContext):
         markup = get_llm_model_pick_keyboard(current, include_back=True)
     await present_section(callback.message, 'ai', text, markup, replace=True)
     await state.set_state(LLMStates.choosing_model)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == 'ai_chat')
+async def ai_chat_start(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(AIChatStates.waiting_for_message)
+    await callback.message.edit_text(
+        await render_ai_chat_screen(callback.from_user.id),
+        reply_markup=get_ai_chat_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.message(AIChatStates.waiting_for_message)
+async def ai_chat_message(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    prompt = (message.text or '').strip()
+    if not prompt:
+        await message.answer('Отправьте сообщение текстом.')
+        return
+    if len(prompt) > 4000:
+        await message.answer('Сообщение слишком длинное: максимум 4000 символов.')
+        return
+
+    allowed, used, limit = await reserve_ai_chat_request(user_id)
+    if not allowed:
+        await message.answer(
+            f"{emoji('INFO')} Дневной лимит чата исчерпан: <b>{used}/{limit}</b>.\n"
+            "Лимит обновится завтра по МСК.",
+            reply_markup=get_ai_chat_keyboard(),
+        )
+        return
+
+    history = await get_ai_chat_history(user_id)
+    messages = history + [{'role': 'user', 'content': prompt}]
+    model = await get_user_llm_model(user_id)
+    thinking = await message.answer(
+        f"{emoji('LOADING')} <b>Думаю…</b>\n"
+        f"Модель: <code>{escape(str(LLM_MODELS.get(model, model)))}</code>",
+    )
+    try:
+        answer = await call_llm_api_with_history(
+            AI_CHAT_SYSTEM_PROMPT,
+            messages,
+            user_id=user_id,
+            model=model,
+            max_tokens=1200,
+        )
+    except Exception as ex:
+        await release_ai_chat_request(user_id)
+        logger.exception('AI chat request failed')
+        await thinking.edit_text(
+            f"{emoji('CROSS')} <b>Не удалось получить ответ.</b>\n\n"
+            f"<code>{escape(str(ex)[:700])}</code>",
+            reply_markup=get_ai_chat_keyboard(),
+        )
+        return
+
+    answer = (answer or '').strip()
+    if not answer:
+        await release_ai_chat_request(user_id)
+        await thinking.edit_text(
+            f"{emoji('CROSS')} Модель вернула пустой ответ. Лимит не был потрачен.",
+            reply_markup=get_ai_chat_keyboard(),
+        )
+        return
+
+    messages.append({'role': 'assistant', 'content': answer})
+    try:
+        await save_ai_chat_history(user_id, messages)
+    except Exception:
+        logger.exception('Could not save AI chat history')
+
+    chunks = _split_ai_chat_answer(answer)
+    first = escape(chunks[0]) if chunks else '—'
+    await thinking.edit_text(first, reply_markup=get_ai_chat_keyboard())
+    for chunk in chunks[1:]:
+        await message.answer(escape(chunk))
+    await message.answer(
+        f"Запросов сегодня: <b>{used}/{limit}</b>. Отправьте следующее сообщение.",
+        reply_markup=get_ai_chat_keyboard(),
+    )
+    await state.set_state(AIChatStates.waiting_for_message)
+
+
+@dp.callback_query(F.data == 'ai_chat_clear')
+async def ai_chat_clear(callback: CallbackQuery, state: FSMContext):
+    await clear_ai_chat_history(callback.from_user.id)
+    await state.set_state(AIChatStates.waiting_for_message)
+    screen = await render_ai_chat_screen(callback.from_user.id)
+    await callback.message.edit_text(
+        f"{emoji('CHECK')} История диалога очищена.\n\n{screen}",
+        reply_markup=get_ai_chat_keyboard(),
+    )
+    await callback.answer('История очищена')
+
+
+@dp.callback_query(F.data == 'ai_chat_exit')
+async def ai_chat_exit(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    limits = await format_limits_text(callback.from_user.id)
+    await callback.message.edit_text(
+        f"{emoji('SMILE')} <b>Главное меню</b>\n\n{limits}\n\nВыберите действие:",
+        reply_markup=get_main_menu_keyboard(),
+    )
     await callback.answer()
 
 
@@ -17755,6 +18257,82 @@ async def admin_llm_api_card(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+@dp.callback_query(F.data == 'admin_llm_test_builtin')
+async def admin_llm_test_builtin(callback: CallbackQuery):
+    if not _is_admin(callback):
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    await callback.answer('Проверяю модели…')
+    await callback.message.edit_text(
+        f"{emoji('LOADING')} <b>Проверяю модели API из кода…</b>",
+    )
+    results = await test_builtin_llm_models()
+    text = format_llm_models_test_report('Тест моделей API из кода', results)
+    _, markup = await render_admin_llm_menu()
+    await callback.message.edit_text(text, reply_markup=markup)
+
+
+@dp.callback_query(F.data.startswith('admin_llm_test_all:'))
+async def admin_llm_test_all(callback: CallbackQuery):
+    if not _is_admin(callback):
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    try:
+        api_id = int(callback.data.split(':', 1)[1])
+    except (AttributeError, ValueError):
+        await callback.answer('Некорректный API', show_alert=True)
+        return
+    api = await get_admin_llm_api(api_id)
+    if not api:
+        await callback.answer('API не найден', show_alert=True)
+        return
+    await callback.answer('Проверяю все модели…')
+    await callback.message.edit_text(
+        f"{emoji('LOADING')} <b>Проверяю модели: {escape(str(api['name']))}</b>\n\n"
+        'Запросы выполняются по очереди, чтобы получить отдельную ошибку каждой модели.',
+    )
+    results = await test_admin_llm_api_models(api_id)
+    if results is None:
+        await callback.message.edit_text(
+            f"{emoji('CROSS')} API не найден.",
+            reply_markup=(await render_admin_llm_menu())[1],
+        )
+        return
+    text = format_llm_models_test_report(
+        f"Тест всех моделей: {api['name']}", results,
+    )
+    _, markup = await render_admin_llm_api_card(api_id)
+    await callback.message.edit_text(text, reply_markup=markup)
+
+
+@dp.callback_query(F.data.startswith('admin_llm_test_model:'))
+async def admin_llm_test_model(callback: CallbackQuery):
+    if not _is_admin(callback):
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    try:
+        model_id = int(callback.data.split(':', 1)[1])
+    except (AttributeError, ValueError):
+        await callback.answer('Некорректная модель', show_alert=True)
+        return
+    await callback.answer('Проверяю модель…')
+    await callback.message.edit_text(
+        f"{emoji('LOADING')} <b>Проверяю модель…</b>",
+    )
+    result = await test_admin_llm_model(model_id)
+    if result is None:
+        await callback.message.edit_text(
+            f"{emoji('CROSS')} Модель не найдена.",
+            reply_markup=(await render_admin_llm_menu())[1],
+        )
+        return
+    text = format_llm_models_test_report(
+        'Тест модели', [result], detailed=True,
+    )
+    _, markup = await render_admin_llm_api_card(int(result['api_id']))
+    await callback.message.edit_text(text, reply_markup=markup)
+
+
 @dp.callback_query(F.data.startswith('admin_llm_activate:'))
 async def admin_llm_activate(callback: CallbackQuery):
     if not _is_admin(callback):
@@ -20083,6 +20661,7 @@ async def cmd_cancel_acct_ar(message: Message, state: FSMContext):
         AdminLLMConfigStates.waiting_for_api_key.state,
         AdminLLMConfigStates.waiting_for_model_api_name.state,
         AdminLLMConfigStates.waiting_for_model_display_name.state,
+        AIChatStates.waiting_for_message.state,
     }:
         await state.clear()
         await message.answer("Ок, отменил.")
