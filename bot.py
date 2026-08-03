@@ -37,6 +37,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from telethon import TelegramClient, events, Button
 from telethon.errors import (
     SessionPasswordNeededError, FloodWaitError, BadRequestError, RPCError,
+    AuthKeyUnregisteredError, SessionRevokedError, UserDeactivatedError,
+    UserDeactivatedBanError,
 )
 from telethon.sessions import StringSession
 from telethon.tl.types import User, ReactionEmoji
@@ -127,6 +129,20 @@ LLM_MODELS = {
 }
 LLM_DEFAULT_MODEL = 'sonnet-4.6'
 
+# Встроенная конфигурация остаётся безопасным fallback: пока администратор
+# не включил собственный базовый API, все запросы используют эти значения.
+LLM_FALLBACK_MODELS = dict(LLM_MODELS)
+LLM_FALLBACK_DEFAULT_MODEL = LLM_DEFAULT_MODEL
+GLOBAL_LLM_RUNTIME: Dict[str, Any] = {
+    'api_id': None,
+    'name': 'Встроенный API',
+    'base_url': LLM_BASE_URL,
+    'api_key': LLM_API_KEY,
+    'models': dict(LLM_MODELS),
+    'default_model': LLM_DEFAULT_MODEL,
+}
+GLOBAL_LLM_RUNTIME_READY = False
+
 # Пять независимых разделов, для которых администратор может закрепить
 # одно медиа Telegram (file_id хранится в БД, файл не копируется на диск).
 MEDIA_SECTIONS = {
@@ -201,6 +217,14 @@ SPAM_BLOCK_CHECK_INTERVAL_SECONDS = 12 * 60 * 60
 SPAM_BLOCK_SCHEDULER_POLL_SECONDS = 15 * 60
 SPAM_BLOCK_REQUEST_TIMEOUT_SECONDS = 35
 SPAM_BLOCK_RESPONSE_LIMIT = 1600
+
+# --- Регулярный мониторинг Telegram-аккаунтов ---
+ACCOUNT_MONITORING_POLL_SECONDS = 5 * 60
+ACCOUNT_VALIDITY_CHECK_INTERVAL_SECONDS = 60 * 60
+ACCOUNT_AI_ANALYSIS_INTERVAL_SECONDS = 7 * 24 * 60 * 60
+ACCOUNT_VALIDITY_BATCH_SIZE = 25
+ACCOUNT_AI_ANALYSIS_BATCH_SIZE = 5
+account_monitoring_locks: Dict[int, asyncio.Lock] = {}
 
 # --- Прогрев аккаунтов ---
 # Воркер прогрева на каждый аккаунт: имитирует живого пользователя,
@@ -531,6 +555,14 @@ class AdminStates(StatesGroup):
     waiting_for_revoke_user_id = State()
     waiting_for_user_lookup_id = State()
     waiting_for_media = State()
+
+
+class AdminLLMConfigStates(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_base_url = State()
+    waiting_for_api_key = State()
+    waiting_for_model_api_name = State()
+    waiting_for_model_display_name = State()
 
 
 class BalanceStates(StatesGroup):
@@ -1017,6 +1049,71 @@ async def init_db():
             )
         except Exception:
             pass
+        # Базовые AI API, которыми пользуются все пользователи без личного
+        # API. Если активной записи нет, используется fallback из кода.
+        # API-модель и подпись на кнопке хранятся раздельно: например,
+        # `claude-3-5-sonnet` → «Claude Sonnet 3.5».
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS admin_llm_apis (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                api_key_ciphertext TEXT NOT NULL,
+                is_active BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS admin_llm_models (
+                id BIGSERIAL PRIMARY KEY,
+                api_id BIGINT NOT NULL REFERENCES admin_llm_apis(id) ON DELETE CASCADE,
+                api_model_name TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(api_id, api_model_name)
+            )
+        ''')
+        try:
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_admin_llm_apis_active '
+                'ON admin_llm_apis (is_active, updated_at DESC)'
+            )
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_admin_llm_models_api_order '
+                'ON admin_llm_models (api_id, sort_order, id)'
+            )
+        except Exception:
+            pass
+
+        # Состояние фоновой проверки аккаунтов: валидность каждый час и
+        # AI-анализ активности раз в неделю.
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS account_monitoring_state (
+                account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+                user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                last_validity_check_at TIMESTAMP,
+                last_validity_status TEXT,
+                last_validity_error TEXT,
+                last_ai_analysis_at TIMESTAMP,
+                last_ai_analysis_source TEXT,
+                last_ai_analysis_text TEXT,
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        try:
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_account_monitoring_validity_due '
+                'ON account_monitoring_state (last_validity_check_at)'
+            )
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_account_monitoring_analysis_due '
+                'ON account_monitoring_state (last_ai_analysis_at)'
+            )
+        except Exception:
+            pass
+
         # Медиа для пяти экранов админ-панели.
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS section_media (
@@ -1415,10 +1512,81 @@ async def get_user_accounts(user_id: int) -> List[Dict]:
         return [dict(row) for row in rows]
 
 
+async def refresh_global_llm_runtime() -> Dict[str, Any]:
+    """Загружает активный базовый API администратора или fallback из кода.
+
+    `LLM_MODELS` обновляется на месте, поэтому существующие синхронные
+    клавиатуры сразу показывают подписи моделей, настроенные администратором.
+    """
+    global LLM_DEFAULT_MODEL, GLOBAL_LLM_RUNTIME, GLOBAL_LLM_RUNTIME_READY
+
+    runtime: Dict[str, Any] = {
+        'api_id': None,
+        'name': 'Встроенный API',
+        'base_url': LLM_BASE_URL,
+        'api_key': LLM_API_KEY,
+        'models': dict(LLM_FALLBACK_MODELS),
+        'default_model': LLM_FALLBACK_DEFAULT_MODEL,
+    }
+    if db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                api = await conn.fetchrow(
+                    '''SELECT id, name, base_url, api_key_ciphertext
+                       FROM admin_llm_apis
+                       WHERE is_active = TRUE
+                       ORDER BY updated_at DESC, id DESC
+                       LIMIT 1'''
+                )
+                if api:
+                    rows = await conn.fetch(
+                        '''SELECT api_model_name, display_name
+                           FROM admin_llm_models
+                           WHERE api_id = $1
+                           ORDER BY sort_order, id''',
+                        api['id'],
+                    )
+                    models = {
+                        str(row['api_model_name']).strip(): str(row['display_name']).strip()
+                        for row in rows
+                        if str(row['api_model_name']).strip()
+                        and str(row['display_name']).strip()
+                    }
+                    # Нельзя переключить весь бот на API без моделей: в этом
+                    # случае оставляем проверенный встроенный fallback.
+                    if models:
+                        default_model = next(iter(models))
+                        runtime = {
+                            'api_id': int(api['id']),
+                            'name': str(api['name']),
+                            'base_url': str(api['base_url']).strip().rstrip('/'),
+                            'api_key': _decrypt_llm_secret(api['api_key_ciphertext']),
+                            'models': models,
+                            'default_model': default_model,
+                        }
+        except Exception as ex:
+            logger.warning('Could not refresh global LLM runtime: %s', ex)
+
+    GLOBAL_LLM_RUNTIME = runtime
+    GLOBAL_LLM_RUNTIME_READY = True
+    LLM_MODELS.clear()
+    LLM_MODELS.update(runtime['models'])
+    LLM_DEFAULT_MODEL = runtime['default_model']
+    return dict(runtime)
+
+
+async def get_global_llm_runtime() -> Dict[str, Any]:
+    if not GLOBAL_LLM_RUNTIME_READY and db_pool is not None:
+        await refresh_global_llm_runtime()
+    return dict(GLOBAL_LLM_RUNTIME)
+
+
 async def get_user_llm_model(user_id: int) -> str:
-    """Возвращает модель активного пользовательского API или встроенную."""
+    """Возвращает модель личного API пользователя либо базового API."""
+    runtime = await get_global_llm_runtime()
+    default_model = runtime['default_model']
     if db_pool is None:
-        return LLM_DEFAULT_MODEL
+        return default_model
     try:
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -1433,17 +1601,18 @@ async def get_user_llm_model(user_id: int) -> str:
             if models:
                 selected = (row['llm_model'] or '').strip()
                 return selected if selected in models else models[0]
-        if row and row['llm_model'] in LLM_MODELS:
+        if row and row['llm_model'] in runtime['models']:
             return row['llm_model']
     except Exception as e:
         logger.warning('get_user_llm_model fallback: %s', e)
-    return LLM_DEFAULT_MODEL
+    return default_model
 
 
 async def set_user_llm_model(user_id: int, model: str) -> None:
-    """Сохраняет модель из встроенного или активного пользовательского API."""
+    """Сохраняет модель из личного либо текущего базового API."""
     if db_pool is None:
         return
+    runtime = await get_global_llm_runtime()
     async with db_pool.acquire() as conn:
         allowed = await conn.fetchval(
             '''SELECT models FROM user_llm_apis a
@@ -1451,7 +1620,7 @@ async def set_user_llm_model(user_id: int, model: str) -> None:
                WHERE u.user_id = $1''', user_id
         )
         custom_models = {str(x).strip() for x in (allowed or []) if str(x).strip()}
-        if model not in LLM_MODELS and model not in custom_models:
+        if model not in runtime['models'] and model not in custom_models:
             raise ValueError(f'Unknown model: {model}')
         await conn.execute(
             'INSERT INTO users (user_id, llm_model) VALUES ($1, $2) '
@@ -1461,9 +1630,10 @@ async def set_user_llm_model(user_id: int, model: str) -> None:
 
 
 async def get_user_llm_models(user_id: int) -> List[str]:
-    """Список моделей для текущего режима пользователя."""
+    """Список моделей для личного API или текущего базового API."""
+    runtime = await get_global_llm_runtime()
     if db_pool is None:
-        return list(LLM_MODELS)
+        return list(runtime['models'])
     try:
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -1472,17 +1642,20 @@ async def get_user_llm_models(user_id: int) -> List[str]:
                    WHERE u.user_id = $1''', user_id
             )
         models = [str(x).strip() for x in (row['models'] if row else []) or []]
-        return [x for x in models if x] or list(LLM_MODELS)
+        return [x for x in models if x] or list(runtime['models'])
     except Exception:
-        return list(LLM_MODELS)
+        return list(runtime['models'])
 
 
 async def get_user_llm_runtime(
     user_id: Optional[int], requested_model: Optional[str] = None
 ) -> Tuple[str, str, str]:
-    """Возвращает (base_url, api_key, model), не раскрывая ключ в UI/логах."""
-    model = requested_model or LLM_DEFAULT_MODEL
-    base_url, api_key = LLM_BASE_URL, LLM_API_KEY
+    """Возвращает runtime личного или базового API без раскрытия ключа."""
+    runtime = await get_global_llm_runtime()
+    model = requested_model or runtime['default_model']
+    base_url = runtime['base_url']
+    api_key = runtime['api_key']
+    using_custom_api = False
     if user_id is not None and db_pool is not None:
         try:
             async with db_pool.acquire() as conn:
@@ -1493,6 +1666,7 @@ async def get_user_llm_runtime(
                        WHERE u.user_id = $1''', user_id
                 )
             if row:
+                using_custom_api = True
                 base_url = str(row['base_url']).strip().rstrip('/')
                 api_key = _decrypt_llm_secret(row['api_key_ciphertext'])
                 custom_models = [str(x).strip() for x in (row['models'] or []) if str(x).strip()]
@@ -1500,6 +1674,8 @@ async def get_user_llm_runtime(
                     model = custom_models[0]
         except Exception as ex:
             logger.warning('get_user_llm_runtime fallback: %s', ex)
+    if not using_custom_api and model not in runtime['models']:
+        model = runtime['default_model']
     return base_url, api_key, model
 
 
@@ -1568,6 +1744,145 @@ async def save_user_llm_api(user_id: int, base_url: str, api_key: str, models: L
                 api_id, models[0], user_id
             )
     return int(api_id)
+
+
+async def get_admin_llm_apis() -> List[Dict[str, Any]]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            '''SELECT id, name, base_url, is_active, created_at, updated_at
+               FROM admin_llm_apis
+               ORDER BY is_active DESC, updated_at DESC, id DESC'''
+        )
+    return [dict(row) for row in rows]
+
+
+async def get_admin_llm_api(api_id: int) -> Optional[Dict[str, Any]]:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            '''SELECT id, name, base_url, is_active, created_at, updated_at
+               FROM admin_llm_apis WHERE id = $1''',
+            api_id,
+        )
+    return dict(row) if row else None
+
+
+async def get_admin_llm_models(api_id: int) -> List[Dict[str, Any]]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            '''SELECT id, api_id, api_model_name, display_name, sort_order
+               FROM admin_llm_models WHERE api_id = $1
+               ORDER BY sort_order, id''',
+            api_id,
+        )
+    return [dict(row) for row in rows]
+
+
+async def create_admin_llm_api(name: str, base_url: str, api_key: str) -> int:
+    async with db_pool.acquire() as conn:
+        api_id = await conn.fetchval(
+            '''INSERT INTO admin_llm_apis
+               (name, base_url, api_key_ciphertext)
+               VALUES ($1, $2, $3) RETURNING id''',
+            name.strip(), base_url.strip().rstrip('/'), _encrypt_llm_secret(api_key),
+        )
+    return int(api_id)
+
+
+async def add_admin_llm_model(
+    api_id: int, api_model_name: str, display_name: str,
+) -> int:
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            exists = await conn.fetchval(
+                'SELECT 1 FROM admin_llm_apis WHERE id = $1', api_id,
+            )
+            if not exists:
+                raise ValueError('API не найден')
+            models_count = await conn.fetchval(
+                'SELECT COUNT(*) FROM admin_llm_models WHERE api_id = $1', api_id,
+            )
+            if int(models_count or 0) >= 20:
+                raise ValueError('Для одного API можно добавить максимум 20 моделей')
+            sort_order = await conn.fetchval(
+                'SELECT COALESCE(MAX(sort_order), 0) + 1 '
+                'FROM admin_llm_models WHERE api_id = $1',
+                api_id,
+            )
+            model_id = await conn.fetchval(
+                '''INSERT INTO admin_llm_models
+                   (api_id, api_model_name, display_name, sort_order)
+                   VALUES ($1, $2, $3, $4) RETURNING id''',
+                api_id,
+                api_model_name.strip(),
+                display_name.strip(),
+                int(sort_order or 1),
+            )
+    await refresh_global_llm_runtime()
+    return int(model_id)
+
+
+async def activate_admin_llm_api(api_id: int) -> None:
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            models_count = await conn.fetchval(
+                'SELECT COUNT(*) FROM admin_llm_models WHERE api_id = $1', api_id,
+            )
+            if not models_count:
+                raise ValueError('Сначала добавьте хотя бы одну модель')
+            exists = await conn.fetchval(
+                'SELECT 1 FROM admin_llm_apis WHERE id = $1', api_id,
+            )
+            if not exists:
+                raise ValueError('API не найден')
+            await conn.execute('UPDATE admin_llm_apis SET is_active = FALSE')
+            await conn.execute(
+                'UPDATE admin_llm_apis SET is_active = TRUE, updated_at = NOW() '
+                'WHERE id = $1', api_id,
+            )
+    await refresh_global_llm_runtime()
+
+
+async def use_builtin_llm_api() -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            'UPDATE admin_llm_apis SET is_active = FALSE, updated_at = NOW() '
+            'WHERE is_active = TRUE'
+        )
+    await refresh_global_llm_runtime()
+
+
+async def delete_admin_llm_api(api_id: int) -> bool:
+    async with db_pool.acquire() as conn:
+        result = await conn.execute(
+            'DELETE FROM admin_llm_apis WHERE id = $1', api_id,
+        )
+    await refresh_global_llm_runtime()
+    return result.endswith(' 1')
+
+
+async def delete_admin_llm_model(model_id: int) -> Optional[int]:
+    """Удаляет модель; если у активного API моделей не осталось — отключает его."""
+    api_id: Optional[int] = None
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                'DELETE FROM admin_llm_models WHERE id = $1 RETURNING api_id',
+                model_id,
+            )
+            if not row:
+                return None
+            api_id = int(row['api_id'])
+            remaining = await conn.fetchval(
+                'SELECT COUNT(*) FROM admin_llm_models WHERE api_id = $1', api_id,
+            )
+            if not remaining:
+                await conn.execute(
+                    'UPDATE admin_llm_apis SET is_active = FALSE, updated_at = NOW() '
+                    'WHERE id = $1', api_id,
+                )
+    await refresh_global_llm_runtime()
+    return api_id
+
 
 async def get_account(account_id: int) -> Optional[Dict]:
     async with db_pool.acquire() as conn:
@@ -1880,12 +2195,300 @@ async def spam_block_check_worker() -> None:
         await asyncio.sleep(SPAM_BLOCK_SCHEDULER_POLL_SECONDS)
 
 
-async def delete_account(account_id: int) -> bool:
+async def save_account_validity_monitoring_state(
+    account_id: int, user_id: int, status: str, error: str = '',
+) -> None:
     async with db_pool.acquire() as conn:
-        result = await conn.execute(
-            'DELETE FROM accounts WHERE id = $1', account_id
+        await conn.execute(
+            '''INSERT INTO account_monitoring_state
+               (account_id, user_id, last_validity_check_at, last_validity_status,
+                last_validity_error, updated_at)
+               VALUES ($1, $2, NOW(), $3, $4, NOW())
+               ON CONFLICT (account_id) DO UPDATE SET
+                 user_id = EXCLUDED.user_id,
+                 last_validity_check_at = EXCLUDED.last_validity_check_at,
+                 last_validity_status = EXCLUDED.last_validity_status,
+                 last_validity_error = EXCLUDED.last_validity_error,
+                 updated_at = NOW()''',
+            account_id, user_id, status, (error or '')[:1000],
         )
-        return result != "DELETE 0"
+
+
+async def save_account_ai_analysis_monitoring_state(
+    account_id: int, user_id: int, source: str, text: str,
+) -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            '''INSERT INTO account_monitoring_state
+               (account_id, user_id, last_ai_analysis_at, last_ai_analysis_source,
+                last_ai_analysis_text, updated_at)
+               VALUES ($1, $2, NOW(), $3, $4, NOW())
+               ON CONFLICT (account_id) DO UPDATE SET
+                 user_id = EXCLUDED.user_id,
+                 last_ai_analysis_at = EXCLUDED.last_ai_analysis_at,
+                 last_ai_analysis_source = EXCLUDED.last_ai_analysis_source,
+                 last_ai_analysis_text = EXCLUDED.last_ai_analysis_text,
+                 updated_at = NOW()''',
+            account_id, user_id, source, (text or '')[:12000],
+        )
+
+
+async def get_due_account_validity_checks(
+    limit: int = ACCOUNT_VALIDITY_BATCH_SIZE,
+) -> List[Dict[str, int]]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            '''SELECT a.id AS account_id, a.user_id
+               FROM accounts a
+               LEFT JOIN account_monitoring_state m ON m.account_id = a.id
+               WHERE a.is_active = TRUE
+                 AND (
+                   m.last_validity_check_at IS NULL
+                   OR m.last_validity_check_at <= NOW() - INTERVAL '1 hour'
+                 )
+               ORDER BY m.last_validity_check_at NULLS FIRST, a.id
+               LIMIT $1''',
+            max(1, min(int(limit), 100)),
+        )
+    return [dict(row) for row in rows]
+
+
+async def get_due_account_ai_analyses(
+    limit: int = ACCOUNT_AI_ANALYSIS_BATCH_SIZE,
+) -> List[Dict[str, int]]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            '''SELECT a.id AS account_id, a.user_id
+               FROM accounts a
+               LEFT JOIN account_monitoring_state m ON m.account_id = a.id
+               WHERE a.is_active = TRUE
+                 AND (
+                   m.last_ai_analysis_at IS NULL
+                   OR m.last_ai_analysis_at <= NOW() - INTERVAL '7 days'
+                 )
+               ORDER BY m.last_ai_analysis_at NULLS FIRST, a.id
+               LIMIT $1''',
+            max(1, min(int(limit), 30)),
+        )
+    return [dict(row) for row in rows]
+
+
+async def shutdown_account_runtime(account_id: int, user_id: int) -> None:
+    """Останавливает живые воркеры перед окончательным удалением аккаунта."""
+    try:
+        await stop_warming(account_id)
+    except Exception:
+        pass
+
+    responders = active_auto_responders.get(user_id)
+    if responders:
+        task = responders.pop(account_id, None)
+        if task:
+            task.cancel()
+        if not responders:
+            active_auto_responders.pop(user_id, None)
+
+    try:
+        await stop_account_ai_responder(account_id, user_id)
+    except Exception:
+        pass
+
+    autosub_stop_flags[account_id] = True
+    autosub_task = autosub_tasks.pop(account_id, None)
+    if autosub_task:
+        autosub_task.cancel()
+    autosub_stop_flags.pop(account_id, None)
+
+    # Останавливаем живые задачи обычных рассылок этого аккаунта, если они
+    # ещё держат клиент в памяти. Статус в БД будет снят в delete_account().
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT id FROM broadcasts WHERE account_id = $1', account_id,
+            )
+        for row in rows:
+            task = active_broadcasts.pop(int(row['id']), None)
+            if task:
+                task.cancel()
+    except Exception:
+        pass
+
+    for storage in (active_clients, pending_clients):
+        client = storage.pop(account_id, None)
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
+async def delete_account(account_id: int) -> bool:
+    """Удаляет аккаунт и зависимые активные настройки без нарушения FK."""
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            # Историю рассылок сохраняем, но отвязываем её от удаляемой сессии.
+            await conn.execute(
+                "UPDATE broadcasts SET account_id = NULL, "
+                "status = CASE WHEN status IN ('active', 'scheduled') THEN 'stopped' ELSE status END, "
+                "stopped_at = CASE WHEN status IN ('active', 'scheduled') THEN NOW() ELSE stopped_at END "
+                "WHERE account_id = $1",
+                account_id,
+            )
+            await conn.execute(
+                "UPDATE dm_broadcasts SET account_id = NULL, "
+                "status = CASE WHEN status = 'active' THEN 'stopped' ELSE status END, "
+                "stopped_at = CASE WHEN status = 'active' THEN NOW() ELSE stopped_at END "
+                "WHERE account_id = $1",
+                account_id,
+            )
+            await conn.execute(
+                'DELETE FROM auto_responders WHERE account_id = $1', account_id,
+            )
+            await conn.execute(
+                'DELETE FROM account_logs WHERE account_id = $1', account_id,
+            )
+            result = await conn.execute(
+                'DELETE FROM accounts WHERE id = $1', account_id,
+            )
+    return result != 'DELETE 0'
+
+
+async def notify_invalid_account_removal(
+    user_id: int, account: Dict[str, Any], error: str,
+) -> None:
+    try:
+        await bot.send_message(
+            user_id,
+            f"{emoji('CROSS')} <b>Аккаунт удалён после проверки валидности</b>\n\n"
+            f"{emoji('PHONE')} Аккаунт: <code>{escape(str(account.get('phone') or account.get('id')))}</code>\n"
+            "Telegram не подтвердил авторизацию этой сессии, поэтому бот "
+            "полностью снял аккаунт из работы.\n\n"
+            f"Причина: <i>{escape((error or 'Сессия не авторизована')[:500])}</i>",
+        )
+    except Exception as ex:
+        logger.warning('Could not notify account removal for %s: %s', account.get('id'), ex)
+
+
+async def remove_invalid_account(
+    account: Dict[str, Any], user_id: int, error: str,
+) -> bool:
+    account_id = int(account['id'])
+    await shutdown_account_runtime(account_id, user_id)
+    deleted = await delete_account(account_id)
+    if deleted:
+        await notify_invalid_account_removal(user_id, account, error)
+    return deleted
+
+
+def _split_monitoring_text(text: str, limit: int = 3200) -> List[str]:
+    text = (text or '').strip() or 'Нет данных для анализа.'
+    chunks: List[str] = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        cut = text.rfind('\n', 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip('\n')
+    return chunks
+
+
+async def notify_weekly_account_analysis(
+    user_id: int, account: Dict[str, Any], result: Dict[str, Any],
+) -> None:
+    source = 'AI' if result.get('source') == 'llm' else 'локальная эвристика'
+    chunks = _split_monitoring_text(result.get('text') or '')
+    for index, chunk in enumerate(chunks):
+        header = (
+            f"{emoji('AI')} <b>Еженедельный анализ аккаунта</b>\n\n"
+            f"{emoji('PHONE')} Аккаунт: <code>{escape(str(account.get('phone') or account.get('id')))}</code>\n"
+            f"Источник: <b>{source}</b>\n\n"
+            if index == 0 else f"{emoji('AI')} <b>Продолжение анализа</b>\n\n"
+        )
+        try:
+            # LLM-текст не считаем доверенной HTML-разметкой.
+            await bot.send_message(user_id, header + escape(chunk))
+        except Exception as ex:
+            logger.warning('Could not notify weekly analysis for account %s: %s',
+                           account.get('id'), ex)
+            return
+
+
+async def run_account_validity_monitor(
+    account_id: int, user_id: int,
+) -> Dict[str, Any]:
+    lock = account_monitoring_locks.setdefault(account_id, asyncio.Lock())
+    async with lock:
+        account = await get_account(account_id)
+        if not account or account.get('user_id') != user_id:
+            return {'status': 'missing'}
+        result = await validate_account(account_id, user_id)
+        status = result.get('status') or ('valid' if result.get('valid') else 'check_error')
+        await save_account_validity_monitoring_state(
+            account_id, user_id, status, result.get('error') or '',
+        )
+        if result.get('removable'):
+            removed = await remove_invalid_account(
+                account, user_id, result.get('error') or '',
+            )
+            result['removed'] = removed
+        return result
+
+
+async def run_weekly_account_ai_analysis(
+    account_id: int, user_id: int,
+) -> Dict[str, Any]:
+    lock = account_monitoring_locks.setdefault(account_id, asyncio.Lock())
+    async with lock:
+        account = await get_account(account_id)
+        if not account or account.get('user_id') != user_id or not account.get('is_active'):
+            return {'status': 'missing'}
+        # user_id=None намеренно: регулярный сервисный анализ использует
+        # базовый API, выбранный администратором, а не личный API пользователя.
+        result = await analyze_account_logs_security(account_id, user_id=None)
+        await save_account_ai_analysis_monitoring_state(
+            account_id,
+            user_id,
+            result.get('source') or 'heuristic',
+            result.get('text') or '',
+        )
+        await notify_weekly_account_analysis(user_id, account, result)
+        return result
+
+
+async def account_monitoring_worker() -> None:
+    """Почасовая валидация и недельный AI-анализ активных аккаунтов."""
+    while True:
+        try:
+            for item in await get_due_account_validity_checks():
+                try:
+                    await run_account_validity_monitor(
+                        int(item['account_id']), int(item['user_id']),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:
+                    logger.exception('Account validity monitor failed: %s', ex)
+                await asyncio.sleep(1)
+
+            for item in await get_due_account_ai_analyses():
+                try:
+                    await run_weekly_account_ai_analysis(
+                        int(item['account_id']), int(item['user_id']),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:
+                    logger.exception('Weekly account AI analysis failed: %s', ex)
+                await asyncio.sleep(2)
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            logger.exception('Account monitoring worker failed: %s', ex)
+        await asyncio.sleep(ACCOUNT_MONITORING_POLL_SECONDS)
+
 
 async def update_account_warming(account_id: int, enabled: bool):
     async with db_pool.acquire() as conn:
@@ -5240,7 +5843,7 @@ async def build_security_prompt(
 
 async def analyze_account_logs_security(
     account_id: int,
-    user_id: int,
+    user_id: Optional[int],
 ) -> Dict[str, Any]:
     """Главная точка входа: тянет 50 лог��в + флуды, выдаёт отчёт.
 
@@ -9337,6 +9940,128 @@ async def admin_media_delete(callback: CallbackQuery):
     )
 
 
+async def render_admin_llm_menu() -> Tuple[str, InlineKeyboardMarkup]:
+    runtime = await get_global_llm_runtime()
+    apis = await get_admin_llm_apis()
+    active_id = runtime.get('api_id')
+    source_label = (
+        f"<b>{escape(str(runtime.get('name') or 'Базовый API'))}</b>"
+        if active_id is not None else '<b>Встроенный API из кода</b>'
+    )
+    models_text = '\n'.join(
+        f"• <code>{escape(str(model_id))}</code> → {escape(str(label))}"
+        for model_id, label in (runtime.get('models') or {}).items()
+    ) or '• моделей пока нет'
+    text = (
+        f"{emoji('AI')} <b>Базовый AI API</b>\n\n"
+        f"Активный источник: {source_label}\n"
+        f"URL: <code>{escape(str(runtime.get('base_url') or '—'))}</code>\n\n"
+        "<b>Модели, доступные пользователям:</b>\n"
+        f"{models_text}\n\n"
+        "Токены не отображаются. У личных API пользователей приоритет выше "
+        "базового API."
+    )
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text='Добавить базовый API',
+        callback_data='admin_llm_add',
+        style='primary',
+        icon_custom_emoji_id=get_icon('ADD_TEXT'),
+    ))
+    for api in apis:
+        mark = 'Используется' if api.get('is_active') else 'Сохранён'
+        builder.row(InlineKeyboardButton(
+            text=f"{str(api['name'])[:48]} · {mark}",
+            callback_data=f"admin_llm_api:{api['id']}",
+            style='success' if api.get('is_active') else 'default',
+            icon_custom_emoji_id=get_icon('AI'),
+        ))
+    if active_id is not None:
+        builder.row(InlineKeyboardButton(
+            text='Вернуться к API из кода',
+            callback_data='admin_llm_builtin',
+            style='default',
+            icon_custom_emoji_id=get_icon('BACK'),
+        ))
+    builder.row(InlineKeyboardButton(
+        text='В админ-панель',
+        callback_data='admin_refresh_stats',
+        style='default',
+        icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    return text, builder.as_markup()
+
+
+async def render_admin_llm_api_card(api_id: int) -> Tuple[Optional[str], Optional[InlineKeyboardMarkup]]:
+    api = await get_admin_llm_api(api_id)
+    if not api:
+        return None, None
+    models = await get_admin_llm_models(api_id)
+    models_lines = [
+        f"• <code>{escape(str(item['api_model_name']))}</code> → "
+        f"<b>{escape(str(item['display_name']))}</b>"
+        f"{' <i>(по умолчанию)</i>' if index == 0 else ''}"
+        for index, item in enumerate(models)
+    ] or ['• Пока нет моделей']
+    status = 'используется как базовый' if api.get('is_active') else 'не активен'
+    text = (
+        f"{emoji('AI')} <b>{escape(str(api['name']))}</b>\n\n"
+        f"Статус: <b>{status}</b>\n"
+        f"URL: <code>{escape(str(api['base_url']))}</code>\n\n"
+        "<b>Модели:</b>\n" + '\n'.join(models_lines) + "\n\n"
+        "Сначала указывается техническое имя модели для API, затем — "
+        "подпись, которую увидят пользователи на кнопке."
+    )
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text='Добавить модель',
+        callback_data=f'admin_llm_model_add:{api_id}',
+        style='primary',
+        icon_custom_emoji_id=get_icon('ADD_TEXT'),
+    ))
+    if not api.get('is_active'):
+        builder.row(InlineKeyboardButton(
+            text='Сделать базовым',
+            callback_data=f'admin_llm_activate:{api_id}',
+            style='success',
+            icon_custom_emoji_id=get_icon('CHECK'),
+        ))
+    for item in models:
+        builder.row(InlineKeyboardButton(
+            text=f"Удалить модель: {item['display_name']}",
+            callback_data=f"admin_llm_model_delete:{item['id']}",
+            style='danger',
+            icon_custom_emoji_id=get_icon('DELETE'),
+        ))
+    builder.row(InlineKeyboardButton(
+        text='Удалить API',
+        callback_data=f'admin_llm_api_delete:{api_id}',
+        style='danger',
+        icon_custom_emoji_id=get_icon('DELETE'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='К списку API',
+        callback_data='admin_llm_menu',
+        style='default',
+        icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    return text, builder.as_markup()
+
+
+def _is_admin(callback_or_message) -> bool:
+    user = getattr(callback_or_message, 'from_user', None)
+    return bool(user and user.id in ADMIN_IDS)
+
+
+def _valid_admin_llm_base_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return bool(
+        parsed.scheme in ('http', 'https')
+        and parsed.netloc
+        and '@' not in parsed.netloc
+    )
+
+
 async def build_admin_panel() -> tuple:
     """Строит текст и клавиатуру главной админ-панели (единый источник)."""
     stats = await get_broadcast_stats()
@@ -9360,6 +10085,12 @@ async def build_admin_panel() -> tuple:
         callback_data="admin_finance",
         style='primary',
         icon_custom_emoji_id=get_icon("CHART")
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Базовый AI API",
+        callback_data="admin_llm_menu",
+        style='primary',
+        icon_custom_emoji_id=get_icon("AI")
     ))
     builder.row(InlineKeyboardButton(
         text="Подарить подписку",
@@ -10652,11 +11383,14 @@ async def _auto_check_pro_sbp(
 async def _render_llm_api_settings(target: Message, user_id: int) -> None:
     apis = await get_user_llm_apis(user_id)
     active = next((a for a in apis if a.get('is_active')), None)
+    runtime = await get_global_llm_runtime()
     lines = [
         f"{emoji('GEAR')} <b>Настройки AI API</b>",
         "",
-        f"Режим: <b>{'Ваш API' if active else 'Встроенная версия с лимитами'}</b>",
+        f"Режим: <b>{'Ваш API' if active else 'Базовый API'}</b>",
     ]
+    if not active:
+        lines.append(f"Источник: <code>{escape(str(runtime.get('name') or 'Встроенный API'))}</code>")
     if active:
         lines.append(f"Модели: <code>{escape(', '.join(active.get('models') or []))}</code>")
     if apis:
@@ -10673,7 +11407,7 @@ async def _render_llm_api_settings(target: Message, user_id: int) -> None:
                                              callback_data=f"ai_api_use:{api['id']}", style='default',
                                              icon_custom_emoji_id=get_icon('CHECK')))
     if active:
-        builder.row(InlineKeyboardButton(text='Вернуться к встроенной версии', callback_data='ai_api_builtin',
+        builder.row(InlineKeyboardButton(text='Вернуться к базовому API', callback_data='ai_api_builtin',
                                          style='default', icon_custom_emoji_id=get_icon('BACK')))
     builder.row(InlineKeyboardButton(text='Назад', callback_data='ai_generator', style='default',
                                      icon_custom_emoji_id=get_icon('BACK')))
@@ -10759,7 +11493,7 @@ async def ai_api_use(callback: CallbackQuery):
 async def ai_api_builtin(callback: CallbackQuery):
     await set_active_llm_api(callback.from_user.id, None)
     await _render_llm_api_settings(callback.message, callback.from_user.id)
-    await callback.answer('Встроенная версия включена')
+    await callback.answer('Базовый API включён')
 
 
 @dp.callback_query(F.data == 'llm_choose_custom', LLMStates.choosing_model)
@@ -10908,7 +11642,8 @@ async def ai_generator_prompt(message: Message, state: FSMContext):
     summary = (
         f"{emoji('AI')} <b>3 варианта готовы.</b>\n\n"
         f"{emoji('INFO')} Запрос: <i>{escape(user_prompt[:160])}</i>\n"
-        f"{emoji('CLOCK')} Запрос #{request_id or '—'} · {escape(LLM_MODEL)}"
+        f"{emoji('CLOCK')} Запрос #{request_id or '—'} · "
+        f"{escape(LLM_MODELS.get(user_model, user_model))}"
     )
     await thinking.edit_text(
         summary,
@@ -11130,11 +11865,12 @@ async def llm_model_menu(callback: CallbackQuery, state: FSMContext):
     """Показывает клавиатуру выбора LLM-модели с подсветкой текущей."""
     current = await get_user_llm_model(callback.from_user.id)
     label = LLM_MODELS.get(current, current)
+    runtime = await get_global_llm_runtime()
     await callback.message.edit_text(
         f"{emoji('BOT')} <b>Выбор модели</b>\n\n"
         f"Текущая: <code>{escape(label)}</code>\n\n"
         f"{emoji('INFO')} Используется официальный Anthropic SDK, "
-        f"прокси: <code>{escape(LLM_BASE_URL)}</code>.",
+        f"базовый API: <code>{escape(str(runtime['base_url']))}</code>.",
         reply_markup=get_llm_model_keyboard(current),
     )
     await callback.answer()
@@ -11865,28 +12601,106 @@ async def process_2fa(message: Message, state: FSMContext):
 
 # --- Мои аккаунты ---
 async def validate_account(account_id: int, user_id: int) -> Dict[str, Any]:
+    """Проверяет авторизацию, не удаляя аккаунт при кратковременной ошибке сети.
+
+    `removable=True` выставляется только если Telegram явно подтвердил, что
+    сессия больше не авторизована. Это отличает невалидную сессию от сбоя
+    прокси/сети и защищает рабочие аккаунты от ошибочного удаления.
+    """
     account = await get_account(account_id)
     if not account or account.get('user_id') != user_id:
-        return {'valid': False, 'error': 'Аккаунт не найден'}
-    client = await get_client_for_account(account_id)
-    valid = bool(client and client.is_connected() and await client.is_user_authorized())
+        return {
+            'valid': False,
+            'removable': False,
+            'status': 'missing',
+            'error': 'Аккаунт не найден',
+        }
+
+    client: Optional[TelegramClient] = active_clients.get(account_id)
+    owns_probe = False
     premium = False
     username = ''
-    error = ''
-    if valid:
-        try:
+    result: Dict[str, Any] = {
+        'valid': False,
+        'removable': False,
+        'status': 'check_error',
+        'error': '',
+        'premium': False,
+        'username': '',
+    }
+    try:
+        if client is None:
+            proxy = await get_proxy(account['proxy_id']) if account.get('proxy_id') else None
+            fingerprint = await get_account_fingerprint(account_id)
+            if not fingerprint:
+                fingerprint = await regenerate_account_fingerprint(account_id)
+            client = await create_telethon_client(
+                account['session_string'], proxy=proxy, fingerprint=fingerprint,
+            )
+            await client.connect()
+            owns_probe = True
+        elif not client.is_connected():
+            await client.connect()
+
+        authorized = await client.is_user_authorized()
+        if not authorized:
+            result.update({
+                'status': 'invalid',
+                'removable': True,
+                'error': 'Сессия Telegram больше не авторизована.',
+            })
+        else:
             me = await client.get_me()
             premium = bool(getattr(me, 'premium', False))
             username = getattr(me, 'username', None) or ''
-        except Exception as ex:
-            valid, error = False, str(ex)
+            result.update({
+                'valid': True,
+                'status': 'valid',
+                'premium': premium,
+                'username': username,
+            })
+    except (
+        AuthKeyUnregisteredError, SessionRevokedError,
+        UserDeactivatedError, UserDeactivatedBanError,
+    ) as ex:
+        result.update({
+            'status': 'invalid',
+            'removable': True,
+            'error': str(ex) or 'Telegram отозвал авторизацию сессии.',
+        })
+    except Exception as ex:
+        # Ошибка подключения не доказывает, что сессия умерла: оставляем
+        # аккаунт и повторим проверку в следующий плановый час.
+        result['error'] = str(ex)[:1000]
+    finally:
+        if owns_probe and client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            '''UPDATE accounts SET is_active = $1, telegram_premium = $2,
-               validation_status = $3, last_validated_at = NOW() WHERE id = $4''',
-            valid, premium, 'valid' if valid else 'invalid', account_id
-        )
-    return {'valid': valid, 'premium': premium, 'username': username, 'error': error}
+        if result['valid']:
+            await conn.execute(
+                '''UPDATE accounts SET is_active = TRUE, telegram_premium = $1,
+                   validation_status = 'valid', last_validated_at = NOW()
+                   WHERE id = $2''',
+                premium, account_id,
+            )
+        elif result['removable']:
+            await conn.execute(
+                '''UPDATE accounts SET is_active = FALSE, telegram_premium = FALSE,
+                   validation_status = 'invalid', last_validated_at = NOW()
+                   WHERE id = $1''',
+                account_id,
+            )
+        else:
+            await conn.execute(
+                '''UPDATE accounts SET validation_status = 'check_error',
+                   last_validated_at = NOW() WHERE id = $1''',
+                account_id,
+            )
+    return result
 
 
 @dp.callback_query(F.data.startswith('validate_account_'))
@@ -11895,9 +12709,15 @@ async def validate_account_handler(callback: CallbackQuery):
     await callback.answer('Проверяю подключение...')
     result = await validate_account(account_id, callback.from_user.id)
     if not result['valid']:
+        if result.get('removable'):
+            title = 'Сессия невалидна'
+            fallback = 'Требуется повторная авторизация.'
+        else:
+            title = 'Не удалось подтвердить валидность'
+            fallback = 'Проверьте подключение или прокси и попробуйте позже.'
         await callback.message.edit_text(
-            f"{emoji('CROSS')} <b>Сессия невалидна</b>\n\n"
-            f"{escape(result.get('error') or 'Требуется повторная авторизация.')}",
+            f"{emoji('CROSS')} <b>{title}</b>\n\n"
+            f"{escape(result.get('error') or fallback)}",
             reply_markup=get_account_actions_keyboard(account_id)
         )
         return
@@ -12200,6 +13020,12 @@ async def manage_account(callback: CallbackQuery):
             "ORDER BY cooldown_until DESC LIMIT 1",
             account_id,
         )
+        monitoring_row = await conn.fetchrow(
+            "SELECT last_validity_check_at, last_validity_status, "
+            "last_ai_analysis_at, last_ai_analysis_source "
+            "FROM account_monitoring_state WHERE account_id = $1",
+            account_id,
+        )
 
     # --- Риск-скор ---
     if flood_week == 0:
@@ -12255,6 +13081,25 @@ async def manage_account(callback: CallbackQuery):
     else:
         cooldown_line = 'нет активных ограничений'
 
+    # --- Плановый мониторинг ---
+    if monitoring_row:
+        monitor_data = dict(monitoring_row)
+        validity_status = monitor_data.get('last_validity_status') or 'ещё не проверялась'
+        validity_when = _format_msk_datetime(
+            monitor_data.get('last_validity_check_at'), '—'
+        )
+        analysis_when = _format_msk_datetime(
+            monitor_data.get('last_ai_analysis_at'), 'ещё не выполнялся'
+        )
+        source = monitor_data.get('last_ai_analysis_source')
+        source_label = 'AI' if source == 'llm' else ('эвристика' if source else '—')
+        monitoring_line = (
+            f"валидность: {validity_status} ({validity_when}); "
+            f"AI-анализ: {analysis_when} ({source_label})"
+        )
+    else:
+        monitoring_line = 'ожидается первая почасовая проверка и AI-анализ'
+
     # --- Последнее действие ---
     if last_log:
         direction_icon = "→" if last_log['direction'] == 'outgoing' else "←"
@@ -12293,6 +13138,7 @@ async def manage_account(callback: CallbackQuery):
         f"{emoji('CHECK')} Проверка: <b>{validation_str}</b> (последняя: {last_check_str})\n"
         f"{emoji('BELL')} Спамблок: <b>{escape(spam_line)}</b>\n"
         f"{emoji('CLOCK')} FloodWait: <b>{escape(cooldown_line)}</b>\n"
+        f"{emoji('AI')} Мониторинг: <b>{escape(monitoring_line)}</b>\n"
         f"{emoji('CLOCK')} Добавлен: <b>{account['created_at'].strftime('%d.%m.%Y %H:%M')}</b>\n\n"
         f"{emoji('LINK')} Прокси: {proxy_line}{proxy_status_badge}\n"
         f"{emoji('PHONE')} Отпечаток: {fp_line}\n\n"
@@ -13718,18 +14564,16 @@ async def show_warming_plan(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("delete_account_"))
 async def delete_account_handler(callback: CallbackQuery):
     account_id = int(callback.data.split("_")[2])
+    account = await get_account(account_id)
+    if not account or account.get('user_id') != callback.from_user.id:
+        await callback.answer('Аккаунт не найден', show_alert=True)
+        return
 
-    # Перед удалением аккаунта — гасим прогрев
-    await stop_warming(account_id)
-
-    if account_id in active_clients:
-        try:
-            await active_clients[account_id].disconnect()
-        except:
-            pass
-        del active_clients[account_id]
-
-    await delete_account(account_id)
+    await shutdown_account_runtime(account_id, callback.from_user.id)
+    deleted = await delete_account(account_id)
+    if not deleted:
+        await callback.answer('Не удалось удалить аккаунт', show_alert=True)
+        return
 
     await callback.message.edit_text(
         f"{emoji('CHECK')} Аккаунт успешно удален!",
@@ -16710,6 +17554,269 @@ async def admin_refresh_stats(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(admin_text, reply_markup=markup)
     await callback.answer()
 
+@dp.callback_query(F.data == 'admin_llm_menu')
+async def admin_llm_menu(callback: CallbackQuery, state: FSMContext):
+    if not _is_admin(callback):
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    await state.clear()
+    text, markup = await render_admin_llm_menu()
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == 'admin_llm_add')
+async def admin_llm_add_start(callback: CallbackQuery, state: FSMContext):
+    if not _is_admin(callback):
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AdminLLMConfigStates.waiting_for_name)
+    await callback.message.edit_text(
+        f"{emoji('AI')} <b>Новый базовый AI API</b>\n\n"
+        "Введите внутреннее название API, например: <code>Основной SmartAPI</code>.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text='Отмена', callback_data='admin_llm_cancel', style='default',
+                icon_custom_emoji_id=get_icon('BACK'),
+            )
+        ]]),
+    )
+    await callback.answer()
+
+
+@dp.message(AdminLLMConfigStates.waiting_for_name)
+async def admin_llm_receive_name(message: Message, state: FSMContext):
+    if not _is_admin(message):
+        return
+    name = ' '.join((message.text or '').split()).strip()
+    if not 2 <= len(name) <= 48:
+        await message.answer('Название должно содержать от 2 до 48 символов.')
+        return
+    await state.update_data(admin_llm_name=name)
+    await state.set_state(AdminLLMConfigStates.waiting_for_base_url)
+    await message.answer(
+        'Отправьте base URL Anthropic-совместимого API, например <code>https://api.example.com</code>.',
+    )
+
+
+@dp.message(AdminLLMConfigStates.waiting_for_base_url)
+async def admin_llm_receive_base_url(message: Message, state: FSMContext):
+    if not _is_admin(message):
+        return
+    base_url = (message.text or '').strip().rstrip('/')
+    if not _valid_admin_llm_base_url(base_url):
+        await message.answer('Нужен корректный http:// или https:// URL без логина и пароля.')
+        return
+    await state.update_data(admin_llm_base_url=base_url)
+    await state.set_state(AdminLLMConfigStates.waiting_for_api_key)
+    await message.answer('Отправьте API-токен. Он будет зашифрован и не показывается повторно.')
+
+
+@dp.message(AdminLLMConfigStates.waiting_for_api_key)
+async def admin_llm_receive_api_key(message: Message, state: FSMContext):
+    if not _is_admin(message):
+        return
+    api_key = (message.text or '').strip()
+    if not 8 <= len(api_key) <= 4096:
+        await message.answer('Токен имеет некорректную длину. Отправьте его ещё раз.')
+        return
+    data = await state.get_data()
+    try:
+        api_id = await create_admin_llm_api(
+            data['admin_llm_name'], data['admin_llm_base_url'], api_key,
+        )
+    except Exception:
+        logger.exception('Could not save admin LLM API')
+        await state.clear()
+        await message.answer('Не удалось сохранить API. Попробуйте позже.')
+        return
+    await state.clear()
+    await state.update_data(admin_llm_api_id=api_id)
+    await state.set_state(AdminLLMConfigStates.waiting_for_model_api_name)
+    await message.answer(
+        f"{emoji('AI')} API сохранён.\n\n"
+        "Теперь отправьте <b>техническое имя модели</b>, которое нужно передавать "
+        "в API, например <code>claude-3-5-sonnet</code>.\n\n"
+        "Допустимы латинские буквы, цифры, <code>._:/-</code>; максимум 34 символа.",
+    )
+
+
+@dp.callback_query(F.data.startswith('admin_llm_model_add:'))
+async def admin_llm_model_add_start(callback: CallbackQuery, state: FSMContext):
+    if not _is_admin(callback):
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    try:
+        api_id = int(callback.data.split(':', 1)[1])
+    except (AttributeError, ValueError):
+        await callback.answer('Некорректный API', show_alert=True)
+        return
+    if not await get_admin_llm_api(api_id):
+        await callback.answer('API не найден', show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(admin_llm_api_id=api_id)
+    await state.set_state(AdminLLMConfigStates.waiting_for_model_api_name)
+    await callback.message.edit_text(
+        f"{emoji('AI')} <b>Добавление модели</b>\n\n"
+        "Отправьте техническое имя модели для API, например "
+        "<code>claude-3-5-sonnet</code>.\n"
+        "Максимум 34 символа; допустимы <code>._:/-</code>.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text='Отмена', callback_data=f'admin_llm_api:{api_id}', style='default',
+                icon_custom_emoji_id=get_icon('BACK'),
+            )
+        ]]),
+    )
+    await callback.answer()
+
+
+@dp.message(AdminLLMConfigStates.waiting_for_model_api_name)
+async def admin_llm_receive_model_api_name(message: Message, state: FSMContext):
+    if not _is_admin(message):
+        return
+    model_name = (message.text or '').strip()
+    if not re.fullmatch(r'[A-Za-z0-9._:/-]{1,34}', model_name):
+        await message.answer(
+            'Некорректное имя. Используйте до 34 символов: латинские буквы, цифры, <code>._:/-</code>.',
+        )
+        return
+    await state.update_data(admin_llm_model_api_name=model_name)
+    await state.set_state(AdminLLMConfigStates.waiting_for_model_display_name)
+    await message.answer(
+        "Теперь отправьте название, которое будет показано пользователям на кнопке, "
+        "например <code>Claude Sonnet 3.5</code>.",
+    )
+
+
+@dp.message(AdminLLMConfigStates.waiting_for_model_display_name)
+async def admin_llm_receive_model_display_name(message: Message, state: FSMContext):
+    if not _is_admin(message):
+        return
+    display_name = ' '.join((message.text or '').split()).strip()
+    if not 1 <= len(display_name) <= 48:
+        await message.answer('Название для кнопки должно содержать от 1 до 48 символов.')
+        return
+    data = await state.get_data()
+    api_id = int(data.get('admin_llm_api_id') or 0)
+    try:
+        await add_admin_llm_model(
+            api_id,
+            data['admin_llm_model_api_name'],
+            display_name,
+        )
+    except Exception as ex:
+        logger.warning('Could not save admin LLM model: %s', ex)
+        await message.answer('Не удалось сохранить модель. Возможно, она уже добавлена.')
+        return
+    await state.clear()
+    text, markup = await render_admin_llm_api_card(api_id)
+    await message.answer(
+        f"{emoji('CHECK')} Модель сохранена.\n\n{text}",
+        reply_markup=markup,
+    )
+
+
+@dp.callback_query(F.data.startswith('admin_llm_api:'))
+async def admin_llm_api_card(callback: CallbackQuery, state: FSMContext):
+    if not _is_admin(callback):
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    try:
+        api_id = int(callback.data.split(':', 1)[1])
+    except (AttributeError, ValueError):
+        await callback.answer('Некорректный API', show_alert=True)
+        return
+    await state.clear()
+    text, markup = await render_admin_llm_api_card(api_id)
+    if text is None:
+        await callback.answer('API не найден', show_alert=True)
+        return
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('admin_llm_activate:'))
+async def admin_llm_activate(callback: CallbackQuery):
+    if not _is_admin(callback):
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    try:
+        api_id = int(callback.data.split(':', 1)[1])
+        await activate_admin_llm_api(api_id)
+    except (ValueError, TypeError) as ex:
+        await callback.answer(str(ex), show_alert=True)
+        return
+    except Exception:
+        logger.exception('Could not activate admin LLM API')
+        await callback.answer('Не удалось включить API', show_alert=True)
+        return
+    text, markup = await render_admin_llm_api_card(api_id)
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer('Базовый API изменён')
+
+
+@dp.callback_query(F.data == 'admin_llm_builtin')
+async def admin_llm_builtin(callback: CallbackQuery):
+    if not _is_admin(callback):
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    await use_builtin_llm_api()
+    text, markup = await render_admin_llm_menu()
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer('Встроенный API включён')
+
+
+@dp.callback_query(F.data.startswith('admin_llm_model_delete:'))
+async def admin_llm_model_delete(callback: CallbackQuery):
+    if not _is_admin(callback):
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    try:
+        model_id = int(callback.data.split(':', 1)[1])
+    except (AttributeError, ValueError):
+        await callback.answer('Некорректная модель', show_alert=True)
+        return
+    api_id = await delete_admin_llm_model(model_id)
+    if api_id is None:
+        await callback.answer('Модель не найдена', show_alert=True)
+        return
+    text, markup = await render_admin_llm_api_card(api_id)
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer('Модель удалена')
+
+
+@dp.callback_query(F.data.startswith('admin_llm_api_delete:'))
+async def admin_llm_api_delete(callback: CallbackQuery):
+    if not _is_admin(callback):
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    try:
+        api_id = int(callback.data.split(':', 1)[1])
+    except (AttributeError, ValueError):
+        await callback.answer('Некорректный API', show_alert=True)
+        return
+    if not await delete_admin_llm_api(api_id):
+        await callback.answer('API не найден', show_alert=True)
+        return
+    text, markup = await render_admin_llm_menu()
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer('API удалён')
+
+
+@dp.callback_query(F.data == 'admin_llm_cancel')
+async def admin_llm_cancel(callback: CallbackQuery, state: FSMContext):
+    if not _is_admin(callback):
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    await state.clear()
+    text, markup = await render_admin_llm_menu()
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer('Отменено')
+
+
 @dp.callback_query(F.data == 'admin_finance')
 async def admin_finance(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
@@ -18954,6 +20061,11 @@ async def cmd_cancel_acct_ar(message: Message, state: FSMContext):
         ScriptStates.choosing_account.state,
         ScriptStates.waiting_for_bot_url.state,
         ScriptStates.choosing_button.state,
+        AdminLLMConfigStates.waiting_for_name.state,
+        AdminLLMConfigStates.waiting_for_base_url.state,
+        AdminLLMConfigStates.waiting_for_api_key.state,
+        AdminLLMConfigStates.waiting_for_model_api_name.state,
+        AdminLLMConfigStates.waiting_for_model_display_name.state,
     }:
         await state.clear()
         await message.answer("Ок, отменил.")
@@ -18966,6 +20078,8 @@ async def on_startup():
     os.makedirs("media", exist_ok=True)
     os.makedirs("media/ai", exist_ok=True)
     await init_db()
+    # Подхватываем базовый API/модели администратора до запуска воркеров.
+    await refresh_global_llm_runtime()
 
     async with db_pool.acquire() as conn:
         responders = await conn.fetch(
@@ -19022,6 +20136,7 @@ async def on_startup():
     asyncio.create_task(check_scheduled_broadcasts())
     asyncio.create_task(task_queue_worker())
     asyncio.create_task(spam_block_check_worker())
+    asyncio.create_task(account_monitoring_worker())
 
 async def main():
     # --- Защита от запуска нескольких экземпляров ---
