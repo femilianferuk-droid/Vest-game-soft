@@ -192,6 +192,15 @@ autolike_tasks: Dict[int, asyncio.Task] = {}
 autolike_stop_flags: Dict[int, bool] = {}
 delete_messages_stop_flags: Dict[int, bool] = {}
 script_run_locks: Dict[int, asyncio.Lock] = {}
+# Не допускаем одновременную ручную и плановую проверку одного аккаунта.
+spam_check_locks: Dict[int, asyncio.Lock] = {}
+
+# --- Проверка ограничений @SpamBot ---
+SPAM_BLOCK_BOT_USERNAME = '@SpamBot'
+SPAM_BLOCK_CHECK_INTERVAL_SECONDS = 12 * 60 * 60
+SPAM_BLOCK_SCHEDULER_POLL_SECONDS = 15 * 60
+SPAM_BLOCK_REQUEST_TIMEOUT_SECONDS = 35
+SPAM_BLOCK_RESPONSE_LIMIT = 1600
 
 # --- Прогрев аккаунтов ---
 # Воркер прогрева на каждый аккаунт: имитирует живого пользователя,
@@ -1082,6 +1091,51 @@ async def init_db():
         except Exception:
             pass
 
+        # Периодическая проверка ограничений аккаунта через @SpamBot.
+        # Настройки хранятся отдельно от accounts, чтобы у уже добавленных
+        # аккаунтов проверка по умолчанию была включена без миграции строк.
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS account_spam_checks (
+                account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+                user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                notify_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                last_checked_at TIMESTAMP,
+                last_status TEXT,
+                last_response TEXT,
+                last_error TEXT,
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        try:
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_account_spam_checks_due '
+                'ON account_spam_checks (is_enabled, last_checked_at)'
+            )
+        except Exception:
+            pass
+
+        # Дедлайны FloodWait для длительных действий. Это даёт воркеру
+        # создания каналов возможность действительно приостановиться и
+        # продолжить работу строго после указанного Telegram cooldown.
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS account_action_cooldowns (
+                account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
+                action TEXT NOT NULL,
+                cooldown_until TIMESTAMP NOT NULL,
+                source TEXT,
+                updated_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (account_id, action)
+            )
+        ''')
+        try:
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_account_action_cooldowns_until '
+                'ON account_action_cooldowns (cooldown_until)'
+            )
+        except Exception:
+            pass
+
         # Планы прогрева, сгенерированные LLM.
         # Один аккаунт может иметь несколько планов в истории,
         # но только один активный (is_active = TRUE).
@@ -1524,6 +1578,307 @@ async def get_account(account_id: int) -> Optional[Dict]:
             account_id
         )
         return dict(row) if row else None
+
+
+SPAM_BLOCK_STATUS_LABELS = {
+    'clear': 'Ограничений не найдено',
+    'limited': 'Есть ограничения',
+    'unknown': 'Ответ не распознан',
+    'error': 'Не удалось проверить',
+}
+
+
+def _now_msk_naive() -> datetime:
+    """В БД используются TIMESTAMP без timezone, поэтому храним МСК naive."""
+    return datetime.now(MSK_TZ).replace(tzinfo=None)
+
+
+def _format_msk_datetime(value: Any, empty: str = 'ещё не проверялось') -> str:
+    if not value:
+        return empty
+    try:
+        if getattr(value, 'tzinfo', None) is not None:
+            value = value.astimezone(MSK_TZ)
+        return value.strftime('%d.%m.%Y %H:%M МСК')
+    except Exception:
+        return str(value)[:16]
+
+
+def classify_spam_block_response(text: str) -> str:
+    """Классифицирует ответ @SpamBot на русском и английском.
+
+    Сначала ищем явные фразы об отсутствии ограничений: в ответе может
+    одновременно встречаться слово «ограничение», поэтому порядок важен.
+    """
+    normalized = ' '.join((text or '').casefold().split())
+    if not normalized:
+        return 'unknown'
+
+    clear_markers = (
+        'no limits are currently applied',
+        'no limitations are currently applied',
+        'no restrictions are currently applied',
+        'your account is free of limitations',
+        'you are free as a bird',
+        'никаких ограничений',
+        'ограничения не наложены',
+        'нет ограничений на ваш аккаунт',
+        'ваш аккаунт не ограничен',
+    )
+    if any(marker in normalized for marker in clear_markers):
+        return 'clear'
+
+    limited_markers = (
+        'your account is limited',
+        'account is limited',
+        'you are limited',
+        'limited until',
+        'restrictions are currently applied',
+        'account has been limited',
+        'ваш аккаунт ограничен',
+        'аккаунт ограничен до',
+        'на ваш аккаунт наложены ограничения',
+        'ограничения действуют',
+    )
+    if any(marker in normalized for marker in limited_markers):
+        return 'limited'
+    return 'unknown'
+
+
+async def get_account_spam_check_settings(
+    account_id: int, user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Настройки проверки; без записи в БД используются безопасные дефолты."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            'SELECT * FROM account_spam_checks WHERE account_id = $1',
+            account_id,
+        )
+    if row:
+        return dict(row)
+    return {
+        'account_id': account_id,
+        'user_id': user_id,
+        'is_enabled': True,
+        'notify_enabled': True,
+        'last_checked_at': None,
+        'last_status': None,
+        'last_response': None,
+        'last_error': None,
+    }
+
+
+async def update_account_spam_check_settings(
+    account_id: int,
+    user_id: int,
+    *,
+    is_enabled: Optional[bool] = None,
+    notify_enabled: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Меняет только указанные настройки, не стирая прошлый результат."""
+    current = await get_account_spam_check_settings(account_id, user_id)
+    enabled = bool(current.get('is_enabled', True)) if is_enabled is None else bool(is_enabled)
+    notify = (
+        bool(current.get('notify_enabled', True))
+        if notify_enabled is None else bool(notify_enabled)
+    )
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            '''INSERT INTO account_spam_checks
+               (account_id, user_id, is_enabled, notify_enabled, updated_at)
+               VALUES ($1, $2, $3, $4, NOW())
+               ON CONFLICT (account_id) DO UPDATE SET
+                 user_id = EXCLUDED.user_id,
+                 is_enabled = EXCLUDED.is_enabled,
+                 notify_enabled = EXCLUDED.notify_enabled,
+                 updated_at = NOW()''',
+            account_id, user_id, enabled, notify,
+        )
+    return await get_account_spam_check_settings(account_id, user_id)
+
+
+async def save_account_spam_check_result(
+    account_id: int,
+    user_id: int,
+    status: str,
+    response: str = '',
+    error: str = '',
+) -> None:
+    """Сохраняет результат проверки, не меняя включённые пользователем тумблеры."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            '''INSERT INTO account_spam_checks
+               (account_id, user_id, last_checked_at, last_status,
+                last_response, last_error, updated_at)
+               VALUES ($1, $2, NOW(), $3, $4, $5, NOW())
+               ON CONFLICT (account_id) DO UPDATE SET
+                 user_id = EXCLUDED.user_id,
+                 last_checked_at = EXCLUDED.last_checked_at,
+                 last_status = EXCLUDED.last_status,
+                 last_response = EXCLUDED.last_response,
+                 last_error = EXCLUDED.last_error,
+                 updated_at = NOW()''',
+            account_id,
+            user_id,
+            status,
+            (response or '')[:4000],
+            (error or '')[:1000],
+        )
+
+
+def format_spam_block_result(result: Dict[str, Any]) -> str:
+    status = result.get('status') or 'unknown'
+    label = SPAM_BLOCK_STATUS_LABELS.get(status, 'Неизвестный статус')
+    response = (result.get('response') or result.get('error') or '—').strip()
+    if len(response) > SPAM_BLOCK_RESPONSE_LIMIT:
+        response = response[:SPAM_BLOCK_RESPONSE_LIMIT - 1].rstrip() + '…'
+    return (
+        f"Статус: <b>{escape(label)}</b>\n"
+        f"Ответ @SpamBot:\n<i>{escape(response)}</i>"
+    )
+
+
+async def notify_spam_block_result(
+    user_id: int, account: Dict[str, Any], result: Dict[str, Any],
+) -> None:
+    """Отправляет владельцу результат плановой проверки, если он не выключил уведомления."""
+    try:
+        checked_at = _format_msk_datetime(result.get('checked_at'), 'только что')
+        await bot.send_message(
+            user_id,
+            f"{emoji('BELL')} <b>Автопроверка ограничений</b>\n\n"
+            f"{emoji('PHONE')} Аккаунт: <code>{escape(str(account.get('phone') or result.get('account_id')))}</code>\n"
+            f"{format_spam_block_result(result)}\n\n"
+            f"{emoji('CLOCK')} Проверено: <b>{checked_at}</b>",
+        )
+    except Exception as ex:
+        logger.warning('Could not notify spam check result for account %s: %s',
+                       result.get('account_id'), ex)
+
+
+async def check_account_spam_block(
+    account_id: int,
+    user_id: int,
+    *,
+    notify: bool = False,
+) -> Dict[str, Any]:
+    """Запрашивает @SpamBot и сохраняет результат проверки аккаунта.
+
+    Это именно проверка статуса и соблюдение ограничений Telegram: функция
+    не пытается обходить блокировки и не повторяет запросы при FloodWait.
+    """
+    lock = spam_check_locks.setdefault(account_id, asyncio.Lock())
+    async with lock:
+        account = await get_account(account_id)
+        checked_at = _now_msk_naive()
+        result: Dict[str, Any] = {
+            'account_id': account_id,
+            'status': 'error',
+            'response': '',
+            'error': '',
+            'checked_at': checked_at,
+        }
+        if not account or account.get('user_id') != user_id:
+            result['error'] = 'Аккаунт не найден или недоступен'
+            return result
+
+        try:
+            client = await get_client_for_account(account_id)
+            if not client or not await client.is_user_authorized():
+                raise RuntimeError('Не удалось подключиться к Telegram-аккаунту')
+
+            async with client.conversation(
+                SPAM_BLOCK_BOT_USERNAME,
+                timeout=SPAM_BLOCK_REQUEST_TIMEOUT_SECONDS,
+                exclusive=False,
+            ) as conversation:
+                await conversation.send_message('/start')
+                message = await conversation.get_response()
+
+            response = (
+                getattr(message, 'raw_text', None)
+                or getattr(message, 'message', None)
+                or ''
+            ).strip()
+            result['response'] = response
+            result['status'] = classify_spam_block_response(response)
+        except FloodWaitError as ex:
+            await record_flood_wait(account_id, 0, ex.seconds)
+            result['error'] = f'FloodWait: Telegram просит подождать {int(ex.seconds)} сек.'
+        except asyncio.TimeoutError:
+            result['error'] = 'Не дождались ответа @SpamBot'
+        except Exception as ex:
+            logger.warning('Spam block check failed for account %s: %s', account_id, ex)
+            result['error'] = str(ex)[:1000]
+
+        await save_account_spam_check_result(
+            account_id,
+            user_id,
+            result['status'],
+            result['response'],
+            result['error'],
+        )
+        try:
+            preview = (result['response'] or result['error'] or '')[:90]
+            await add_account_log(
+                account_id,
+                SPAM_BLOCK_BOT_USERNAME,
+                0,
+                'spam_check',
+                f"{result['status']}: {preview}",
+            )
+        except Exception:
+            pass
+
+        if notify:
+            settings = await get_account_spam_check_settings(account_id, user_id)
+            if settings.get('notify_enabled', True):
+                await notify_spam_block_result(user_id, account, result)
+        return result
+
+
+async def get_due_spam_block_checks(limit: int = 20) -> List[Dict[str, int]]:
+    """Выбирает активные аккаунты, не проверявшиеся последние 12 часов."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            '''SELECT a.id AS account_id, a.user_id
+               FROM accounts a
+               LEFT JOIN account_spam_checks s ON s.account_id = a.id
+               WHERE a.is_active = TRUE
+                 AND COALESCE(s.is_enabled, TRUE) = TRUE
+                 AND (
+                   s.last_checked_at IS NULL
+                   OR s.last_checked_at <= NOW() - INTERVAL '12 hours'
+                 )
+               ORDER BY s.last_checked_at NULLS FIRST, a.id
+               LIMIT $1''',
+            max(1, min(int(limit), 100)),
+        )
+    return [dict(row) for row in rows]
+
+
+async def spam_block_check_worker() -> None:
+    """Фоновый планировщик: проверка один раз в 12 часов на аккаунт."""
+    while True:
+        try:
+            due_accounts = await get_due_spam_block_checks()
+            for item in due_accounts:
+                try:
+                    await check_account_spam_block(
+                        int(item['account_id']), int(item['user_id']), notify=True,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:
+                    logger.exception('Spam block scheduler check failed: %s', ex)
+                # Не создаём всплеск запросов к @SpamBot для множества аккаунтов.
+                await asyncio.sleep(2)
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            logger.exception('Spam block scheduler failed: %s', ex)
+        await asyncio.sleep(SPAM_BLOCK_SCHEDULER_POLL_SECONDS)
+
 
 async def delete_account(account_id: int) -> bool:
     async with db_pool.acquire() as conn:
@@ -4990,6 +5345,11 @@ async def auto_responder_worker(responder: Dict, user_id: int):
             if trigger == "-" or trigger.lower() in message_text.lower():
                 try:
                     sender = await event.get_sender()
+                    # Ответ @SpamBot нужен для фоновой проверки статуса,
+                    # а не для автоответчика. Иначе триггер «-» мог бы
+                    # отвечать самому сервисному боту Telegram.
+                    if (getattr(sender, 'username', None) or '').casefold() == 'spambot':
+                        return
                     user_data = {
                         'username': sender.username or '',
                         'first_name': sender.first_name or '',
@@ -6029,6 +6389,7 @@ async def execute_join(
 
 # --- Создание каналов и групп ---
 CHAT_CREATION_DELAY = 20
+CHAT_CREATION_FLOOD_ACTION = 'chat_creation'
 
 CHAT_CREATION_LABELS = {
     'channel': {
@@ -6063,6 +6424,112 @@ def build_chat_title(base_title: str, index: int, total: int) -> str:
     return f"{base_title[:128 - len(suffix)]}{suffix}"
 
 
+async def set_account_action_cooldown(
+    account_id: int, action: str, seconds: int, source: str = 'FloodWait',
+) -> datetime:
+    """Сохраняет дедлайн Telegram cooldown и никогда не сокращает его."""
+    wait_seconds = max(1, int(seconds))
+    requested_until = _now_msk_naive() + timedelta(seconds=wait_seconds)
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            '''INSERT INTO account_action_cooldowns
+               (account_id, action, cooldown_until, source, updated_at)
+               VALUES ($1, $2, $3, $4, NOW())
+               ON CONFLICT (account_id, action) DO UPDATE SET
+                 cooldown_until = GREATEST(
+                     account_action_cooldowns.cooldown_until,
+                     EXCLUDED.cooldown_until
+                 ),
+                 source = EXCLUDED.source,
+                 updated_at = NOW()
+               RETURNING cooldown_until''',
+            account_id, action, requested_until, source,
+        )
+    return row['cooldown_until'] if row else requested_until
+
+
+async def get_account_action_cooldown(
+    account_id: int, action: str,
+) -> Optional[datetime]:
+    """Возвращает активный дедлайн и очищает уже прошедшие записи."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            '''SELECT cooldown_until FROM account_action_cooldowns
+               WHERE account_id = $1 AND action = $2''',
+            account_id, action,
+        )
+        if not row:
+            return None
+        deadline = row['cooldown_until']
+        compare_deadline = deadline
+        if getattr(compare_deadline, 'tzinfo', None) is not None:
+            compare_deadline = compare_deadline.astimezone(MSK_TZ).replace(tzinfo=None)
+        if compare_deadline <= _now_msk_naive():
+            await conn.execute(
+                '''DELETE FROM account_action_cooldowns
+                   WHERE account_id = $1 AND action = $2''',
+                account_id, action,
+            )
+            return None
+    return deadline
+
+
+async def clear_account_action_cooldown(account_id: int, action: str) -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            '''DELETE FROM account_action_cooldowns
+               WHERE account_id = $1 AND action = $2''',
+            account_id, action,
+        )
+
+
+def cooldown_remaining_seconds(deadline: datetime) -> int:
+    comparable = deadline
+    if getattr(comparable, 'tzinfo', None) is not None:
+        comparable = comparable.astimezone(MSK_TZ).replace(tzinfo=None)
+    return max(0, int((comparable - _now_msk_naive()).total_seconds() + 0.999))
+
+
+async def wait_for_chat_creation_cooldown(
+    account_id: int,
+    user_id: int,
+    labels: Dict[str, str],
+    chat_title: str,
+    created_count: int,
+    total_count: int,
+    progress_message: Message,
+) -> bool:
+    """Ждёт строго до окончания FloodWait, обновляя прогресс и реагируя на Stop."""
+    while not chat_creation_stop_flags.get(user_id, False):
+        deadline = await get_account_action_cooldown(
+            account_id, CHAT_CREATION_FLOOD_ACTION,
+        )
+        if not deadline:
+            return True
+        remaining = cooldown_remaining_seconds(deadline)
+        if remaining <= 0:
+            await clear_account_action_cooldown(
+                account_id, CHAT_CREATION_FLOOD_ACTION,
+            )
+            return True
+        try:
+            await progress_message.edit_text(
+                f"{emoji('CLOCK')} <b>{labels['title']} приостановлено</b>\n\n"
+                f"Telegram запросил паузу FloodWait.\n"
+                f"До продолжения: <b>{remaining} сек.</b>\n"
+                f"Продолжим после: <b>{_format_msk_datetime(deadline, '—')}</b>\n\n"
+                f"Создано: <b>{created_count}/{total_count}</b>\n"
+                f"{labels['current']}: <code>{escape(chat_title)}</code>",
+                reply_markup=get_chat_creation_control_keyboard(),
+            )
+        except Exception:
+            pass
+        # Спим кусками максимум по минуте: так Stop работает без долгого
+        # ожидания, а продлённый другим запросом дедлайн подхватывается.
+        await asyncio.sleep(min(remaining, 60))
+    return False
+
+
 async def execute_chat_creation(
     account_id: int,
     user_id: int,
@@ -6071,7 +6538,7 @@ async def execute_chat_creation(
     creation_kind: str,
     progress_message: Message,
 ) -> Dict[str, Any]:
-    """Создать приватные каналы или супергруппы с паузой 20 секунд."""
+    """Создаёт каналы/группы, соблюдая и пережидая FloodWait Telegram."""
     labels = get_chat_creation_labels(creation_kind)
     is_group = creation_kind == 'group'
 
@@ -6092,62 +6559,70 @@ async def execute_chat_creation(
             break
 
         chat_title = build_chat_title(base_title, index, count)
-        request = CreateChannelRequest(
-            title=chat_title,
-            about='',
-            broadcast=not is_group,
-            megagroup=is_group,
-        )
-        try:
-            await client(request)
-            created.append(chat_title)
-            logger.info(
-                'Created %s %r for account_id=%s (%s/%s)',
-                creation_kind, chat_title, account_id, index, count,
+        while not chat_creation_stop_flags.get(user_id, False):
+            # Если Telegram уже выдал FloodWait этому аккаунту, в том числе
+            # в предыдущей задаче, не делаем новый запрос до его окончания.
+            may_continue = await wait_for_chat_creation_cooldown(
+                account_id=account_id,
+                user_id=user_id,
+                labels=labels,
+                chat_title=chat_title,
+                created_count=len(created),
+                total_count=count,
+                progress_message=progress_message,
             )
-        except FloodWaitError as ex:
-            await record_flood_wait(account_id, 0, ex.seconds)
-            wait_seconds = max(CHAT_CREATION_DELAY, ex.seconds + 1)
-            try:
-                await progress_message.edit_text(
-                    f"{emoji('CLOCK')} <b>Telegram включил ограничение</b>\n\n"
-                    f"Ожидание: <b>{wait_seconds} сек.</b>\n"
-                    f"Создано: <b>{len(created)}/{count}</b>\n"
-                    f"{labels['current']}: "
-                    f"<code>{escape(chat_title)}</code>",
-                    reply_markup=get_chat_creation_control_keyboard(),
-                )
-            except Exception:
-                pass
-
-            await asyncio.sleep(wait_seconds)
-            if chat_creation_stop_flags.get(user_id, False):
+            if not may_continue:
                 break
 
+            request = CreateChannelRequest(
+                title=chat_title,
+                about='',
+                broadcast=not is_group,
+                megagroup=is_group,
+            )
             try:
                 await client(request)
                 created.append(chat_title)
-            except Exception as retry_ex:
-                failed.append({
-                    'title': chat_title,
-                    'error': str(retry_ex),
-                })
-                logger.warning(
-                    '%s retry failed for %r: %s',
-                    creation_kind, chat_title, retry_ex,
+                await clear_account_action_cooldown(
+                    account_id, CHAT_CREATION_FLOOD_ACTION,
                 )
-        except RPCError as ex:
-            failed.append({'title': chat_title, 'error': str(ex)})
-            logger.warning(
-                '%s creation failed for %r: %s',
-                creation_kind, chat_title, ex,
-            )
-        except Exception as ex:
-            failed.append({'title': chat_title, 'error': str(ex)})
-            logger.exception(
-                'Unexpected %s creation error for %r',
-                creation_kind, chat_title,
-            )
+                logger.info(
+                    'Created %s %r for account_id=%s (%s/%s)',
+                    creation_kind, chat_title, account_id, index, count,
+                )
+                break
+            except FloodWaitError as ex:
+                wait_seconds = max(1, int(ex.seconds))
+                await record_flood_wait(account_id, 0, wait_seconds)
+                deadline = await set_account_action_cooldown(
+                    account_id,
+                    CHAT_CREATION_FLOOD_ACTION,
+                    wait_seconds,
+                )
+                logger.warning(
+                    '%s creation FloodWait for account_id=%s: %ss, until %s',
+                    creation_kind, account_id, wait_seconds, deadline,
+                )
+                # Не считаем текущий канал ошибкой: тот же запрос будет
+                # повторён только после полного cooldown.
+                continue
+            except RPCError as ex:
+                failed.append({'title': chat_title, 'error': str(ex)})
+                logger.warning(
+                    '%s creation failed for %r: %s',
+                    creation_kind, chat_title, ex,
+                )
+                break
+            except Exception as ex:
+                failed.append({'title': chat_title, 'error': str(ex)})
+                logger.exception(
+                    'Unexpected %s creation error for %r',
+                    creation_kind, chat_title,
+                )
+                break
+
+        if chat_creation_stop_flags.get(user_id, False):
+            break
 
         processed = len(created) + len(failed)
         try:
@@ -8325,6 +8800,12 @@ def get_account_actions_keyboard(
         callback_data=f"validate_account_{account_id}",
         style='primary',
         icon_custom_emoji_id=get_icon("CHECK")
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Спамблок и уведомления",
+        callback_data=f"spam_check_menu:{account_id}",
+        style='primary',
+        icon_custom_emoji_id=get_icon("BELL")
     ))
     builder.row(InlineKeyboardButton(
         text="Логи аккаунта",
@@ -11429,6 +11910,196 @@ async def validate_account_handler(callback: CallbackQuery):
     )
 
 
+def get_spam_check_keyboard(
+    account_id: int, settings: Dict[str, Any],
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text='Проверить сейчас',
+        callback_data=f'spam_check_run:{account_id}',
+        style='primary',
+        icon_custom_emoji_id=get_icon('REFRESH'),
+    ))
+    notifications_on = bool(settings.get('notify_enabled', True))
+    builder.row(InlineKeyboardButton(
+        text=(
+            'Отключить уведомления'
+            if notifications_on else 'Включить уведомления'
+        ),
+        callback_data=f'spam_check_toggle_notify:{account_id}',
+        style='default',
+        icon_custom_emoji_id=get_icon('BELL'),
+    ))
+    auto_check_on = bool(settings.get('is_enabled', True))
+    builder.row(InlineKeyboardButton(
+        text=(
+            'Выключить автопроверку'
+            if auto_check_on else 'Включить автопроверку'
+        ),
+        callback_data=f'spam_check_toggle_auto:{account_id}',
+        style='default',
+        icon_custom_emoji_id=get_icon('CLOCK'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Назад к аккаунту',
+        callback_data=f'manage_account_{account_id}',
+        style='default',
+        icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    return builder.as_markup()
+
+
+def render_spam_check_screen(
+    account: Dict[str, Any], settings: Dict[str, Any],
+) -> str:
+    enabled = bool(settings.get('is_enabled', True))
+    notify_enabled = bool(settings.get('notify_enabled', True))
+    last_checked = settings.get('last_checked_at')
+    status = settings.get('last_status')
+    status_label = SPAM_BLOCK_STATUS_LABELS.get(
+        status, 'ещё не проверялось'
+    )
+
+    schedule_line = 'выключена'
+    if enabled:
+        schedule_line = 'включена: раз в 12 часов'
+        if last_checked and hasattr(last_checked, '__add__'):
+            try:
+                schedule_line += (
+                    f"\nСледующая проверка после: "
+                    f"{_format_msk_datetime(last_checked + timedelta(seconds=SPAM_BLOCK_CHECK_INTERVAL_SECONDS))}"
+                )
+            except Exception:
+                pass
+
+    response = (settings.get('last_response') or settings.get('last_error') or '').strip()
+    if len(response) > SPAM_BLOCK_RESPONSE_LIMIT:
+        response = response[:SPAM_BLOCK_RESPONSE_LIMIT - 1].rstrip() + '…'
+    response_block = (
+        f"\n\n<b>Последний ответ @SpamBot:</b>\n<i>{escape(response)}</i>"
+        if response else ''
+    )
+    return (
+        f"{emoji('BELL')} <b>Проверка спамблока</b>\n\n"
+        f"{emoji('PHONE')} Аккаунт: <code>{escape(str(account.get('phone') or account.get('id')))}</code>\n"
+        f"Статус: <b>{escape(status_label)}</b>\n"
+        f"Последняя проверка: <b>{_format_msk_datetime(last_checked)}</b>\n\n"
+        f"{emoji('CLOCK')} Автопроверка: <b>{schedule_line}</b>\n"
+        f"{emoji('BELL')} Уведомления: <b>{'включены' if notify_enabled else 'выключены'}</b>"
+        f"{response_block}"
+    )
+
+
+async def _get_owned_spam_check_account(
+    callback: CallbackQuery, account_id: int,
+) -> Optional[Dict[str, Any]]:
+    account = await get_account(account_id)
+    if not account or account.get('user_id') != callback.from_user.id:
+        await callback.answer('Аккаунт не найден', show_alert=True)
+        return None
+    return account
+
+
+@dp.callback_query(F.data.startswith('spam_check_menu:'))
+async def spam_check_menu(callback: CallbackQuery):
+    try:
+        account_id = int(callback.data.split(':', 1)[1])
+    except (AttributeError, ValueError):
+        await callback.answer('Некорректный аккаунт', show_alert=True)
+        return
+    account = await _get_owned_spam_check_account(callback, account_id)
+    if not account:
+        return
+    settings = await get_account_spam_check_settings(
+        account_id, callback.from_user.id,
+    )
+    await callback.message.edit_text(
+        render_spam_check_screen(account, settings),
+        reply_markup=get_spam_check_keyboard(account_id, settings),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('spam_check_run:'))
+async def spam_check_run(callback: CallbackQuery):
+    try:
+        account_id = int(callback.data.split(':', 1)[1])
+    except (AttributeError, ValueError):
+        await callback.answer('Некорректный аккаунт', show_alert=True)
+        return
+    account = await _get_owned_spam_check_account(callback, account_id)
+    if not account:
+        return
+
+    await callback.answer('Проверяю @SpamBot…')
+    try:
+        await callback.message.edit_text(
+            f"{emoji('LOADING')} <b>Проверяю ограничения через @SpamBot…</b>\n\n"
+            f"{emoji('PHONE')} Аккаунт: <code>{escape(str(account.get('phone') or account_id))}</code>",
+        )
+    except Exception:
+        pass
+
+    await check_account_spam_block(account_id, callback.from_user.id, notify=False)
+    settings = await get_account_spam_check_settings(
+        account_id, callback.from_user.id,
+    )
+    await callback.message.edit_text(
+        render_spam_check_screen(account, settings),
+        reply_markup=get_spam_check_keyboard(account_id, settings),
+    )
+
+
+@dp.callback_query(F.data.startswith('spam_check_toggle_notify:'))
+async def spam_check_toggle_notify(callback: CallbackQuery):
+    try:
+        account_id = int(callback.data.split(':', 1)[1])
+    except (AttributeError, ValueError):
+        await callback.answer('Некорректный аккаунт', show_alert=True)
+        return
+    account = await _get_owned_spam_check_account(callback, account_id)
+    if not account:
+        return
+    settings = await get_account_spam_check_settings(account_id, callback.from_user.id)
+    settings = await update_account_spam_check_settings(
+        account_id,
+        callback.from_user.id,
+        notify_enabled=not bool(settings.get('notify_enabled', True)),
+    )
+    await callback.message.edit_text(
+        render_spam_check_screen(account, settings),
+        reply_markup=get_spam_check_keyboard(account_id, settings),
+    )
+    await callback.answer(
+        'Уведомления включены' if settings.get('notify_enabled') else 'Уведомления выключены'
+    )
+
+
+@dp.callback_query(F.data.startswith('spam_check_toggle_auto:'))
+async def spam_check_toggle_auto(callback: CallbackQuery):
+    try:
+        account_id = int(callback.data.split(':', 1)[1])
+    except (AttributeError, ValueError):
+        await callback.answer('Некорректный аккаунт', show_alert=True)
+        return
+    account = await _get_owned_spam_check_account(callback, account_id)
+    if not account:
+        return
+    settings = await get_account_spam_check_settings(account_id, callback.from_user.id)
+    settings = await update_account_spam_check_settings(
+        account_id,
+        callback.from_user.id,
+        is_enabled=not bool(settings.get('is_enabled', True)),
+    )
+    await callback.message.edit_text(
+        render_spam_check_screen(account, settings),
+        reply_markup=get_spam_check_keyboard(account_id, settings),
+    )
+    await callback.answer(
+        'Автопроверка включена' if settings.get('is_enabled') else 'Автопроверка выключена'
+    )
+
+
 @dp.callback_query(F.data == "my_accounts")
 async def my_accounts(callback: CallbackQuery):
     accounts = await get_user_accounts(callback.from_user.id)
@@ -11518,6 +12189,17 @@ async def manage_account(callback: CallbackQuery):
             "SELECT mode, system_prompt FROM account_ai_responder WHERE account_id=$1",
             account_id
         )
+        spam_row = await conn.fetchrow(
+            "SELECT is_enabled, notify_enabled, last_checked_at, last_status "
+            "FROM account_spam_checks WHERE account_id = $1",
+            account_id,
+        )
+        cooldown_row = await conn.fetchrow(
+            "SELECT action, cooldown_until FROM account_action_cooldowns "
+            "WHERE account_id = $1 AND cooldown_until > NOW() "
+            "ORDER BY cooldown_until DESC LIMIT 1",
+            account_id,
+        )
 
     # --- Риск-скор ---
     if flood_week == 0:
@@ -11542,6 +12224,36 @@ async def manage_account(callback: CallbackQuery):
             ai_line += f" — <i>{escape(ai_preview)}…</i>"
     else:
         ai_line = "не настроен"
+
+    # --- Автопроверка ограничений ---
+    if spam_row:
+        spam_data = dict(spam_row)
+        if spam_data.get('is_enabled'):
+            spam_status = SPAM_BLOCK_STATUS_LABELS.get(
+                spam_data.get('last_status'), 'ещё не проверялось'
+            )
+            notify_state = 'уведомления вкл.' if spam_data.get('notify_enabled') else 'уведомления выкл.'
+            spam_line = f"{spam_status} ({notify_state})"
+        else:
+            spam_line = 'автопроверка выключена'
+    else:
+        spam_line = 'включена, первая проверка ожидается'
+
+    # --- Текущий FloodWait cooldown ---
+    if cooldown_row:
+        cooldown_data = dict(cooldown_row)
+        action_label = (
+            'создание каналов/групп'
+            if cooldown_data.get('action') == CHAT_CREATION_FLOOD_ACTION
+            else str(cooldown_data.get('action') or 'действие')
+        )
+        remaining = cooldown_remaining_seconds(cooldown_data['cooldown_until'])
+        cooldown_line = (
+            f"{action_label}: ещё {remaining} сек. "
+            f"(до {_format_msk_datetime(cooldown_data['cooldown_until'], '—')})"
+        )
+    else:
+        cooldown_line = 'нет активных ограничений'
 
     # --- Последнее действие ---
     if last_log:
@@ -11579,6 +12291,8 @@ async def manage_account(callback: CallbackQuery):
         f"{status_icon} Статус: <b>{'Активен' if account['is_active'] else 'Неактивен'}</b>\n"
         f"{premium_badge}"
         f"{emoji('CHECK')} Проверка: <b>{validation_str}</b> (последняя: {last_check_str})\n"
+        f"{emoji('BELL')} Спамблок: <b>{escape(spam_line)}</b>\n"
+        f"{emoji('CLOCK')} FloodWait: <b>{escape(cooldown_line)}</b>\n"
         f"{emoji('CLOCK')} Добавлен: <b>{account['created_at'].strftime('%d.%m.%Y %H:%M')}</b>\n\n"
         f"{emoji('LINK')} Прокси: {proxy_line}{proxy_status_badge}\n"
         f"{emoji('PHONE')} Отпечаток: {fp_line}\n\n"
@@ -14924,7 +15638,9 @@ async def autosub_worker(account_id: int, user_id: int):
                 await add_account_log(account_id, url, 0, 'autosub_join', text[:100])
             except FloodWaitError as ex:
                 await record_flood_wait(account_id, 0, ex.seconds)
-                await asyncio.sleep(min(ex.seconds, 3600))
+                # Telegram уже дал точный cooldown — не обрезаем его,
+                # иначе следующая попытка снова нарушит ограничение.
+                await asyncio.sleep(ex.seconds + 1)
             except Exception as ex:
                 logger.info('Autosub skipped %s: %s', url, ex)
             await asyncio.sleep(AUTOSUB_DELAY)
@@ -17365,6 +18081,8 @@ async def account_ai_responder_worker(account_id: int, user_id: int):
                 chat_id = event.chat_id
                 try:
                     sender = await event.get_sender()
+                    if (getattr(sender, 'username', None) or '').casefold() == 'spambot':
+                        return
                     sender_name = (
                         getattr(sender, 'first_name', None)
                         or getattr(sender, 'username', None)
@@ -18303,6 +19021,7 @@ async def on_startup():
 
     asyncio.create_task(check_scheduled_broadcasts())
     asyncio.create_task(task_queue_worker())
+    asyncio.create_task(spam_block_check_worker())
 
 async def main():
     # --- Защита от запуска нескольких экземпляров ---
