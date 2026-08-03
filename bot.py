@@ -29,7 +29,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup,
-    InlineKeyboardButton, FSInputFile, BufferedInputFile
+    InlineKeyboardButton, WebAppInfo, FSInputFile, BufferedInputFile
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from telethon import TelegramClient, events, Button
@@ -7039,7 +7039,7 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(
         text="Открыть мини-апп",
-        url="https://vestgamesoft.shop",
+        web_app=WebAppInfo(url="https://vestgamesoft.shop"),
         style='primary',
         icon_custom_emoji_id=get_icon("APPS")
     ))
