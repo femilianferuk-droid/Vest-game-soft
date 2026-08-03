@@ -1,6 +1,8 @@
 import asyncio
 import base64
+import csv
 import hashlib
+import io
 import json
 import logging
 import os
@@ -1149,6 +1151,102 @@ async def init_db():
             )
         except Exception:
             pass
+
+        # Неизменяемый журнал подтверждённых платежей. Он нужен для
+        # финансовой админ-панели: таблицы подписок хранят только последнее
+        # состояние пользователя, а не всю историю оплат.
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS payment_events (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES users(user_id) ON DELETE SET NULL,
+                kind TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                amount_usdt NUMERIC(12, 6),
+                amount_rub NUMERIC(12, 2),
+                status TEXT NOT NULL DEFAULT 'paid',
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMP DEFAULT NOW(),
+                paid_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(provider, external_id)
+            )
+        ''')
+        try:
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_payment_events_paid_at '
+                'ON payment_events (paid_at DESC)'
+            )
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_payment_events_kind_paid_at '
+                'ON payment_events (kind, paid_at DESC)'
+            )
+        except Exception:
+            pass
+
+        # Безопасно переносим уже подтверждённые пополнения баланса из
+        # старой таблицы. Историю Pro без отдельного журнала восстановить
+        # полностью нельзя, поэтому новые оплаты Pro фиксируются в момент
+        # подтверждения ниже.
+        try:
+            await conn.execute(
+                '''INSERT INTO payment_events
+                   (user_id, kind, provider, external_id, amount_usdt,
+                    amount_rub, status, created_at, paid_at)
+                   SELECT bi.user_id,
+                          'wallet_topup',
+                          CASE WHEN NULLIF(bi.sbp_platega_id, '') IS NOT NULL
+                               THEN 'platega' ELSE 'cryptopay' END,
+                          CASE WHEN NULLIF(bi.sbp_platega_id, '') IS NOT NULL
+                               THEN bi.sbp_platega_id ELSE bi.invoice_id::TEXT END,
+                          CASE WHEN NULLIF(bi.sbp_platega_id, '') IS NOT NULL
+                               THEN NULL ELSE bi.amount_usdt END,
+                          CASE WHEN NULLIF(bi.sbp_platega_id, '') IS NOT NULL
+                               THEN COALESCE(
+                                   bi.amount_rub,
+                                   ROUND(bi.amount_usdt * $1::numeric, 2)
+                               )
+                               ELSE NULL END,
+                          'paid', bi.created_at,
+                          COALESCE(bi.paid_at, bi.created_at)
+                   FROM balance_invoices bi
+                   WHERE bi.status = 'paid'
+                   ON CONFLICT (provider, external_id) DO NOTHING''',
+                TOPUP_RUB_PER_USDT
+            )
+        except Exception as ex:
+            logger.warning('Could not backfill payment events: %s', ex)
+
+        # Для активных Pro безопасно переносим последнюю оплату: у такой
+        # записи уже есть подтверждённый внешний ID. Старые истёкшие
+        # подписки без журнала намеренно не угадываем.
+        try:
+            await conn.execute(
+                '''INSERT INTO payment_events
+                   (user_id, kind, provider, external_id, amount_usdt,
+                    amount_rub, status, created_at, paid_at)
+                   SELECT s.user_id,
+                          'pro_subscription',
+                          CASE WHEN NULLIF(s.last_platega_id, '') IS NOT NULL
+                               THEN 'platega' ELSE 'cryptopay' END,
+                          CASE WHEN NULLIF(s.last_platega_id, '') IS NOT NULL
+                               THEN s.last_platega_id ELSE s.last_invoice_id::TEXT END,
+                          CASE WHEN NULLIF(s.last_platega_id, '') IS NOT NULL
+                               THEN NULL ELSE $1::numeric END,
+                          CASE WHEN NULLIF(s.last_platega_id, '') IS NOT NULL
+                               THEN $2::numeric ELSE NULL END,
+                          'paid', s.updated_at, s.updated_at
+                   FROM subscriptions s
+                   WHERE s.tier = 'pro'
+                     AND (
+                         NULLIF(s.last_platega_id, '') IS NOT NULL
+                         OR s.last_invoice_id IS NOT NULL
+                     )
+                   ON CONFLICT (provider, external_id) DO NOTHING''',
+                float(PRO_PRICE_USD),
+                PRO_PRICE_RUB,
+            )
+        except Exception as ex:
+            logger.warning('Could not backfill active Pro payment events: %s', ex)
 
         # ===== Per-account AI-автоответчик (account_ai_responder) =====
         # Живёт на добавленном Telegram-аккаунте, а не в самом боте.
@@ -3479,6 +3577,295 @@ async def get_admin_extended_stats() -> Dict[str, Any]:
             'expiring_soon': int(expiring_soon),
             'new_today': int(new_today),
         }
+
+
+# Константы журнала подтверждённых платежей используются как в платёжных
+# обработчиках, так и в финансовой админ-панели.
+PAYMENT_KIND_WALLET_TOPUP = 'wallet_topup'
+PAYMENT_KIND_PRO_SUBSCRIPTION = 'pro_subscription'
+PAYMENT_PROVIDER_CRYPTOPAY = 'cryptopay'
+PAYMENT_PROVIDER_PLATEGA = 'platega'
+
+ADMIN_FINANCE_PERIODS = {
+    1: '24 часа',
+    7: '7 дней',
+    30: '30 дней',
+    0: 'всё время',
+}
+
+FINANCE_KIND_LABELS = {
+    PAYMENT_KIND_WALLET_TOPUP: 'Пополнения баланса',
+    PAYMENT_KIND_PRO_SUBSCRIPTION: 'Pro-подписки',
+}
+
+FINANCE_PROVIDER_LABELS = {
+    PAYMENT_PROVIDER_CRYPTOPAY: 'Crypto Pay',
+    PAYMENT_PROVIDER_PLATEGA: 'СБП / Platega',
+}
+
+
+def normalize_admin_finance_period(value: Any) -> int:
+    """Возвращает разрешённый период отчёта; 30 дней — безопасный дефолт."""
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        return 30
+    return days if days in ADMIN_FINANCE_PERIODS else 30
+
+
+def get_admin_finance_since(days: int) -> Optional[datetime]:
+    if days <= 0:
+        return None
+    # В БД используются TIMESTAMP без timezone, поэтому передаём такое же
+    # локальное время МСК, как в остальных финансовых экранах бота.
+    return datetime.now(MSK_TZ).replace(tzinfo=None) - timedelta(days=days)
+
+
+def format_finance_rub(value: Any) -> str:
+    try:
+        amount = float(value or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    return f'{amount:,.2f}'.replace(',', ' ')
+
+
+def format_finance_usdt(value: Any) -> str:
+    try:
+        amount = float(value or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    result = f'{amount:,.6f}'.replace(',', ' ')
+    return result.rstrip('0').rstrip('.') or '0'
+
+
+def format_finance_amounts(amount_rub: Any, amount_usdt: Any) -> str:
+    values = []
+    try:
+        if amount_rub is not None and float(amount_rub) != 0:
+            values.append(f'{format_finance_rub(amount_rub)} ₽')
+    except (TypeError, ValueError):
+        pass
+    try:
+        if amount_usdt is not None and float(amount_usdt) != 0:
+            values.append(f'{format_finance_usdt(amount_usdt)} USDT')
+    except (TypeError, ValueError):
+        pass
+    return ' · '.join(values) if values else '0 ₽'
+
+
+async def get_admin_finance_stats(days: int = 30) -> Dict[str, Any]:
+    """Сводка подтверждённых платежей за выбранный период."""
+    days = normalize_admin_finance_period(days)
+    since = get_admin_finance_since(days)
+    where = "p.status = 'paid'"
+    params: List[Any] = []
+    if since is not None:
+        params.append(since)
+        where += f' AND p.paid_at >= ${len(params)}'
+
+    async with db_pool.acquire() as conn:
+        totals = await conn.fetchrow(
+            f'''SELECT
+                    COUNT(*) AS payment_count,
+                    COALESCE(SUM(p.amount_rub), 0) AS rub_total,
+                    COALESCE(SUM(p.amount_usdt), 0) AS usdt_total,
+                    COUNT(*) FILTER (
+                        WHERE p.kind = '{PAYMENT_KIND_WALLET_TOPUP}'
+                    ) AS topup_count,
+                    COALESCE(SUM(p.amount_rub) FILTER (
+                        WHERE p.kind = '{PAYMENT_KIND_WALLET_TOPUP}'
+                    ), 0) AS topup_rub,
+                    COALESCE(SUM(p.amount_usdt) FILTER (
+                        WHERE p.kind = '{PAYMENT_KIND_WALLET_TOPUP}'
+                    ), 0) AS topup_usdt,
+                    COUNT(*) FILTER (
+                        WHERE p.kind = '{PAYMENT_KIND_PRO_SUBSCRIPTION}'
+                    ) AS pro_count,
+                    COALESCE(SUM(p.amount_rub) FILTER (
+                        WHERE p.kind = '{PAYMENT_KIND_PRO_SUBSCRIPTION}'
+                    ), 0) AS pro_rub,
+                    COALESCE(SUM(p.amount_usdt) FILTER (
+                        WHERE p.kind = '{PAYMENT_KIND_PRO_SUBSCRIPTION}'
+                    ), 0) AS pro_usdt
+                FROM payment_events p
+                WHERE {where}''',
+            *params,
+        )
+        provider_rows = await conn.fetch(
+            f'''SELECT p.provider,
+                       COUNT(*) AS payment_count,
+                       COALESCE(SUM(p.amount_rub), 0) AS rub_total,
+                       COALESCE(SUM(p.amount_usdt), 0) AS usdt_total
+                FROM payment_events p
+                WHERE {where}
+                GROUP BY p.provider
+                ORDER BY payment_count DESC, p.provider''',
+            *params,
+        )
+        wallet_balance = await conn.fetchval(
+            'SELECT COALESCE(SUM(balance), 0) FROM users'
+        )
+        active_topups_24h = await conn.fetchval(
+            "SELECT COUNT(*) FROM balance_invoices "
+            "WHERE status = 'active' AND created_at >= $1",
+            get_admin_finance_since(1),
+        )
+        active_pro = await conn.fetchval(
+            "SELECT COUNT(*) FROM subscriptions "
+            "WHERE tier = 'pro' AND (expires_at IS NULL OR expires_at > $1)",
+            datetime.now(MSK_TZ).replace(tzinfo=None),
+        )
+
+    result = dict(totals or {})
+    result.update({
+        'period_days': days,
+        'provider_rows': [dict(row) for row in provider_rows],
+        'wallet_balance': wallet_balance or 0,
+        'active_topups_24h': int(active_topups_24h or 0),
+        'active_pro': int(active_pro or 0),
+    })
+    return result
+
+
+async def get_admin_payment_events(
+    days: int = 30, limit: int = 15,
+) -> List[Dict[str, Any]]:
+    """Возвращает последние подтверждённые платежи для списка и CSV."""
+    days = normalize_admin_finance_period(days)
+    limit = max(1, min(int(limit), 10_000))
+    since = get_admin_finance_since(days)
+    where = "p.status = 'paid'"
+    params: List[Any] = []
+    if since is not None:
+        params.append(since)
+        where += f' AND p.paid_at >= ${len(params)}'
+    params.append(limit)
+    limit_arg = len(params)
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            f'''SELECT p.id, p.user_id, p.kind, p.provider, p.external_id,
+                       p.amount_rub, p.amount_usdt, p.paid_at,
+                       u.username, u.first_name
+                FROM payment_events p
+                LEFT JOIN users u ON u.user_id = p.user_id
+                WHERE {where}
+                ORDER BY p.paid_at DESC, p.id DESC
+                LIMIT ${limit_arg}''',
+            *params,
+        )
+    return [dict(row) for row in rows]
+
+
+def build_admin_finance_keyboard(days: int) -> InlineKeyboardMarkup:
+    days = normalize_admin_finance_period(days)
+    builder = InlineKeyboardBuilder()
+    period_buttons = []
+    for period, label in ((1, '24 ч'), (7, '7 дн.'), (30, '30 дн.')):
+        period_buttons.append(InlineKeyboardButton(
+            text=label,
+            callback_data=f'admin_finance:{period}',
+            style='success' if days == period else 'default',
+            icon_custom_emoji_id=get_icon('CALENDAR'),
+        ))
+    builder.row(*period_buttons)
+    builder.row(InlineKeyboardButton(
+        text='Всё время',
+        callback_data='admin_finance:0',
+        style='success' if days == 0 else 'default',
+        icon_custom_emoji_id=get_icon('TIME_PAST'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Последние платежи',
+        callback_data=f'admin_finance_recent:{days}',
+        style='primary',
+        icon_custom_emoji_id=get_icon('MONEY_SEND'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Скачать CSV',
+        callback_data=f'admin_finance_export:{days}',
+        style='default',
+        icon_custom_emoji_id=get_icon('FILE'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='В админ-панель',
+        callback_data='admin_refresh_stats',
+        style='default',
+        icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    return builder.as_markup()
+
+
+async def render_admin_finance(days: int = 30) -> Tuple[str, InlineKeyboardMarkup]:
+    """Строит экран финансовой сводки и соответствующую клавиатуру."""
+    stats = await get_admin_finance_stats(days)
+    days = stats['period_days']
+    provider_lines = []
+    for row in stats['provider_rows']:
+        provider = FINANCE_PROVIDER_LABELS.get(row['provider'], row['provider'])
+        provider_lines.append(
+            f"• {escape(str(provider))}: <b>{row['payment_count']}</b> — "
+            f"{format_finance_amounts(row['rub_total'], row['usdt_total'])}"
+        )
+    if not provider_lines:
+        provider_lines.append('• Подтверждённых платежей пока нет')
+
+    text = (
+        f"{emoji('CHART')} <b>Финансы и платежи</b>\n\n"
+        f"Период: <b>{ADMIN_FINANCE_PERIODS[days]}</b>\n\n"
+        f"{emoji('MONEY_SEND')} <b>Выручка</b>\n"
+        f"Подтверждённых платежей: <b>{stats.get('payment_count', 0)}</b>\n"
+        f"Рубли (СБП): <b>{format_finance_rub(stats.get('rub_total'))} ₽</b>\n"
+        f"USDT (Crypto Pay): <b>{format_finance_usdt(stats.get('usdt_total'))} USDT</b>\n\n"
+        f"<b>По продуктам</b>\n"
+        f"• Пополнения баланса: <b>{stats.get('topup_count', 0)}</b> — "
+        f"{format_finance_amounts(stats.get('topup_rub'), stats.get('topup_usdt'))}\n"
+        f"• Pro-подписки: <b>{stats.get('pro_count', 0)}</b> — "
+        f"{format_finance_amounts(stats.get('pro_rub'), stats.get('pro_usdt'))}\n\n"
+        f"<b>По способу оплаты</b>\n"
+        + '\n'.join(provider_lines)
+        + f"\n\n{emoji('MONEY_SEND')} "
+        f"Баланс пользователей: <b>{format_finance_rub(stats['wallet_balance'])} ₽</b>\n"
+        f"{emoji('STAR')} Активных Pro: <b>{stats['active_pro']}</b>\n"
+        f"{emoji('CLOCK')} Незакрытых пополнений за 24 ч: "
+        f"<b>{stats['active_topups_24h']}</b>\n\n"
+        f"<i>В отчёт попадают только подтверждённые платежи.</i>"
+    )
+    return text, build_admin_finance_keyboard(days)
+
+
+def finance_csv_cell(value: Any) -> str:
+    """Защищает CSV от формул из пользовательских username/имён."""
+    text = '' if value is None else str(value)
+    return f"'{text}" if text.startswith(('=', '+', '-', '@')) else text
+
+
+def build_admin_finance_csv(rows: List[Dict[str, Any]]) -> bytes:
+    output = io.StringIO(newline='')
+    writer = csv.writer(output, delimiter=';')
+    writer.writerow([
+        'Дата оплаты', 'Тип', 'Провайдер', 'Сумма, ₽', 'Сумма, USDT',
+        'Telegram ID', 'Username', 'Имя', 'Внешний ID',
+    ])
+    for row in rows:
+        paid_at = row.get('paid_at')
+        paid_at_text = (
+            paid_at.strftime('%Y-%m-%d %H:%M:%S')
+            if hasattr(paid_at, 'strftime') else str(paid_at or '')
+        )
+        writer.writerow([
+            paid_at_text,
+            FINANCE_KIND_LABELS.get(row.get('kind'), row.get('kind') or ''),
+            FINANCE_PROVIDER_LABELS.get(row.get('provider'), row.get('provider') or ''),
+            format_finance_rub(row.get('amount_rub')) if row.get('amount_rub') is not None else '',
+            format_finance_usdt(row.get('amount_usdt')) if row.get('amount_usdt') is not None else '',
+            finance_csv_cell(row.get('user_id')),
+            finance_csv_cell(row.get('username')),
+            finance_csv_cell(row.get('first_name')),
+            finance_csv_cell(row.get('external_id')),
+        ])
+    # BOM помогает Excel на Windows корректно определить UTF-8 и кириллицу.
+    return ('\ufeff' + output.getvalue()).encode('utf-8')
 
 
 async def get_users_page(offset: int, limit: int) -> Dict[str, Any]:
@@ -6090,6 +6477,48 @@ PRO_PRICE_LABEL = "40₽ / месяц"
 PRO_DURATION_DAYS = 30
 
 
+async def record_payment_event(
+    user_id: int,
+    kind: str,
+    provider: str,
+    external_id: Any,
+    *,
+    amount_usdt: Optional[float] = None,
+    amount_rub: Optional[float] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Сохраняет подтверждённый платёж для финансовой админ-панели.
+
+    Пара (provider, external_id) уникальна, поэтому повторная проверка
+    одного и того же счёта не добавит выручку дважды.
+    """
+    event_id = str(external_id or '').strip()
+    if not event_id:
+        logger.warning('Payment event skipped: empty external id (%s)', kind)
+        return False
+    try:
+        async with db_pool.acquire() as conn:
+            result = await conn.execute(
+                '''INSERT INTO payment_events
+                   (user_id, kind, provider, external_id, amount_usdt,
+                    amount_rub, metadata)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                   ON CONFLICT (provider, external_id) DO NOTHING''',
+                user_id,
+                kind,
+                provider,
+                event_id,
+                amount_usdt,
+                amount_rub,
+                json.dumps(metadata or {}, ensure_ascii=False),
+            )
+        return result.endswith(' 1')
+    except Exception as ex:
+        # Ошибка статистики не должна мешать уже подтверждённой оплате.
+        logger.exception('Could not record payment event %s/%s: %s', provider, event_id, ex)
+        return False
+
+
 async def get_subscription(user_id: int) -> Dict[str, Any]:
     """Возвращает текущую подписку пользователя. Авто-создаёт Free, если нет."""
     async with db_pool.acquire() as conn:
@@ -6447,8 +6876,17 @@ async def _auto_check_crypto_topup(
                 )
             if claimed:
                 # Баланс хранится в рублях: конвертируем USDT → ₽
-                credited_rub = round(float(claimed['amount_usdt']) * TOPUP_RUB_PER_USDT, 2)
+                paid_usdt = float(claimed['amount_usdt'])
+                credited_rub = round(paid_usdt * TOPUP_RUB_PER_USDT, 2)
                 await add_wallet_balance(user_id, credited_rub)
+                await record_payment_event(
+                    user_id,
+                    PAYMENT_KIND_WALLET_TOPUP,
+                    PAYMENT_PROVIDER_CRYPTOPAY,
+                    invoice_id,
+                    amount_usdt=paid_usdt,
+                    metadata={'credited_rub': credited_rub},
+                )
             balance = await get_wallet_balance(user_id)
             try:
                 await bot.edit_message_text(
@@ -6592,6 +7030,14 @@ async def _auto_check_sbp_topup(
                 # Зачисляем рубли напрямую (баланс хранится в рублях)
                 credited = float(claimed['amount_rub'] or amount_rub)
                 await add_wallet_balance(user_id, credited)
+                await record_payment_event(
+                    user_id,
+                    PAYMENT_KIND_WALLET_TOPUP,
+                    PAYMENT_PROVIDER_PLATEGA,
+                    transaction_id,
+                    amount_rub=credited,
+                    metadata={'credited_rub': credited},
+                )
             balance = await get_wallet_balance(user_id)
             try:
                 await bot.edit_message_text(
@@ -8429,6 +8875,12 @@ async def build_admin_panel() -> tuple:
         icon_custom_emoji_id=get_icon("PEOPLE")
     ))
     builder.row(InlineKeyboardButton(
+        text="Финансы и платежи",
+        callback_data="admin_finance",
+        style='primary',
+        icon_custom_emoji_id=get_icon("CHART")
+    ))
+    builder.row(InlineKeyboardButton(
         text="Подарить подписку",
         callback_data="admin_gift_sub",
         style='default',
@@ -9613,6 +10065,14 @@ async def _auto_check_pro_crypto(
                     invoice_id=invoice_id,
                     invoice_payload=f"pro_30d:{user_id}"
                 )
+                await record_payment_event(
+                    user_id,
+                    PAYMENT_KIND_PRO_SUBSCRIPTION,
+                    PAYMENT_PROVIDER_CRYPTOPAY,
+                    invoice_id,
+                    amount_usdt=float(PRO_PRICE_USD),
+                    metadata={'duration_days': PRO_DURATION_DAYS},
+                )
                 new_sub = await get_subscription(user_id)
                 try:
                     await bot.edit_message_text(
@@ -9666,6 +10126,14 @@ async def _auto_check_pro_sbp(
                 await set_subscription(
                     user_id, "pro", expires,
                     platega_id=transaction_id
+                )
+                await record_payment_event(
+                    user_id,
+                    PAYMENT_KIND_PRO_SUBSCRIPTION,
+                    PAYMENT_PROVIDER_PLATEGA,
+                    transaction_id,
+                    amount_rub=float(PRO_PRICE_RUB),
+                    metadata={'duration_days': PRO_DURATION_DAYS},
                 )
                 new_sub = await get_subscription(user_id)
                 try:
@@ -15525,6 +15993,112 @@ async def admin_refresh_stats(callback: CallbackQuery, state: FSMContext):
     admin_text, markup = await build_admin_panel()
     await callback.message.edit_text(admin_text, reply_markup=markup)
     await callback.answer()
+
+@dp.callback_query(F.data == 'admin_finance')
+async def admin_finance(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    await state.clear()
+    text, markup = await render_admin_finance(30)
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('admin_finance:'))
+async def admin_finance_period(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    period = normalize_admin_finance_period(callback.data.split(':', 1)[1])
+    text, markup = await render_admin_finance(period)
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('admin_finance_recent:'))
+async def admin_finance_recent(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    period = normalize_admin_finance_period(callback.data.split(':', 1)[1])
+    rows = await get_admin_payment_events(period, limit=15)
+    lines = [
+        f"{emoji('MONEY_SEND')} <b>Последние платежи</b>",
+        f"Период: <b>{ADMIN_FINANCE_PERIODS[period]}</b>",
+        '',
+    ]
+    if not rows:
+        lines.append('Подтверждённых платежей за этот период нет.')
+    else:
+        for row in rows:
+            paid_at = row.get('paid_at')
+            date_text = (
+                paid_at.strftime('%d.%m.%Y %H:%M')
+                if hasattr(paid_at, 'strftime') else '—'
+            )
+            kind = FINANCE_KIND_LABELS.get(row.get('kind'), row.get('kind') or 'Платёж')
+            provider = FINANCE_PROVIDER_LABELS.get(
+                row.get('provider'), row.get('provider') or '—'
+            )
+            username = row.get('username')
+            user_label = f'@{username}' if username else 'без username'
+            user_id = row.get('user_id')
+            lines.append(
+                f"<b>{escape(str(kind))}</b> · {escape(str(provider))}\n"
+                f"{format_finance_amounts(row.get('amount_rub'), row.get('amount_usdt'))} · "
+                f"{date_text}\n"
+                f"{escape(user_label)} · <code>{escape(str(user_id or '—'))}</code>"
+            )
+
+    builder = InlineKeyboardBuilder()
+    if rows:
+        builder.row(InlineKeyboardButton(
+            text='Скачать CSV',
+            callback_data=f'admin_finance_export:{period}',
+            style='default',
+            icon_custom_emoji_id=get_icon('FILE'),
+        ))
+    builder.row(InlineKeyboardButton(
+        text='К финансам',
+        callback_data=f'admin_finance:{period}',
+        style='primary',
+        icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    await callback.message.edit_text('\n\n'.join(lines), reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('admin_finance_export:'))
+async def admin_finance_export(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    period = normalize_admin_finance_period(callback.data.split(':', 1)[1])
+    rows = await get_admin_payment_events(period, limit=10_000)
+    if not rows:
+        await callback.answer('За этот период нет платежей для экспорта', show_alert=True)
+        return
+
+    try:
+        period_slug = 'all' if period == 0 else f'{period}d'
+        filename = (
+            f"payments_{period_slug}_"
+            f"{datetime.now(MSK_TZ).strftime('%Y-%m-%d')}.csv"
+        )
+        await callback.message.answer_document(
+            BufferedInputFile(build_admin_finance_csv(rows), filename=filename),
+            caption=(
+                f"{emoji('FILE')} <b>Экспорт платежей</b>\n\n"
+                f"Период: <b>{ADMIN_FINANCE_PERIODS[period]}</b>\n"
+                f"Строк в файле: <b>{len(rows)}</b>"
+            ),
+        )
+        await callback.answer('CSV-файл готов')
+    except Exception as ex:
+        logger.exception('Finance CSV export failed: %s', ex)
+        await callback.answer('Не удалось создать CSV-файл', show_alert=True)
+
 
 @dp.callback_query(F.data == "admin_broadcast_all")
 async def admin_broadcast_all(callback: CallbackQuery, state: FSMContext):
