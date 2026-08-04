@@ -651,7 +651,9 @@ class ScriptStates(StatesGroup):
     waiting_for_name = State()
     choosing_account = State()
     waiting_for_bot_url = State()
+    choosing_captcha = State()
     choosing_button = State()
+    confirming_step = State()
 
 class LLMStates(StatesGroup):
     choosing_model = State()      # выбор модели перед вводом промта
@@ -935,6 +937,8 @@ async def init_db():
                 button_text TEXT NOT NULL,
                 button_kind TEXT NOT NULL,
                 button_snapshot JSONB NOT NULL DEFAULT '[]'::jsonb,
+                steps JSONB NOT NULL DEFAULT '[]'::jsonb,
+                captcha_enabled BOOLEAN NOT NULL DEFAULT FALSE,
                 last_status TEXT NOT NULL DEFAULT 'never',
                 last_error TEXT,
                 last_run_at TIMESTAMP,
@@ -963,6 +967,15 @@ async def init_db():
             await conn.execute(
                 'CREATE INDEX IF NOT EXISTS idx_script_runs_script_started '
                 'ON script_runs (script_id, started_at DESC)'
+            )
+        except Exception:
+            pass
+        try:
+            await conn.execute(
+                "ALTER TABLE user_scripts ADD COLUMN IF NOT EXISTS steps JSONB NOT NULL DEFAULT '[]'::jsonb"
+            )
+            await conn.execute(
+                "ALTER TABLE user_scripts ADD COLUMN IF NOT EXISTS captcha_enabled BOOLEAN NOT NULL DEFAULT FALSE"
             )
         except Exception:
             pass
@@ -4246,27 +4259,31 @@ async def account_dashboard(callback: CallbackQuery):
     await callback.answer()
 
 
-# --- Сохранённые скрипты для Telegram-ботов ---
+# --- Сохранённые маршруты для Telegram-ботов ---
 SCRIPT_ALLOWED_BUTTON_KINDS = {
     'KeyboardButtonCallback',
     'KeyboardButton',
 }
 SCRIPT_BOT_RESPONSE_TIMEOUT = 15.0
+SCRIPT_CAPTCHA_IMAGE_MAX_BYTES = 4 * 1024 * 1024
+SCRIPT_CAPTCHA_MAX_ATTEMPTS = 3
+SCRIPT_TELEGRAM_HOSTS = {'t.me', 'telegram.me', 'telegram.dog'}
+SCRIPT_CAPTCHA_SYSTEM_PROMPT = (
+    'Ты решаешь капчу Telegram-бота. Тебе даны фото, текст сообщения и кнопки. '
+    'Верни только JSON без markdown. Если ответ нужно выбрать кнопкой: '
+    '{"action":"click","button_index":0}. Если нужно отправить текст: '
+    '{"action":"send","answer":"текст"}. Не добавляй пояснений.'
+)
 
 
 def parse_telegram_bot_url(value: str) -> Dict[str, str]:
-    """Разбирает @bot, botname или t.me/bot?start=payload.
-
-    Возвращает bot_username без @ и start_payload. Разрешаем только
-    Telegram-ссылки, чтобы скрипт не мог работать с произвольным URL.
-    """
+    """Разбирает @bot, botname или t.me/bot?start=payload."""
     raw = (value or '').strip()
     if not raw:
         raise ValueError('Укажите ссылку на Telegram-бота')
 
     username = ''
     payload = ''
-
     if raw.startswith('@'):
         username = raw[1:]
     elif re.fullmatch(r'[A-Za-z0-9_]{5,32}', raw):
@@ -4279,17 +4296,11 @@ def parse_telegram_bot_url(value: str) -> Dict[str, str]:
         username = (query.get('domain') or [''])[0]
         payload = (query.get('start') or [''])[0]
     else:
-        candidate = raw
-        if '://' not in candidate:
-            candidate = 'https://' + candidate
+        candidate = raw if '://' in raw else 'https://' + raw
         parsed = urlparse(candidate)
-        host = (parsed.hostname or '').lower()
-        if host.startswith('www.'):
-            host = host[4:]
-        if host not in {'t.me', 'telegram.me', 'telegram.dog'}:
-            raise ValueError(
-                'Разрешены только ссылки t.me, telegram.me или @username'
-            )
+        host = (parsed.hostname or '').lower().removeprefix('www.')
+        if host not in SCRIPT_TELEGRAM_HOSTS:
+            raise ValueError('Разрешены только ссылки t.me, telegram.me или @username')
         parts = [part for part in parsed.path.split('/') if part]
         if not parts:
             raise ValueError('В ссылке отсутствует username бота')
@@ -4297,148 +4308,429 @@ def parse_telegram_bot_url(value: str) -> Dict[str, str]:
         query = parse_qs(parsed.query)
         payload = (query.get('start') or [''])[0]
         if query.get('startapp') and not payload:
-            raise ValueError(
-                'Ссылки startapp открывают Mini App и не поддерживаются '
-                'серверным скриптом'
-            )
+            raise ValueError('Ссылки startapp открывают Mini App и не поддерживаются серверным скриптом')
 
     username = username.strip().lstrip('@')
     if not re.fullmatch(r'[A-Za-z0-9_]{5,32}', username):
         raise ValueError('Некорректный username Telegram-бота')
     if payload:
         payload = payload.strip()
-        if len(payload) > 128 or not re.fullmatch(
-            r'[A-Za-z0-9_-]+', payload
-        ):
+        if len(payload) > 128 or not re.fullmatch(r'[A-Za-z0-9_-]+', payload):
             raise ValueError('Некорректный start-параметр в ссылке')
+    return {'bot_username': username, 'start_payload': payload, 'bot_url': raw}
 
-    return {
-        'bot_username': username,
-        'start_payload': payload,
-        'bot_url': raw,
-    }
+
+def _is_script_channel_url(url: str) -> bool:
+    raw = (url or '').strip()
+    if not raw:
+        return False
+    candidate = raw if '://' in raw else 'https://' + raw
+    parsed = urlparse(candidate)
+    host = (parsed.hostname or '').lower().removeprefix('www.')
+    if host not in SCRIPT_TELEGRAM_HOSTS:
+        return False
+    path = parsed.path.strip('/')
+    return bool(path and not path.startswith('share/'))
 
 
 def extract_script_buttons(message: Any) -> List[Dict[str, Any]]:
-    """Преобразует клавиатуру Telethon в JSON-совместимый снимок."""
+    """Преобразует кнопки Telethon в снимок и отмечает доступное действие."""
     result: List[Dict[str, Any]] = []
     for row_index, row in enumerate(message.buttons or []):
         for col_index, button in enumerate(row):
             raw_button = getattr(button, 'button', None)
             kind = type(raw_button).__name__
-            text = str(getattr(button, 'text', '') or '').strip()
-            url = (
-                getattr(button, 'url', None)
-                or getattr(raw_button, 'url', None)
-                or ''
-            )
+            text = str(getattr(button, 'text', '') or '').strip() or 'Без названия'
+            url = getattr(button, 'url', None) or getattr(raw_button, 'url', None) or ''
+            url = str(url)[:500] if url else ''
+            action = ''
+            if kind in SCRIPT_ALLOWED_BUTTON_KINDS:
+                action = 'click'
+            elif _is_script_channel_url(url):
+                action = 'join_channel'
             result.append({
                 'row': row_index,
                 'col': col_index,
-                'text': text or 'Без названия',
+                'text': text,
                 'kind': kind,
-                'url': str(url)[:500] if url else '',
-                'selectable': kind in SCRIPT_ALLOWED_BUTTON_KINDS,
+                'url': url,
+                'action': action,
+                'selectable': action == 'click',
+                'actionable': bool(action),
             })
     return result
 
 
-async def load_script_bot_menu(
-    account_id: int, bot_url: str
-) -> Dict[str, Any]:
-    """Открывает бота через /start и ждёт свежее сообщение с кнопками."""
-    parsed = parse_telegram_bot_url(bot_url)
-    client = await get_client_for_account(account_id)
-    if not client:
-        raise RuntimeError('Не удалось подключиться к выбранному аккаунту')
+def _script_message_text(message: Any) -> str:
+    return (getattr(message, 'raw_text', None) or getattr(message, 'message', None) or '')[:1500]
 
-    try:
-        entity = await client.get_entity(parsed['bot_username'])
-    except Exception as ex:
-        raise RuntimeError(
-            f"Бот @{parsed['bot_username']} не найден"
-        ) from ex
 
-    if not isinstance(entity, User) or not getattr(entity, 'bot', False):
-        raise ValueError(
-            f"@{parsed['bot_username']} не является Telegram-ботом"
-        )
-
-    before = await client.get_messages(entity, limit=10)
-    before_id = max((int(item.id) for item in before), default=0)
-    before_edits = {
-        int(item.id): getattr(item, 'edit_date', None)
-        for item in before
+def _script_menu_from_message(parsed: Dict[str, str], entity: Any, message: Any) -> Dict[str, Any]:
+    return {
+        **parsed,
+        'entity': entity,
+        'message': message,
+        'message_id': int(message.id),
+        'message_text': _script_message_text(message),
+        'has_photo': bool(getattr(message, 'photo', None)),
+        'buttons': extract_script_buttons(message),
     }
-    command = '/start'
-    if parsed['start_payload']:
-        command += f" {parsed['start_payload']}"
-    await client.send_message(entity, command)
 
+
+async def _get_script_bot_entity(client: TelegramClient, bot_username: str):
+    try:
+        entity = await client.get_entity(bot_username)
+    except Exception as ex:
+        raise RuntimeError(f'Бот @{bot_username} не найден') from ex
+    if not isinstance(entity, User) or not getattr(entity, 'bot', False):
+        raise ValueError(f'@{bot_username} не является Telegram-ботом')
+    return entity
+
+
+async def _script_message_snapshot(client: TelegramClient, entity: Any) -> Tuple[int, Dict[int, Any]]:
+    before = await client.get_messages(entity, limit=15)
+    return (
+        max((int(item.id) for item in before), default=0),
+        {int(item.id): getattr(item, 'edit_date', None) for item in before},
+    )
+
+
+async def _wait_for_script_bot_response(
+    client: TelegramClient,
+    entity: Any,
+    parsed: Dict[str, str],
+    before_id: int,
+    before_edits: Dict[int, Any],
+    *,
+    require_buttons: bool = True,
+) -> Dict[str, Any]:
     deadline = time.monotonic() + SCRIPT_BOT_RESPONSE_TIMEOUT
     latest_response = None
     while time.monotonic() < deadline:
-        messages = await client.get_messages(entity, limit=10)
+        messages = await client.get_messages(entity, limit=15)
         for message in messages:
             message_id = int(message.id)
             was_edited = (
                 message_id in before_edits
                 and getattr(message, 'edit_date', None) is not None
-                and getattr(message, 'edit_date', None)
-                != before_edits[message_id]
+                and getattr(message, 'edit_date', None) != before_edits[message_id]
             )
-            if (
-                message.out
-                or (message_id <= before_id and not was_edited)
-            ):
+            if message.out or (message_id <= before_id and not was_edited):
                 continue
             latest_response = message
-            buttons = extract_script_buttons(message)
-            if buttons:
-                return {
-                    **parsed,
-                    'message': message,
-                    'message_id': int(message.id),
-                    'message_text': (message.raw_text or '')[:1000],
-                    'buttons': buttons,
-                }
+            menu = _script_menu_from_message(parsed, entity, message)
+            if menu['buttons'] or menu['has_photo'] or not require_buttons:
+                return menu
         await asyncio.sleep(0.7)
-
     if latest_response is not None:
-        raise RuntimeError(
-            'Бот ответил, но в новом сообщении нет кнопок'
-        )
-    raise TimeoutError(
-        f"Бот @{parsed['bot_username']} не ответил за "
-        f"{int(SCRIPT_BOT_RESPONSE_TIMEOUT)} секунд"
+        raise RuntimeError('Бот ответил, но в новом сообщении нет кнопок')
+    raise TimeoutError(f"Бот @{parsed['bot_username']} не ответил за {int(SCRIPT_BOT_RESPONSE_TIMEOUT)} секунд")
+
+
+async def load_script_bot_menu(account_id: int, bot_url: str) -> Dict[str, Any]:
+    """Открывает бота через /start и загружает первое актуальное меню."""
+    parsed = parse_telegram_bot_url(bot_url)
+    client = await get_client_for_account(account_id)
+    if not client:
+        raise RuntimeError('Не удалось подключиться к выбранному аккаунту')
+    entity = await _get_script_bot_entity(client, parsed['bot_username'])
+    before_id, before_edits = await _script_message_snapshot(client, entity)
+    command = '/start' + (f" {parsed['start_payload']}" if parsed['start_payload'] else '')
+    await client.send_message(entity, command)
+    return await _wait_for_script_bot_response(
+        client, entity, parsed, before_id, before_edits, require_buttons=True,
     )
+
+
+async def _get_current_script_message(client: TelegramClient, entity: Any, message_id: int):
+    message = await client.get_messages(entity, ids=message_id)
+    if not message:
+        raise RuntimeError('Текущее сообщение бота не найдено; начните маршрут заново')
+    return message
+
+
+def find_script_button(message: Any, step: Dict[str, Any]) -> Any:
+    """Находит кнопку по позиции, а при изменении меню — по уникальному тексту."""
+    row_index = int(step.get('row', -1))
+    col_index = int(step.get('col', -1))
+    expected_text = str(step.get('text') or '')
+    rows = message.buttons or []
+    if 0 <= row_index < len(rows) and 0 <= col_index < len(rows[row_index]):
+        candidate = rows[row_index][col_index]
+        kind = type(getattr(candidate, 'button', None)).__name__
+        text = str(getattr(candidate, 'text', '') or '').strip() or 'Без названия'
+        if kind in SCRIPT_ALLOWED_BUTTON_KINDS and text == expected_text:
+            return candidate
+    matches = []
+    for row in rows:
+        for candidate in row:
+            kind = type(getattr(candidate, 'button', None)).__name__
+            text = str(getattr(candidate, 'text', '') or '').strip() or 'Без названия'
+            if kind in SCRIPT_ALLOWED_BUTTON_KINDS and text == expected_text:
+                matches.append(candidate)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise RuntimeError('Меню изменилось: найдено несколько кнопок с сохранённым текстом')
+    raise RuntimeError('Сохранённая кнопка больше не найдена. Обновите маршрут скрипта')
+
+
+async def _click_script_step(
+    client: TelegramClient,
+    menu: Dict[str, Any],
+    step: Dict[str, Any],
+    *,
+    require_buttons: bool,
+) -> Dict[str, Any]:
+    message = menu['message']
+    before_id, before_edits = await _script_message_snapshot(client, menu['entity'])
+    selected = find_script_button(message, step)
+    await selected.click()
+    return await _wait_for_script_bot_response(
+        client,
+        menu['entity'],
+        menu,
+        before_id,
+        before_edits,
+        require_buttons=require_buttons,
+    )
+
+
+async def _script_join_channel_url(client: TelegramClient, url: str) -> None:
+    parsed = urlparse(url if '://' in url else 'https://' + url)
+    path = parsed.path.strip('/')
+    if not path:
+        raise ValueError('Кнопка не содержит ссылку на канал')
+    try:
+        if path.startswith('+') or path.startswith('joinchat/'):
+            invite_hash = path[1:] if path.startswith('+') else path.split('/', 1)[1]
+            await client(ImportChatInviteRequest(invite_hash))
+        else:
+            username = path.split('/', 1)[0]
+            entity = await client.get_entity('@' + username.lstrip('@'))
+            await client(JoinChannelRequest(entity))
+    except RPCError as ex:
+        code = str(ex).upper()
+        already_joined = (
+            ex.__class__.__name__ == 'UserAlreadyParticipantError'
+            or 'USER_ALREADY_PARTICIPANT' in code
+            or 'ALREADY A PARTICIPANT' in code
+        )
+        if not already_joined:
+            raise RuntimeError(f'Не удалось подписаться по кнопке: {str(ex)[:500]}') from ex
+
+
+def _script_captcha_json(raw: str) -> Dict[str, Any]:
+    text = (raw or '').strip()
+    fence = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.S)
+    if fence:
+        text = fence.group(1)
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+async def _solve_script_photo_captcha(
+    client: TelegramClient,
+    menu: Dict[str, Any],
+    *,
+    require_buttons: bool,
+) -> Dict[str, Any]:
+    message = menu['message']
+    if not getattr(message, 'photo', None):
+        raise RuntimeError('Указана фото-капча, но в сообщении бота нет фото')
+    image = await client.download_media(message, bytes)
+    if not isinstance(image, bytes) or not image:
+        raise RuntimeError('Не удалось скачать фото капчи')
+    if len(image) > SCRIPT_CAPTCHA_IMAGE_MAX_BYTES:
+        raise RuntimeError('Фото капчи слишком большое для AI-анализа')
+
+    buttons = extract_script_buttons(message)
+    buttons_for_ai = [
+        {
+            'index': index,
+            'text': item['text'],
+            'kind': item['kind'],
+            'action': item['action'],
+            'url': item['url'],
+        }
+        for index, item in enumerate(buttons)
+    ]
+    runtime = await get_global_llm_runtime()
+    content = [
+        {
+            'type': 'text',
+            'text': (
+                'Текст/подпись сообщения с капчей:\n'
+                f"{_script_message_text(message) or '—'}\n\n"
+                'Кнопки под сообщением:\n'
+                + json.dumps(buttons_for_ai, ensure_ascii=False)
+            ),
+        },
+        {
+            'type': 'image',
+            'source': {
+                'type': 'base64',
+                'media_type': 'image/jpeg',
+                'data': base64.b64encode(image).decode('ascii'),
+            },
+        },
+    ]
+    try:
+        ai_client = anthropic.AsyncAnthropic(
+            api_key=runtime['api_key'],
+            base_url=runtime['base_url'],
+            timeout=min(LLM_TIMEOUT, 60),
+        )
+        response = await ai_client.messages.create(
+            model=runtime['default_model'],
+            max_tokens=160,
+            system=SCRIPT_CAPTCHA_SYSTEM_PROMPT,
+            messages=[{'role': 'user', 'content': content}],
+        )
+    except anthropic.APIStatusError as ex:
+        raise RuntimeError(f'AI-капча HTTP {ex.status_code}: {str(ex)[:500]}') from ex
+    except anthropic.APIError as ex:
+        raise RuntimeError(f'AI-капча {ex.__class__.__name__}: {str(ex)[:500]}') from ex
+
+    raw_answer = _extract_llm_response_text(response)
+    data = _script_captcha_json(raw_answer)
+    before_id, before_edits = await _script_message_snapshot(client, menu['entity'])
+    action = str(data.get('action') or '').lower()
+    if action == 'click':
+        try:
+            index = int(data.get('button_index'))
+        except (TypeError, ValueError):
+            raise RuntimeError(f'AI-капча не вернула корректный button_index: {raw_answer[:300]}')
+        if not 0 <= index < len(buttons):
+            raise RuntimeError(f'AI-капча выбрала несуществующую кнопку: {index}')
+        step = buttons[index]
+        if step.get('action') != 'click':
+            raise RuntimeError('AI-капча выбрала кнопку, которую нельзя нажать сервером')
+        selected = find_script_button(message, step)
+        await selected.click()
+    elif action == 'send':
+        answer = str(data.get('answer') or '').strip()
+        if not answer:
+            raise RuntimeError(f'AI-капча не вернула текстовый ответ: {raw_answer[:300]}')
+        await client.send_message(menu['entity'], answer[:500])
+    else:
+        raise RuntimeError(f'AI-капча вернула неизвестное действие: {raw_answer[:300]}')
+    return await _wait_for_script_bot_response(
+        client, menu['entity'], menu, before_id, before_edits,
+        require_buttons=require_buttons,
+    )
+
+
+async def _resolve_script_captcha_chain(
+    client: TelegramClient,
+    menu: Dict[str, Any],
+    *,
+    require_buttons: bool,
+) -> Tuple[Dict[str, Any], int]:
+    solved = 0
+    while menu.get('has_photo'):
+        if solved >= SCRIPT_CAPTCHA_MAX_ATTEMPTS:
+            raise RuntimeError('AI не смогла пройти фото-капчу за допустимое число попыток')
+        menu = await _solve_script_photo_captcha(
+            client, menu, require_buttons=require_buttons,
+        )
+        solved += 1
+    return menu, solved
+
+
+def normalize_script_steps(script: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_steps = script.get('steps') or []
+    if isinstance(raw_steps, str):
+        try:
+            raw_steps = json.loads(raw_steps)
+        except Exception:
+            raw_steps = []
+    if not isinstance(raw_steps, list):
+        raw_steps = []
+    steps = []
+    for item in raw_steps:
+        if not isinstance(item, dict):
+            continue
+        action = item.get('action') or ('click' if item.get('kind') in SCRIPT_ALLOWED_BUTTON_KINDS else '')
+        if action not in ('click', 'join_channel'):
+            continue
+        steps.append({
+            'row': int(item.get('row', -1)),
+            'col': int(item.get('col', -1)),
+            'text': str(item.get('text') or 'Без названия'),
+            'kind': str(item.get('kind') or ''),
+            'url': str(item.get('url') or ''),
+            'action': action,
+            'final': bool(item.get('final', False)),
+        })
+    if steps:
+        return steps
+
+    # Обратная совместимость со старыми скриптами с одной кнопкой.
+    legacy = {
+        'row': int(script.get('button_row', -1)),
+        'col': int(script.get('button_col', -1)),
+        'text': str(script.get('button_text') or 'Без названия'),
+        'kind': str(script.get('button_kind') or ''),
+        'url': '',
+        'action': 'click',
+        'final': True,
+    }
+    snapshot = script.get('button_snapshot') or []
+    if isinstance(snapshot, str):
+        try:
+            snapshot = json.loads(snapshot)
+        except Exception:
+            snapshot = []
+    for item in snapshot if isinstance(snapshot, list) else []:
+        if not isinstance(item, dict):
+            continue
+        if int(item.get('row', -2)) == legacy['row'] and int(item.get('col', -2)) == legacy['col']:
+            legacy['url'] = str(item.get('url') or '')
+            if item.get('action') == 'join_channel':
+                legacy['action'] = 'join_channel'
+            break
+    return [legacy] if legacy['text'] else []
+
+
+def script_step_label(step: Dict[str, Any]) -> str:
+    prefix = 'Подписка' if step.get('action') == 'join_channel' else 'Кнопка'
+    return f"{prefix}: {step.get('text') or 'Без названия'}"
 
 
 async def get_user_scripts(user_id: int) -> List[Dict[str, Any]]:
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             '''SELECT s.*, a.phone
-            FROM user_scripts s
-            JOIN accounts a ON a.id = s.account_id
-            WHERE s.user_id = $1
-            ORDER BY s.created_at DESC''',
+               FROM user_scripts s
+               JOIN accounts a ON a.id = s.account_id
+               WHERE s.user_id = $1
+               ORDER BY s.created_at DESC''',
             user_id,
         )
-    return [dict(row) for row in rows]
+    result = [dict(row) for row in rows]
+    for script in result:
+        script['steps'] = normalize_script_steps(script)
+    return result
 
 
-async def get_user_script(
-    script_id: int, user_id: int
-) -> Optional[Dict[str, Any]]:
+async def get_user_script(script_id: int, user_id: int) -> Optional[Dict[str, Any]]:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             '''SELECT s.*, a.phone, a.is_active AS account_is_active
-            FROM user_scripts s
-            JOIN accounts a ON a.id = s.account_id
-            WHERE s.id = $1 AND s.user_id = $2''',
+               FROM user_scripts s
+               JOIN accounts a ON a.id = s.account_id
+               WHERE s.id = $1 AND s.user_id = $2''',
             script_id, user_id,
         )
-    return dict(row) if row else None
+    if not row:
+        return None
+    script = dict(row)
+    script['steps'] = normalize_script_steps(script)
+    return script
 
 
 async def save_user_script(
@@ -4448,49 +4740,56 @@ async def save_user_script(
     bot_url: str,
     bot_username: str,
     start_payload: str,
-    button: Dict[str, Any],
+    steps: List[Dict[str, Any]],
     snapshot: List[Dict[str, Any]],
+    captcha_enabled: bool,
 ) -> int:
+    if not steps:
+        raise ValueError('Маршрут должен содержать хотя бы один шаг')
+    legacy = steps[-1]
     async with db_pool.acquire() as conn:
-        owner = await conn.fetchval(
-            'SELECT user_id FROM accounts WHERE id = $1', account_id
-        )
+        owner = await conn.fetchval('SELECT user_id FROM accounts WHERE id = $1', account_id)
         if owner != user_id:
             raise ValueError('Выбранный аккаунт не найден')
         return int(await conn.fetchval(
             '''INSERT INTO user_scripts
-            (user_id, account_id, name, bot_url, bot_username, start_payload,
-            button_row, button_col, button_text, button_kind, button_snapshot)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)
-            RETURNING id''',
-            user_id, account_id, name, bot_url, bot_username,
-            start_payload or None, int(button['row']), int(button['col']),
-            button['text'], button['kind'],
+               (user_id, account_id, name, bot_url, bot_username, start_payload,
+                button_row, button_col, button_text, button_kind, button_snapshot,
+                steps, captcha_enabled)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13)
+               RETURNING id''',
+            user_id, account_id, name, bot_url, bot_username, start_payload or None,
+            int(legacy['row']), int(legacy['col']), legacy['text'], legacy['kind'],
             json.dumps(snapshot, ensure_ascii=False),
+            json.dumps(steps, ensure_ascii=False), bool(captcha_enabled),
         ))
 
 
-async def update_user_script_button(
+async def update_user_script_route(
     script_id: int,
     user_id: int,
     bot_url: str,
     bot_username: str,
     start_payload: str,
-    button: Dict[str, Any],
+    steps: List[Dict[str, Any]],
     snapshot: List[Dict[str, Any]],
+    captcha_enabled: bool,
 ) -> bool:
+    if not steps:
+        raise ValueError('Маршрут должен содержать хотя бы один шаг')
+    legacy = steps[-1]
     async with db_pool.acquire() as conn:
         result = await conn.execute(
             '''UPDATE user_scripts SET
-            bot_url = $1, bot_username = $2, start_payload = $3,
-            button_row = $4, button_col = $5, button_text = $6,
-            button_kind = $7, button_snapshot = $8::jsonb,
-            updated_at = NOW()
-            WHERE id = $9 AND user_id = $10''',
+               bot_url = $1, bot_username = $2, start_payload = $3,
+               button_row = $4, button_col = $5, button_text = $6,
+               button_kind = $7, button_snapshot = $8::jsonb,
+               steps = $9::jsonb, captcha_enabled = $10, updated_at = NOW()
+               WHERE id = $11 AND user_id = $12''',
             bot_url, bot_username, start_payload or None,
-            int(button['row']), int(button['col']), button['text'],
-            button['kind'], json.dumps(snapshot, ensure_ascii=False),
-            script_id, user_id,
+            int(legacy['row']), int(legacy['col']), legacy['text'], legacy['kind'],
+            json.dumps(snapshot, ensure_ascii=False), json.dumps(steps, ensure_ascii=False),
+            bool(captcha_enabled), script_id, user_id,
         )
     return result.endswith('1')
 
@@ -4498,58 +4797,14 @@ async def update_user_script_button(
 async def delete_user_script(script_id: int, user_id: int) -> bool:
     async with db_pool.acquire() as conn:
         result = await conn.execute(
-            'DELETE FROM user_scripts WHERE id = $1 AND user_id = $2',
-            script_id, user_id,
+            'DELETE FROM user_scripts WHERE id = $1 AND user_id = $2', script_id, user_id,
         )
     script_run_locks.pop(script_id, None)
     return result.endswith('1')
 
 
-def find_script_button(
-    message: Any,
-    row_index: int,
-    col_index: int,
-    expected_text: str,
-) -> Any:
-    """Находит кнопку по позиции; при изменении меню — по точному тексту."""
-    rows = message.buttons or []
-    if 0 <= row_index < len(rows) and 0 <= col_index < len(rows[row_index]):
-        candidate = rows[row_index][col_index]
-        raw = getattr(candidate, 'button', None)
-        kind = type(raw).__name__
-        text = (
-            str(getattr(candidate, 'text', '') or '').strip()
-            or 'Без названия'
-        )
-        if kind in SCRIPT_ALLOWED_BUTTON_KINDS and text == expected_text:
-            return candidate
-
-    matches = []
-    for row in rows:
-        for candidate in row:
-            raw = getattr(candidate, 'button', None)
-            kind = type(raw).__name__
-            text = (
-                str(getattr(candidate, 'text', '') or '').strip()
-                or 'Без названия'
-            )
-            if kind in SCRIPT_ALLOWED_BUTTON_KINDS and text == expected_text:
-                matches.append(candidate)
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        raise RuntimeError(
-            'Меню изменилось: найдено несколько кнопок с сохранённым текстом'
-        )
-    raise RuntimeError(
-        'Сохранённая кнопка больше не найдена. Обновите кнопки скрипта'
-    )
-
-
-async def execute_user_script(
-    script_id: int, user_id: int
-) -> Dict[str, Any]:
-    """Загружает свежее меню бота и нажимает сохранённую кнопку."""
+async def execute_user_script(script_id: int, user_id: int) -> Dict[str, Any]:
+    """Выполняет сохранённый маршрут, загружая меню после каждого шага."""
     lock = script_run_locks.setdefault(script_id, asyncio.Lock())
     if lock.locked():
         raise RuntimeError('Этот скрипт уже выполняется')
@@ -4560,78 +4815,104 @@ async def execute_user_script(
             raise ValueError('Скрипт не найден')
         if not script.get('account_is_active'):
             raise RuntimeError('Выбранный аккаунт отключён')
+        steps = normalize_script_steps(script)
+        if not steps:
+            raise RuntimeError('В маршруте нет шагов')
 
         async with db_pool.acquire() as conn:
             recent = await conn.fetchval(
-                '''SELECT EXTRACT(EPOCH FROM (NOW() - last_run_at))
-                FROM user_scripts WHERE id = $1''',
+                'SELECT EXTRACT(EPOCH FROM (NOW() - last_run_at)) FROM user_scripts WHERE id = $1',
                 script_id,
             )
             if recent is not None and float(recent) < 3:
                 raise RuntimeError('Подождите 3 секунды перед повторным запуском')
             run_id = int(await conn.fetchval(
-                '''INSERT INTO script_runs
-                (script_id, user_id, account_id, status)
-                VALUES ($1,$2,$3,'running') RETURNING id''',
+                '''INSERT INTO script_runs (script_id, user_id, account_id, status)
+                   VALUES ($1,$2,$3,'running') RETURNING id''',
                 script_id, user_id, script['account_id'],
             ))
             await conn.execute(
-                '''UPDATE user_scripts SET last_status = 'running',
-                last_error = NULL, last_run_at = NOW(), updated_at = NOW()
-                WHERE id = $1''',
+                '''UPDATE user_scripts SET last_status = 'running', last_error = NULL,
+                   last_run_at = NOW(), updated_at = NOW() WHERE id = $1''',
                 script_id,
             )
 
+        completed: List[str] = []
+        captcha_solved = 0
         try:
-            menu = await load_script_bot_menu(
-                int(script['account_id']), script['bot_url']
-            )
-            selected = find_script_button(
-                menu['message'],
-                int(script['button_row']),
-                int(script['button_col']),
-                script['button_text'],
-            )
-            await selected.click()
-            await add_account_log(
-                int(script['account_id']),
-                f"@{script['bot_username']}",
-                int(getattr(menu['message'], 'chat_id', 0) or 0),
-                'script',
-                f"Нажата кнопка: {script['button_text']}",
-            )
+            parsed = parse_telegram_bot_url(script['bot_url'])
+            client = await get_client_for_account(int(script['account_id']))
+            if not client:
+                raise RuntimeError('Не удалось подключиться к выбранному аккаунту')
+            menu = await load_script_bot_menu(int(script['account_id']), script['bot_url'])
+            if script.get('captcha_enabled') and menu.get('has_photo'):
+                menu, solved = await _resolve_script_captcha_chain(
+                    client, menu, require_buttons=True,
+                )
+                captcha_solved += solved
+
+            for index, step in enumerate(steps):
+                is_last = index == len(steps) - 1
+                if step['action'] == 'join_channel':
+                    await _script_join_channel_url(client, step.get('url') or '')
+                    completed.append(script_step_label(step))
+                    await add_account_log(
+                        int(script['account_id']), f"@{script['bot_username']}", 0,
+                        'script', f"Подписка по кнопке: {step['text']}",
+                    )
+                    # Главное окружение бота уже открыто: /start повторно не шлём.
+                    continue
+
+                try:
+                    menu = await _click_script_step(
+                        client, menu, step,
+                        require_buttons=(not is_last or bool(script.get('captcha_enabled'))),
+                    )
+                except TimeoutError:
+                    if not is_last:
+                        raise
+                    menu = None
+                completed.append(script_step_label(step))
+                await add_account_log(
+                    int(script['account_id']), f"@{script['bot_username']}",
+                    int(getattr(menu.get('message'), 'chat_id', 0) or 0) if menu else 0,
+                    'script', f"Нажата кнопка: {step['text']}",
+                )
+                if menu and script.get('captcha_enabled') and menu.get('has_photo'):
+                    menu, solved = await _resolve_script_captcha_chain(
+                        client, menu, require_buttons=not is_last,
+                    )
+                    captcha_solved += solved
+
+            clicked_summary = ' → '.join(completed)[:1000]
             async with db_pool.acquire() as conn:
                 await conn.execute(
-                    '''UPDATE script_runs SET status = 'completed',
-                    clicked_button = $1, finished_at = NOW() WHERE id = $2''',
-                    script['button_text'], run_id,
+                    '''UPDATE script_runs SET status = 'completed', clicked_button = $1,
+                       finished_at = NOW() WHERE id = $2''', clicked_summary, run_id,
                 )
                 await conn.execute(
-                    '''UPDATE user_scripts SET last_status = 'completed',
-                    last_error = NULL, updated_at = NOW() WHERE id = $1''',
-                    script_id,
+                    '''UPDATE user_scripts SET last_status = 'completed', last_error = NULL,
+                       updated_at = NOW() WHERE id = $1''', script_id,
                 )
             return {
                 'script_id': script_id,
                 'bot_username': script['bot_username'],
-                'button_text': script['button_text'],
-                'message_id': menu['message_id'],
+                'completed_steps': completed,
+                'captcha_solved': captcha_solved,
+                'message_id': int(menu['message_id']) if menu else None,
             }
         except Exception as ex:
             error = str(ex)[:1000]
             async with db_pool.acquire() as conn:
                 await conn.execute(
-                    '''UPDATE script_runs SET status = 'failed',
-                    error = $1, finished_at = NOW() WHERE id = $2''',
-                    error, run_id,
+                    '''UPDATE script_runs SET status = 'failed', error = $1,
+                       finished_at = NOW() WHERE id = $2''', error, run_id,
                 )
                 await conn.execute(
-                    '''UPDATE user_scripts SET last_status = 'failed',
-                    last_error = $1, updated_at = NOW() WHERE id = $2''',
-                    error, script_id,
+                    '''UPDATE user_scripts SET last_status = 'failed', last_error = $1,
+                       updated_at = NOW() WHERE id = $2''', error, script_id,
                 )
             raise
-
 
 async def get_chats_from_client(
     client: TelegramClient, limit: int = 200
@@ -9796,31 +10077,74 @@ def get_script_accounts_keyboard(
 
 
 def get_script_buttons_keyboard(
-    buttons: List[Dict[str, Any]]
+    buttons: List[Dict[str, Any]], steps_count: int = 0,
 ) -> InlineKeyboardMarkup:
+    """Кнопки текущего экрана бота при построении маршрута скрипта."""
     builder = InlineKeyboardBuilder()
     for button in buttons:
-        selectable = bool(button.get('selectable'))
-        prefix = '✅' if selectable else '🔗'
+        action = button.get('action') or ('click' if button.get('selectable') else '')
+        prefix = '➡' if action == 'click' else ('📢' if action == 'join_channel' else '🔗')
         text = str(button.get('text') or 'Без названия')
         if len(text) > 42:
             text = text[:41] + '…'
-        if selectable:
-            callback_data = (
-                f"script:button:{button['row']}:{button['col']}"
-            )
-        else:
-            callback_data = "script:unsupported"
+        callback_data = (
+            f"script:button:{button['row']}:{button['col']}"
+            if action else 'script:unsupported'
+        )
         builder.row(InlineKeyboardButton(
             text=f"{prefix} {text}",
             callback_data=callback_data,
-            style='primary' if selectable else 'default',
+            style='primary' if action else 'default',
+        ))
+    if steps_count:
+        builder.row(InlineKeyboardButton(
+            text=f"Сохранить маршрут ({steps_count})",
+            callback_data='script:route_done',
+            style='success',
+            icon_custom_emoji_id=get_icon('CHECK'),
         ))
     builder.row(InlineKeyboardButton(
         text="Отмена",
         callback_data="script:cancel",
         style='danger',
         icon_custom_emoji_id=get_icon("CROSS"),
+    ))
+    return builder.as_markup()
+
+
+def get_script_captcha_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text='Да, есть фото-капча', callback_data='script:captcha:yes',
+        style='primary', icon_custom_emoji_id=get_icon('MEDIA'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Нет фото-капчи', callback_data='script:captcha:no',
+        style='default', icon_custom_emoji_id=get_icon('CHECK'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Отмена', callback_data='script:cancel',
+        style='danger', icon_custom_emoji_id=get_icon('CROSS'),
+    ))
+    return builder.as_markup()
+
+
+def get_script_step_confirmation_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text='Нажать и перейти дальше',
+        callback_data='script:step:intermediate',
+        style='primary', icon_custom_emoji_id=get_icon('RIGHT'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Сделать финальным шагом',
+        callback_data='script:step:final',
+        style='success', icon_custom_emoji_id=get_icon('CHECK'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Назад к кнопкам',
+        callback_data='script:step:back',
+        style='default', icon_custom_emoji_id=get_icon('BACK'),
     ))
     return builder.as_markup()
 
@@ -9834,7 +10158,7 @@ def get_script_actions_keyboard(script_id: int) -> InlineKeyboardMarkup:
         icon_custom_emoji_id=get_icon("PLAY"),
     ))
     builder.row(InlineKeyboardButton(
-        text="Обновить кнопки",
+        text="Обновить маршрут",
         callback_data=f"script:refresh:{script_id}",
         style='primary',
         icon_custom_emoji_id=get_icon("REFRESH"),
@@ -9876,6 +10200,13 @@ def format_script_card(script: Dict[str, Any]) -> str:
             f"\n{emoji('CROSS')} Последняя ошибка: "
             f"<code>{escape(str(script['last_error'])[:500])}</code>"
         )
+    steps = normalize_script_steps(script)
+    route_preview = ' → '.join(
+        escape(str(step.get('text') or 'Без названия')) for step in steps
+    ) or '—'
+    if len(route_preview) > 700:
+        route_preview = route_preview[:699] + '…'
+    captcha_label = 'включена' if script.get('captcha_enabled') else 'выключена'
     return (
         f"{emoji('PLAY')} <b>{escape(str(script['name']))}</b>\n\n"
         f"{emoji('PHONE')} Аккаунт: "
@@ -9886,8 +10217,9 @@ def format_script_card(script: Dict[str, Any]) -> str:
         f"<code>{escape(str(script['bot_url']))}</code>\n"
         f"{emoji('KEY')} Start-параметр: "
         f"<code>{escape(str(payload))}</code>\n"
-        f"{emoji('CHECK')} Кнопка: "
-        f"<b>{escape(str(script['button_text']))}</b>\n"
+        f"{emoji('CLIPBOARD')} Шагов маршрута: <b>{len(steps)}</b>\n"
+        f"Маршрут: <i>{route_preview}</i>\n"
+        f"{emoji('MEDIA')} Фото-капча: <b>{captcha_label}</b>\n"
         f"{emoji('INFO')} Статус: <b>{escape(str(status))}</b>\n"
         f"{emoji('CLOCK')} Последний запуск: "
         f"<code>{escape(last_run_text)}</code>"
@@ -11154,9 +11486,10 @@ async def scripts_menu(callback: CallbackQuery, state: FSMContext):
     scripts = await get_user_scripts(callback.from_user.id)
     text = (
         f"{emoji('PLAY')} <b>Скрипты</b>\n\n"
-        "Скрипт открывает указанного Telegram-бота через "
-        "<code>/start</code>, загружает свежее меню и нажимает "
-        "сохранённую кнопку.\n\n"
+        "Скрипт строится как маршрут из нескольких кнопок. После каждого "
+        "перехода загружаются кнопки именно нового раздела бота, а не главное меню.\n\n"
+        "Поддерживаются переходы по кнопкам, подписка по кнопке-ссылке на канал "
+        "и опциональная фото-капча через базовую AI-модель.\n\n"
         f"{emoji('INFO')} Сохранено: <b>{len(scripts)}</b>"
     )
     await callback.message.edit_text(
@@ -11275,169 +11608,292 @@ async def script_process_bot_url(message: Message, state: FSMContext):
             f"{emoji('CROSS')} {escape(str(ex))}\n\n"
             "Отправьте другую ссылку или нажмите «Отмена».",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(
-                    text="Отмена",
-                    callback_data="script:cancel",
-                    style='danger',
-                )
+                InlineKeyboardButton(text="Отмена", callback_data="script:cancel", style='danger')
             ]]),
         )
         return
-
     data = await state.get_data()
-    account_id = data.get('script_account_id')
-    if not account_id:
+    if not data.get('script_account_id'):
         await state.clear()
-        await message.answer(
-            f"{emoji('CROSS')} Аккаунт не выбран. Начните создание заново.",
-            reply_markup=get_functions_keyboard(),
-        )
+        await message.answer(f"{emoji('CROSS')} Аккаунт не выбран. Начните создание заново.")
         return
-
-    progress = await message.answer(
-        f"{emoji('LOADING')} <b>Загружаю кнопки…</b>\n\n"
-        f"Бот: <code>@{escape(parsed['bot_username'])}</code>\n"
-        f"Ожидание ответа — до {int(SCRIPT_BOT_RESPONSE_TIMEOUT)} секунд."
-    )
-    try:
-        menu = await load_script_bot_menu(int(account_id), bot_url)
-    except Exception as ex:
-        logger.exception('Script menu loading failed')
-        await progress.edit_text(
-            f"{emoji('CROSS')} <b>Не удалось загрузить кнопки.</b>\n\n"
-            f"<code>{escape(str(ex)[:700])}</code>\n\n"
-            "Проверьте ссылку и попробуйте снова.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(
-                    text="Отмена",
-                    callback_data="script:cancel",
-                    style='danger',
-                )
-            ]]),
-        )
-        return
-
-    buttons = menu['buttons']
-    selectable_count = sum(
-        1 for button in buttons if button.get('selectable')
-    )
-    if not selectable_count:
-        await progress.edit_text(
-            f"{emoji('CROSS')} <b>Нет доступных для нажатия кнопок.</b>\n\n"
-            "Бот прислал только URL/WebApp-кнопки. Серверный Telegram-"
-            "аккаунт может автоматически нажимать callback- и обычные "
-            "текстовые кнопки.\n\n"
-            "Отправьте другую ссылку.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(
-                    text="Отмена",
-                    callback_data="script:cancel",
-                    style='danger',
-                )
-            ]]),
-        )
-        return
-
     await state.update_data(
-        script_bot_url=menu['bot_url'],
-        script_bot_username=menu['bot_username'],
-        script_start_payload=menu['start_payload'],
+        script_bot_url=parsed['bot_url'],
+        script_bot_username=parsed['bot_username'],
+        script_start_payload=parsed['start_payload'],
+    )
+    await state.set_state(ScriptStates.choosing_captcha)
+    await message.answer(
+        f"{emoji('MEDIA')} <b>Фото-капча</b>\n\n"
+        "Есть ли у этого бота капча с изображением? Если да, при запуске "
+        "скрипта изображение, текст сообщения и кнопки будут переданы "
+        "базовой AI-модели администратора для ответа.",
+        reply_markup=get_script_captcha_keyboard(),
+    )
+
+
+async def _load_script_route_menu(
+    account_id: int, bot_url: str, captcha_enabled: bool,
+) -> Tuple[Dict[str, Any], int]:
+    menu = await load_script_bot_menu(account_id, bot_url)
+    solved = 0
+    if captcha_enabled and menu.get('has_photo'):
+        client = await get_client_for_account(account_id)
+        if not client:
+            raise RuntimeError('Не удалось подключиться к аккаунту')
+        menu, solved = await _resolve_script_captcha_chain(
+            client, menu, require_buttons=True,
+        )
+    return menu, solved
+
+
+async def _render_script_route_menu(
+    target: Message, state: FSMContext, menu: Dict[str, Any],
+) -> None:
+    buttons = menu.get('buttons') or []
+    if not any(item.get('action') for item in buttons):
+        if menu.get('has_photo'):
+            raise RuntimeError(
+                'Бот прислал фото с капчей. Включите опцию «Фото-капча» при создании скрипта'
+            )
+        raise RuntimeError('В текущем сообщении бота нет доступных кнопок')
+    data = await state.get_data()
+    steps = list(data.get('script_steps') or [])
+    route = ' → '.join(escape(str(item.get('text') or '—')) for item in steps) or 'пока пуст'
+    if len(route) > 500:
+        route = route[:499] + '…'
+    await state.update_data(
+        script_current_message_id=int(menu['message_id']),
         script_buttons=buttons,
+        script_current_message_text=menu.get('message_text') or '',
+        script_current_has_photo=bool(menu.get('has_photo')),
     )
     await state.set_state(ScriptStates.choosing_button)
-    response_preview = escape((menu.get('message_text') or '')[:500])
-    preview = (
-        f"\n\n{emoji('CHAT')} Ответ бота:\n<i>{response_preview}</i>"
-        if response_preview else ''
-    )
-    await progress.edit_text(
-        f"{emoji('CHECK')} <b>Кнопки загружены</b>\n\n"
-        "Выберите кнопку, которую должен нажимать скрипт."
-        f"{preview}",
-        reply_markup=get_script_buttons_keyboard(buttons),
+    preview = escape((menu.get('message_text') or '')[:600])
+    photo_note = f"\n{emoji('MEDIA')} В сообщении есть фото." if menu.get('has_photo') else ''
+    await target.edit_text(
+        f"{emoji('CHECK')} <b>Текущий экран бота</b>\n\n"
+        f"Маршрут: <b>{len(steps)} шаг.</b> · <i>{route}</i>\n"
+        f"{emoji('CHAT')} Сообщение: <i>{preview or '—'}</i>"
+        f"{photo_note}\n\n"
+        "Выберите следующую кнопку. Для обычной кнопки можно указать, "
+        "является ли она переходом к следующему экрану или финальным шагом.",
+        reply_markup=get_script_buttons_keyboard(buttons, len(steps)),
     )
 
 
-@dp.callback_query(F.data == "script:unsupported")
+async def _get_current_route_menu(state: FSMContext) -> Tuple[TelegramClient, Dict[str, Any]]:
+    data = await state.get_data()
+    account_id = int(data.get('script_account_id') or 0)
+    if not account_id:
+        raise RuntimeError('Не выбран аккаунт')
+    client = await get_client_for_account(account_id)
+    if not client:
+        raise RuntimeError('Не удалось подключиться к аккаунту')
+    bot_username = str(data.get('script_bot_username') or '')
+    entity = await _get_script_bot_entity(client, bot_username)
+    message = await _get_current_script_message(
+        client, entity, int(data.get('script_current_message_id') or 0),
+    )
+    parsed = {
+        'bot_url': str(data.get('script_bot_url') or ''),
+        'bot_username': bot_username,
+        'start_payload': str(data.get('script_start_payload') or ''),
+    }
+    return client, _script_menu_from_message(parsed, entity, message)
+
+
+@dp.callback_query(F.data.startswith('script:captcha:'), ScriptStates.choosing_captcha)
+async def script_captcha_choice(callback: CallbackQuery, state: FSMContext):
+    choice = callback.data.rsplit(':', 1)[1]
+    if choice not in {'yes', 'no'}:
+        await callback.answer('Некорректный выбор', show_alert=True)
+        return
+    await state.update_data(captcha_enabled=(choice == 'yes'), script_steps=[])
+    data = await state.get_data()
+    await callback.answer('Загружаю меню…')
+    await callback.message.edit_text(
+        f"{emoji('LOADING')} <b>Открываю бота и загружаю маршрут…</b>"
+    )
+    try:
+        menu, solved = await _load_script_route_menu(
+            int(data['script_account_id']), data['script_bot_url'], choice == 'yes',
+        )
+        await _render_script_route_menu(callback.message, state, menu)
+        if solved:
+            await callback.message.answer(
+                f"{emoji('CHECK')} Фото-капча пройдена базовой AI-моделью."
+            )
+    except Exception as ex:
+        logger.exception('Script route menu loading failed')
+        await callback.message.edit_text(
+            f"{emoji('CROSS')} <b>Не удалось открыть маршрут.</b>\n\n"
+            f"<code>{escape(str(ex)[:700])}</code>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text='Отмена', callback_data='script:cancel', style='danger')
+            ]]),
+        )
+
+
+@dp.callback_query(F.data == 'script:unsupported')
 async def script_unsupported_button(callback: CallbackQuery):
     await callback.answer(
-        'URL и WebApp-кнопки нельзя автоматически открыть на сервере',
+        'Эта URL/WebApp-кнопка не ведёт на канал и не может быть шагом серверного скрипта',
         show_alert=True,
     )
 
 
-@dp.callback_query(
-    F.data.startswith("script:button:"),
-    ScriptStates.choosing_button,
-)
-async def script_choose_button(
-    callback: CallbackQuery, state: FSMContext
-):
+@dp.callback_query(F.data.startswith('script:button:'), ScriptStates.choosing_button)
+async def script_choose_button(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split(':')
     try:
-        row_index = int(parts[2])
-        col_index = int(parts[3])
+        row_index, col_index = int(parts[2]), int(parts[3])
     except (IndexError, ValueError):
         await callback.answer('Некорректная кнопка', show_alert=True)
         return
-
     data = await state.get_data()
-    buttons = data.get('script_buttons') or []
     selected = next(
         (
-            button for button in buttons
-            if int(button.get('row', -1)) == row_index
-            and int(button.get('col', -1)) == col_index
+            item for item in (data.get('script_buttons') or [])
+            if int(item.get('row', -1)) == row_index and int(item.get('col', -1)) == col_index
         ),
         None,
     )
-    if not selected or not selected.get('selectable'):
-        await callback.answer(
-            'Эту кнопку нельзя сохранить', show_alert=True
-        )
+    if not selected or not selected.get('action'):
+        await callback.answer('Эту кнопку нельзя добавить в маршрут', show_alert=True)
+        return
+    step = dict(selected)
+    step['final'] = False
+    if step['action'] == 'join_channel':
+        try:
+            client, menu = await _get_current_route_menu(state)
+            await _script_join_channel_url(client, step.get('url') or '')
+            steps = list(data.get('script_steps') or []) + [step]
+            await state.update_data(script_steps=steps)
+            await _render_script_route_menu(callback.message, state, menu)
+            await callback.answer('Подписка выполнена; окружение бота сохранено')
+        except Exception as ex:
+            await callback.answer(f'Не удалось подписаться: {str(ex)[:200]}', show_alert=True)
         return
 
+    await state.update_data(script_pending_step=step)
+    await state.set_state(ScriptStates.confirming_step)
+    await callback.message.edit_text(
+        f"{emoji('KEY')} <b>Выбрана кнопка</b>: <b>{escape(str(step['text']))}</b>\n\n"
+        "Если это переход (например «Профиль») — нажмите «Нажать и перейти дальше». "
+        "Тогда загрузятся кнопки именно из нового раздела.\n\n"
+        "Если действие должно завершать маршрут — выберите финальный шаг.",
+        reply_markup=get_script_step_confirmation_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == 'script:step:intermediate', ScriptStates.confirming_step)
+async def script_step_intermediate(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    step = data.get('script_pending_step') or {}
+    if not step:
+        await callback.answer('Кнопка не выбрана', show_alert=True)
+        return
+    await callback.answer('Нажимаю и загружаю следующий экран…')
+    await callback.message.edit_text(f"{emoji('LOADING')} <b>Перехожу к следующему экрану…</b>")
+    try:
+        client, menu = await _get_current_route_menu(state)
+        next_menu = await _click_script_step(client, menu, step, require_buttons=True)
+        solved = 0
+        if data.get('captcha_enabled') and next_menu.get('has_photo'):
+            next_menu, solved = await _resolve_script_captcha_chain(
+                client, next_menu, require_buttons=True,
+            )
+        steps = list(data.get('script_steps') or []) + [{**step, 'final': False}]
+        await state.update_data(script_steps=steps, script_pending_step=None)
+        await _render_script_route_menu(callback.message, state, next_menu)
+        if solved:
+            await callback.message.answer(f"{emoji('CHECK')} Фото-капча пройдена AI.")
+    except Exception as ex:
+        logger.exception('Script intermediate step failed')
+        await callback.message.edit_text(
+            f"{emoji('CROSS')} <b>Не удалось перейти дальше.</b>\n\n"
+            f"<code>{escape(str(ex)[:700])}</code>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text='Отмена', callback_data='script:cancel', style='danger')
+            ]]),
+        )
+
+
+@dp.callback_query(F.data == 'script:step:final', ScriptStates.confirming_step)
+async def script_step_final(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    step = data.get('script_pending_step') or {}
+    if not step:
+        await callback.answer('Кнопка не выбрана', show_alert=True)
+        return
+    steps = list(data.get('script_steps') or []) + [{**step, 'final': True}]
+    await state.update_data(script_steps=steps, script_pending_step=None)
+    await state.set_state(ScriptStates.choosing_button)
+    route = ' → '.join(escape(str(item.get('text') or '—')) for item in steps)
+    await callback.message.edit_text(
+        f"{emoji('CHECK')} Финальный шаг добавлен.\n\n"
+        f"Маршрут: <i>{route}</i>\n\n"
+        "Нажмите «Сохранить маршрут» или вернитесь к кнопкам, чтобы добавить ещё шаги.",
+        reply_markup=get_script_buttons_keyboard(data.get('script_buttons') or [], len(steps)),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == 'script:step:back', ScriptStates.confirming_step)
+async def script_step_back(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ScriptStates.choosing_button)
+    data = await state.get_data()
+    try:
+        _, menu = await _get_current_route_menu(state)
+        await _render_script_route_menu(callback.message, state, menu)
+    except Exception as ex:
+        await callback.answer(str(ex)[:200], show_alert=True)
+        return
+    await callback.answer()
+
+
+async def _save_script_route(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    steps = list(data.get('script_steps') or [])
+    if not steps:
+        await callback.answer('Добавьте хотя бы один шаг маршрута', show_alert=True)
+        return
     try:
         if data.get('script_mode') == 'edit':
             script_id = int(data['script_id'])
-            updated = await update_user_script_button(
-                script_id=script_id,
-                user_id=callback.from_user.id,
-                bot_url=data['script_bot_url'],
-                bot_username=data['script_bot_username'],
-                start_payload=data.get('script_start_payload') or '',
-                button=selected,
-                snapshot=buttons,
+            updated = await update_user_script_route(
+                script_id, callback.from_user.id,
+                data['script_bot_url'], data['script_bot_username'],
+                data.get('script_start_payload') or '', steps,
+                data.get('script_buttons') or [], bool(data.get('captcha_enabled')),
             )
             if not updated:
                 raise ValueError('Скрипт не найден')
         else:
             script_id = await save_user_script(
-                user_id=callback.from_user.id,
-                account_id=int(data['script_account_id']),
-                name=str(data['script_name']),
-                bot_url=data['script_bot_url'],
-                bot_username=data['script_bot_username'],
-                start_payload=data.get('script_start_payload') or '',
-                button=selected,
-                snapshot=buttons,
+                callback.from_user.id, int(data['script_account_id']), str(data['script_name']),
+                data['script_bot_url'], data['script_bot_username'],
+                data.get('script_start_payload') or '', steps,
+                data.get('script_buttons') or [], bool(data.get('captcha_enabled')),
             )
     except Exception as ex:
-        logger.exception('Script save failed')
-        await callback.answer(
-            f"Ошибка сохранения: {str(ex)[:150]}", show_alert=True
-        )
+        logger.exception('Script route save failed')
+        await callback.answer(f'Ошибка сохранения: {str(ex)[:200]}', show_alert=True)
         return
-
     await state.clear()
     script = await get_user_script(script_id, callback.from_user.id)
     await callback.message.edit_text(
-        f"{emoji('CHECK')} <b>Скрипт сохранён.</b>\n\n"
-        + format_script_card(script),
+        f"{emoji('CHECK')} <b>Маршрут скрипта сохранён.</b>\n\n" + format_script_card(script),
         reply_markup=get_script_actions_keyboard(script_id),
     )
     await callback.answer('Готово')
 
+
+@dp.callback_query(F.data == 'script:route_done', ScriptStates.choosing_button)
+async def script_route_done(callback: CallbackQuery, state: FSMContext):
+    await _save_script_route(callback, state)
 
 @dp.callback_query(F.data.startswith("script:view:"))
 async def script_view(callback: CallbackQuery):
@@ -11470,21 +11926,25 @@ async def script_run(callback: CallbackQuery):
         return
 
     await callback.answer('Запускаю…')
+    steps = normalize_script_steps(script)
     await callback.message.edit_text(
-        f"{emoji('LOADING')} <b>Выполняю скрипт…</b>\n\n"
-        f"Открываю <code>@{escape(script['bot_username'])}</code>, "
-        "загружаю свежее меню и нажимаю кнопку "
-        f"<b>{escape(script['button_text'])}</b>."
+        f"{emoji('LOADING')} <b>Выполняю маршрут скрипта…</b>\n\n"
+        f"Открываю <code>@{escape(script['bot_username'])}</code> и выполняю "
+        f"<b>{len(steps)}</b> шаг(ов) с загрузкой меню после каждого перехода."
     )
     try:
         result = await execute_user_script(
             script_id, callback.from_user.id
         )
         script = await get_user_script(script_id, callback.from_user.id)
+        completed = ' → '.join(escape(str(item)) for item in result.get('completed_steps', [])) or '—'
+        captcha_note = (
+            f"\nФото-капча пройдена: <b>{result.get('captcha_solved', 0)}</b>"
+            if result.get('captcha_solved') else ''
+        )
         await callback.message.edit_text(
             f"{emoji('CHECK')} <b>Скрипт выполнен.</b>\n\n"
-            f"Нажата кнопка: "
-            f"<b>{escape(result['button_text'])}</b>\n\n"
+            f"Маршрут: <i>{completed}</i>{captcha_note}\n\n"
             + format_script_card(script),
             reply_markup=get_script_actions_keyboard(script_id),
         )
@@ -11513,48 +11973,35 @@ async def script_refresh_buttons(
     if not script:
         await callback.answer('Скрипт не найден', show_alert=True)
         return
-
-    await callback.answer('Загружаю кнопки…')
+    await callback.answer('Обновляю маршрут…')
     await callback.message.edit_text(
-        f"{emoji('LOADING')} <b>Обновляю меню…</b>\n\n"
+        f"{emoji('LOADING')} <b>Открываю бота для обновления маршрута…</b>\n\n"
         f"Бот: <code>@{escape(script['bot_username'])}</code>"
     )
-    try:
-        menu = await load_script_bot_menu(
-            int(script['account_id']), script['bot_url']
-        )
-    except Exception as ex:
-        await callback.message.edit_text(
-            f"{emoji('CROSS')} <b>Не удалось загрузить меню.</b>\n\n"
-            f"<code>{escape(str(ex)[:700])}</code>",
-            reply_markup=get_script_actions_keyboard(script_id),
-        )
-        return
-
-    buttons = menu['buttons']
-    if not any(button.get('selectable') for button in buttons):
-        await callback.message.edit_text(
-            f"{emoji('CROSS')} В новом меню нет callback- или "
-            "текстовых кнопок.",
-            reply_markup=get_script_actions_keyboard(script_id),
-        )
-        return
     await state.clear()
     await state.update_data(
         script_mode='edit',
         script_id=script_id,
-        script_bot_url=menu['bot_url'],
-        script_bot_username=menu['bot_username'],
-        script_start_payload=menu['start_payload'],
-        script_buttons=buttons,
+        script_account_id=int(script['account_id']),
+        script_bot_url=script['bot_url'],
+        script_bot_username=script['bot_username'],
+        script_start_payload=script.get('start_payload') or '',
+        captcha_enabled=bool(script.get('captcha_enabled')),
+        script_steps=[],
     )
-    await state.set_state(ScriptStates.choosing_button)
-    await callback.message.edit_text(
-        f"{emoji('CHECK')} <b>Меню обновлено.</b>\n\n"
-        "Выберите новую кнопку для скрипта:",
-        reply_markup=get_script_buttons_keyboard(buttons),
-    )
-
+    try:
+        menu, solved = await _load_script_route_menu(
+            int(script['account_id']), script['bot_url'], bool(script.get('captcha_enabled')),
+        )
+        await _render_script_route_menu(callback.message, state, menu)
+        if solved:
+            await callback.message.answer(f"{emoji('CHECK')} Фото-капча пройдена AI.")
+    except Exception as ex:
+        await callback.message.edit_text(
+            f"{emoji('CROSS')} <b>Не удалось загрузить маршрут.</b>\n\n"
+            f"<code>{escape(str(ex)[:700])}</code>",
+            reply_markup=get_script_actions_keyboard(script_id),
+        )
 
 @dp.callback_query(F.data.startswith("script:delete_ask:"))
 async def script_delete_ask(callback: CallbackQuery):
@@ -11636,7 +12083,7 @@ async def help_handler(callback: CallbackQuery):
         f"{emoji('AI')} <b>Нейрокомментинг</b> — комментарии к новым постам в выбранных каналах.\n"
         f"{emoji('SWEEP')} <b>Удаление сообщений</b> — очистка истории.\n"
         f"{emoji('USERS')} <b>Парсинг чата</b> — сбор пользователей.\n"
-        f"{emoji('PLAY')} <b>Скрипты</b> — запуск бота и нажатие сохранённой кнопки.\n"
+        f"{emoji('PLAY')} <b>Скрипты</b> — маршруты из нескольких кнопок и фото-капча.\n"
         f"{emoji('AI')} <b>AI Генератор</b> — 3 варианта текста на выбор.\n"
         f"{emoji('AI')} <b>Чат с нейросетями</b> — диалог с сохранением контекста.\n\n"
         f"{emoji('SUPPORT')} <b>Поддержка:</b> {SUPPORT_USERNAME}"
@@ -21732,7 +22179,9 @@ async def cmd_cancel_acct_ar(message: Message, state: FSMContext):
         ScriptStates.waiting_for_name.state,
         ScriptStates.choosing_account.state,
         ScriptStates.waiting_for_bot_url.state,
+        ScriptStates.choosing_captcha.state,
         ScriptStates.choosing_button.state,
+        ScriptStates.confirming_step.state,
         AdminLLMConfigStates.waiting_for_name.state,
         AdminLLMConfigStates.waiting_for_base_url.state,
         AdminLLMConfigStates.waiting_for_api_key.state,
