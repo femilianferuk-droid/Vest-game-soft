@@ -943,6 +943,9 @@ async def init_db():
                 button_snapshot JSONB NOT NULL DEFAULT '[]'::jsonb,
                 steps JSONB NOT NULL DEFAULT '[]'::jsonb,
                 captcha_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                is_public BOOLEAN NOT NULL DEFAULT FALSE,
+                published_at TIMESTAMP,
+                public_uses INTEGER NOT NULL DEFAULT 0,
                 last_status TEXT NOT NULL DEFAULT 'never',
                 last_error TEXT,
                 last_run_at TIMESTAMP,
@@ -980,6 +983,19 @@ async def init_db():
             )
             await conn.execute(
                 "ALTER TABLE user_scripts ADD COLUMN IF NOT EXISTS captcha_enabled BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+            await conn.execute(
+                "ALTER TABLE user_scripts ADD COLUMN IF NOT EXISTS is_public BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+            await conn.execute(
+                "ALTER TABLE user_scripts ADD COLUMN IF NOT EXISTS published_at TIMESTAMP"
+            )
+            await conn.execute(
+                "ALTER TABLE user_scripts ADD COLUMN IF NOT EXISTS public_uses INTEGER NOT NULL DEFAULT 0"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_user_scripts_public "
+                "ON user_scripts (is_public, published_at DESC)"
             )
         except Exception:
             pass
@@ -4755,6 +4771,93 @@ async def get_user_script(script_id: int, user_id: int) -> Optional[Dict[str, An
     script = dict(row)
     script['steps'] = normalize_script_steps(script)
     return script
+
+
+async def set_script_public(script_id: int, user_id: int, is_public: bool) -> bool:
+    async with db_pool.acquire() as conn:
+        result = await conn.execute(
+            '''UPDATE user_scripts SET is_public = $1,
+               published_at = CASE WHEN $1 THEN NOW() ELSE NULL END,
+               updated_at = NOW()
+               WHERE id = $2 AND user_id = $3''',
+            is_public, script_id, user_id,
+        )
+    return result.endswith('1')
+
+
+async def get_public_scripts(limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            '''SELECT s.id, s.name, s.bot_url, s.bot_username, s.start_payload,
+                      s.button_row, s.button_col, s.button_text, s.button_kind,
+                      s.button_snapshot, s.steps, s.captcha_enabled, s.public_uses,
+                      s.published_at, u.username, u.first_name
+               FROM user_scripts s
+               JOIN users u ON u.user_id = s.user_id
+               WHERE s.is_public = TRUE
+               ORDER BY s.published_at DESC NULLS LAST, s.id DESC
+               LIMIT $1 OFFSET $2''',
+            max(1, min(int(limit), 50)), max(0, int(offset)),
+        )
+    result = [dict(row) for row in rows]
+    for script in result:
+        script['steps'] = normalize_script_steps(script)
+    return result
+
+
+async def get_public_script(script_id: int) -> Optional[Dict[str, Any]]:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            '''SELECT s.id, s.name, s.bot_url, s.bot_username, s.start_payload,
+                      s.button_row, s.button_col, s.button_text, s.button_kind,
+                      s.button_snapshot, s.steps, s.captcha_enabled, s.public_uses,
+                      s.published_at, u.username, u.first_name
+               FROM user_scripts s
+               JOIN users u ON u.user_id = s.user_id
+               WHERE s.id = $1 AND s.is_public = TRUE''',
+            script_id,
+        )
+    if not row:
+        return None
+    script = dict(row)
+    script['steps'] = normalize_script_steps(script)
+    return script
+
+
+def normalize_script_snapshot(value: Any) -> List[Dict[str, Any]]:
+    snapshot = value or []
+    if isinstance(snapshot, str):
+        try:
+            snapshot = json.loads(snapshot)
+        except Exception:
+            snapshot = []
+    return [dict(item) for item in snapshot if isinstance(item, dict)] if isinstance(snapshot, list) else []
+
+
+async def apply_public_script(
+    public_script_id: int, user_id: int, account_id: int,
+) -> int:
+    public_script = await get_public_script(public_script_id)
+    if not public_script:
+        raise ValueError('Публичный скрипт не найден или снят с публикации')
+    name = f"{public_script['name']} (копия)"[:64]
+    script_id = await save_user_script(
+        user_id=user_id,
+        account_id=account_id,
+        name=name,
+        bot_url=public_script['bot_url'],
+        bot_username=public_script['bot_username'],
+        start_payload=public_script.get('start_payload') or '',
+        steps=public_script['steps'],
+        snapshot=normalize_script_snapshot(public_script.get('button_snapshot')),
+        captcha_enabled=bool(public_script.get('captcha_enabled')),
+    )
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            'UPDATE user_scripts SET public_uses = public_uses + 1 WHERE id = $1',
+            public_script_id,
+        )
+    return script_id
 
 
 async def save_user_script(
@@ -10172,6 +10275,12 @@ def get_scripts_keyboard(
         icon_custom_emoji_id=get_icon("ADD_TEXT"),
     ))
     builder.row(InlineKeyboardButton(
+        text="Публичные скрипты",
+        callback_data="script:public",
+        style='primary',
+        icon_custom_emoji_id=get_icon("GLOBE"),
+    ))
+    builder.row(InlineKeyboardButton(
         text="Назад",
         callback_data="functions",
         style='default',
@@ -10274,7 +10383,7 @@ def get_script_step_confirmation_keyboard() -> InlineKeyboardMarkup:
 
 
 def get_script_actions_keyboard(
-    script_id: int, is_running: bool = False,
+    script_id: int, is_running: bool = False, is_public: bool = False,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     if is_running:
@@ -10296,6 +10405,15 @@ def get_script_actions_keyboard(
         callback_data=f"script:refresh:{script_id}",
         style='primary',
         icon_custom_emoji_id=get_icon("REFRESH"),
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Снять с публикации" if is_public else "Выложить публично",
+        callback_data=(
+            f"script:unpublish:{script_id}" if is_public
+            else f"script:publish:{script_id}"
+        ),
+        style='default',
+        icon_custom_emoji_id=get_icon("GLOBE"),
     ))
     builder.row(InlineKeyboardButton(
         text="Удалить",
@@ -10342,6 +10460,10 @@ def format_script_card(script: Dict[str, Any]) -> str:
     if len(route_preview) > 700:
         route_preview = route_preview[:699] + '…'
     captcha_label = 'включена' if script.get('captcha_enabled') else 'выключена'
+    public_label = (
+        f"опубликован · применений: {script.get('public_uses', 0)}"
+        if script.get('is_public') else 'не опубликован'
+    )
     return (
         f"{emoji('PLAY')} <b>{escape(str(script['name']))}</b>\n\n"
         f"{emoji('PHONE')} Аккаунт: "
@@ -10355,11 +10477,79 @@ def format_script_card(script: Dict[str, Any]) -> str:
         f"{emoji('CLIPBOARD')} Шагов маршрута: <b>{len(steps)}</b>\n"
         f"Маршрут: <i>{route_preview}</i>\n"
         f"{emoji('MEDIA')} Фото-капча: <b>{captcha_label}</b>\n"
+        f"{emoji('GLOBE')} Публичный доступ: <b>{escape(str(public_label))}</b>\n"
         f"{emoji('INFO')} Статус: <b>{escape(str(status))}</b>\n"
         f"{emoji('CLOCK')} Последний запуск: "
         f"<code>{escape(last_run_text)}</code>"
         f"{error_line}"
     )
+
+
+def format_public_script_card(script: Dict[str, Any]) -> str:
+    author = (
+        f"@{script['username']}" if script.get('username')
+        else (script.get('first_name') or 'Автор')
+    )
+    steps = normalize_script_steps(script)
+    route = ' → '.join(escape(str(step.get('text') or '—')) for step in steps) or '—'
+    if len(route) > 700:
+        route = route[:699] + '…'
+    captcha = 'есть' if script.get('captcha_enabled') else 'нет'
+    return (
+        f"{emoji('GLOBE')} <b>{escape(str(script['name']))}</b>\n\n"
+        f"Автор: <b>{escape(str(author))}</b>\n"
+        f"Бот: <code>@{escape(str(script['bot_username']))}</code>\n"
+        f"Шагов: <b>{len(steps)}</b>\n"
+        f"Маршрут: <i>{route}</i>\n"
+        f"Фото-капча: <b>{captcha}</b>\n"
+        f"Применений: <b>{script.get('public_uses', 0)}</b>\n\n"
+        "После применения маршрут будет сохранён у вас. Для запуска выберите свой Telegram-аккаунт."
+    )
+
+
+def get_public_scripts_keyboard(scripts: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for script in scripts:
+        author = f"@{script['username']}" if script.get('username') else (script.get('first_name') or 'Автор')
+        name = str(script.get('name') or 'Без названия')[:42]
+        builder.row(InlineKeyboardButton(
+            text=f"{name} · {str(author)[:16]}",
+            callback_data=f"script:public_view:{script['id']}",
+            style='default', icon_custom_emoji_id=get_icon('GLOBE'),
+        ))
+    builder.row(InlineKeyboardButton(
+        text='К моим скриптам', callback_data='scripts',
+        style='default', icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    return builder.as_markup()
+
+
+def get_public_script_actions_keyboard(script_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text='Применить себе', callback_data=f'script:apply:{script_id}',
+        style='success', icon_custom_emoji_id=get_icon('CHECK'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='К публичным скриптам', callback_data='script:public',
+        style='default', icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    return builder.as_markup()
+
+
+def get_public_script_account_keyboard(public_script_id: int, accounts: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for account in accounts:
+        builder.row(InlineKeyboardButton(
+            text=str(account['phone']),
+            callback_data=f"script:apply_account:{public_script_id}:{account['id']}",
+            style='default', icon_custom_emoji_id=get_icon('PROFILE'),
+        ))
+    builder.row(InlineKeyboardButton(
+        text='Отмена', callback_data=f'script:public_view:{public_script_id}',
+        style='default', icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    return builder.as_markup()
 
 
 def get_help_keyboard() -> InlineKeyboardMarkup:
@@ -10449,6 +10639,34 @@ def get_help_keyboard() -> InlineKeyboardMarkup:
             callback_data="help_ai",
             style='primary',
             icon_custom_emoji_id=get_icon("AI")
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="💬 Чат с ИИ",
+            callback_data="help_ai_chat",
+            style='primary',
+            icon_custom_emoji_id=get_icon("AI")
+        ),
+        InlineKeyboardButton(
+            text="🤖 Нейрокомментинг",
+            callback_data="help_neurocomment",
+            style='primary',
+            icon_custom_emoji_id=get_icon("AI")
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="⭐ Тарифы Free / Pro",
+            callback_data="help_tariffs",
+            style='primary',
+            icon_custom_emoji_id=get_icon("STAR")
+        ),
+        InlineKeyboardButton(
+            text="📊 Мониторинг аккаунтов",
+            callback_data="help_monitoring",
+            style='primary',
+            icon_custom_emoji_id=get_icon("STATS")
         )
     )
     # Документы
@@ -11633,6 +11851,135 @@ async def scripts_menu(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+@dp.callback_query(F.data == 'script:public')
+async def script_public_list(callback: CallbackQuery):
+    scripts = await get_public_scripts(limit=20)
+    if not scripts:
+        await callback.message.edit_text(
+            f"{emoji('INFO')} <b>Публичных скриптов пока нет.</b>\n\n"
+            "Опубликуйте свой скрипт из его карточки — он появится здесь.",
+            reply_markup=get_public_scripts_keyboard([]),
+        )
+        await callback.answer()
+        return
+    await callback.message.edit_text(
+        f"{emoji('GLOBE')} <b>Публичные скрипты</b>\n\n"
+        "Выберите маршрут, чтобы посмотреть детали и применить его к своему аккаунту.",
+        reply_markup=get_public_scripts_keyboard(scripts),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('script:public_view:'))
+async def script_public_view(callback: CallbackQuery):
+    try:
+        script_id = int(callback.data.rsplit(':', 1)[1])
+    except ValueError:
+        await callback.answer('Некорректный скрипт', show_alert=True)
+        return
+    script = await get_public_script(script_id)
+    if not script:
+        await callback.answer('Скрипт снят с публикации или не найден', show_alert=True)
+        return
+    await callback.message.edit_text(
+        format_public_script_card(script),
+        reply_markup=get_public_script_actions_keyboard(script_id),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('script:publish:'))
+async def script_publish(callback: CallbackQuery):
+    try:
+        script_id = int(callback.data.rsplit(':', 1)[1])
+    except ValueError:
+        await callback.answer('Некорректный скрипт', show_alert=True)
+        return
+    if not await set_script_public(script_id, callback.from_user.id, True):
+        await callback.answer('Скрипт не найден', show_alert=True)
+        return
+    script = await get_user_script(script_id, callback.from_user.id)
+    await callback.message.edit_text(
+        f"{emoji('GLOBE')} <b>Скрипт опубликован.</b>\n\n" + format_script_card(script),
+        reply_markup=get_script_actions_keyboard(
+            script_id, script.get('last_status') == 'running', True,
+        ),
+    )
+    await callback.answer('Опубликовано')
+
+
+@dp.callback_query(F.data.startswith('script:unpublish:'))
+async def script_unpublish(callback: CallbackQuery):
+    try:
+        script_id = int(callback.data.rsplit(':', 1)[1])
+    except ValueError:
+        await callback.answer('Некорректный скрипт', show_alert=True)
+        return
+    if not await set_script_public(script_id, callback.from_user.id, False):
+        await callback.answer('Скрипт не найден', show_alert=True)
+        return
+    script = await get_user_script(script_id, callback.from_user.id)
+    await callback.message.edit_text(
+        f"{emoji('CHECK')} Скрипт снят с публикации.\n\n" + format_script_card(script),
+        reply_markup=get_script_actions_keyboard(
+            script_id, script.get('last_status') == 'running', False,
+        ),
+    )
+    await callback.answer('Снято с публикации')
+
+
+@dp.callback_query(F.data.startswith('script:apply:'))
+async def script_apply_public(callback: CallbackQuery):
+    try:
+        public_id = int(callback.data.rsplit(':', 1)[1])
+    except ValueError:
+        await callback.answer('Некорректный скрипт', show_alert=True)
+        return
+    script = await get_public_script(public_id)
+    if not script:
+        await callback.answer('Скрипт снят с публикации или не найден', show_alert=True)
+        return
+    accounts = [
+        item for item in await get_user_accounts(callback.from_user.id)
+        if item.get('is_active')
+    ]
+    if not accounts:
+        await callback.answer('Сначала добавьте активный Telegram-аккаунт', show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"{emoji('PROFILE')} <b>Выберите свой аккаунт для применения скрипта</b>\n\n"
+        "Сессия, номер и другие данные автора не копируются.",
+        reply_markup=get_public_script_account_keyboard(public_id, accounts),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('script:apply_account:'))
+async def script_apply_public_account(callback: CallbackQuery):
+    parts = callback.data.split(':')
+    try:
+        public_id = int(parts[2])
+        account_id = int(parts[3])
+    except (IndexError, ValueError):
+        await callback.answer('Некорректный выбор', show_alert=True)
+        return
+    account = await get_account(account_id)
+    if not account or account.get('user_id') != callback.from_user.id or not account.get('is_active'):
+        await callback.answer('Аккаунт не найден или неактивен', show_alert=True)
+        return
+    try:
+        script_id = await apply_public_script(public_id, callback.from_user.id, account_id)
+    except Exception as ex:
+        await callback.answer(f'Не удалось применить: {str(ex)[:200]}', show_alert=True)
+        return
+    script = await get_user_script(script_id, callback.from_user.id)
+    await callback.message.edit_text(
+        f"{emoji('CHECK')} <b>Скрипт применён к вашему аккаунту.</b>\n\n" + format_script_card(script),
+        reply_markup=get_script_actions_keyboard(script_id, False, False),
+    )
+    await callback.answer('Готово')
+
+
 @dp.callback_query(F.data == "script:create")
 async def script_create_start(callback: CallbackQuery, state: FSMContext):
     accounts = [
@@ -12022,7 +12369,7 @@ async def _save_script_route(callback: CallbackQuery, state: FSMContext) -> None
     await callback.message.edit_text(
         f"{emoji('CHECK')} <b>Маршрут скрипта сохранён.</b>\n\n" + format_script_card(script),
         reply_markup=get_script_actions_keyboard(
-            script_id, script.get('last_status') == 'running'
+            script_id, script.get('last_status') == 'running', bool(script.get('is_public'))
         ),
     )
     await callback.answer('Готово')
@@ -12046,7 +12393,7 @@ async def script_view(callback: CallbackQuery):
     await callback.message.edit_text(
         format_script_card(script),
         reply_markup=get_script_actions_keyboard(
-            script_id, script.get('last_status') == 'running'
+            script_id, script.get('last_status') == 'running', bool(script.get('is_public'))
         ),
     )
     await callback.answer()
@@ -12073,7 +12420,7 @@ async def script_run(callback: CallbackQuery):
         "Каждый цикл начинает маршрут заново, выполняет все шаги и ждёт 5 секунд. "
         "Остановите его кнопкой «Остановить скрипт».\n\n"
         + format_script_card(script),
-        reply_markup=get_script_actions_keyboard(script_id, True),
+        reply_markup=get_script_actions_keyboard(script_id, True, bool(script.get('is_public'))),
     )
     await callback.answer('Запущено')
 
@@ -12092,7 +12439,7 @@ async def script_stop(callback: CallbackQuery):
     await callback.message.edit_text(
         f"{emoji('STOP')} <b>Остановка скрипта запрошена.</b>\n\n"
         + format_script_card(script),
-        reply_markup=get_script_actions_keyboard(script_id, False),
+        reply_markup=get_script_actions_keyboard(script_id, False, bool(script.get('is_public'))),
     )
     await callback.answer('Остановлено')
 
@@ -12139,7 +12486,7 @@ async def script_refresh_buttons(
         await callback.message.edit_text(
             f"{emoji('CROSS')} <b>Не удалось загрузить маршрут.</b>\n\n"
             f"<code>{escape(str(ex)[:700])}</code>",
-            reply_markup=get_script_actions_keyboard(script_id),
+            reply_markup=get_script_actions_keyboard(script_id, False, bool(script.get('is_public'))),
         )
 
 @dp.callback_query(F.data.startswith("script:delete_ask:"))
@@ -12473,25 +12820,23 @@ async def help_parse_handler(callback: CallbackQuery):
 @dp.callback_query(F.data == "help_scripts")
 async def help_scripts_handler(callback: CallbackQuery):
     text = (
-        f"{emoji('PLAY')} <b>Скрипты</b>\n\n"
-        f"<b>Что это:</b> сохранённый сценарий «запустить бота по ссылке → "
-        f"нажать указанную кнопку». Удобно для автоматизации рутины в "
-        f"чужих ботах.\n\n"
-        f"<b>Как запустить:</b>\n"
-        f"1. Главное меню → «Скрипты».\n"
-        f"2. Нажмите «Добавить скрипт».\n"
-        f"3. Укажите:\n"
-        f"   • <b>Имя</b> — любое, для удобства.\n"
-        f"   • <b>URL бота</b> — ссылка вида <code>https://t.me/SomeBot?start=...</code>.\n"
-        f"   • <b>Текст кнопки</b> — точное название кнопки, на которую "
-        f"нажмёт аккаунт.\n"
-        f"4. Сохраните.\n"
-        f"5. В списке скриптов нажмите «▶ Запустить» — аккаунт перейдёт по "
-        f"ссылке и кликнет кнопку.\n\n"
-        f"<b>Советы:</b>\n"
-        f"• Для каждого скрипта можно выбрать конкретный аккаунт.\n"
-        f"• История запусков хранится в карточке скрипта.\n"
-        f"• Не запускайте больше 1–2 скриптов в минуту."
+        f"{emoji('PLAY')} <b>Скрипты и публичные маршруты</b>\n\n"
+        "<b>Личный скрипт</b> — маршрут из нескольких кнопок Telegram-бота. "
+        "Промежуточные шаги реально открывают новые разделы, поэтому после "
+        "«Профиль» загружаются кнопки профиля, а не главное меню.\n\n"
+        "<b>Как создать:</b>\n"
+        "1. Функции → «Скрипты» → «Создать скрипт».\n"
+        "2. Выберите свой аккаунт и ссылку на бота.\n"
+        "3. Укажите, есть ли фото-капча.\n"
+        "4. Для каждой кнопки выберите: перейти дальше или сделать финальным шагом.\n"
+        "5. Сохраните маршрут и запустите его.\n\n"
+        "<b>Публичные скрипты:</b>\n"
+        "• В карточке своего скрипта нажмите «Выложить публично».\n"
+        "• В «Публичных скриптах» можно посмотреть маршруты других пользователей.\n"
+        "• «Применить себе» копирует только маршрут, настройки капчи и ссылку на бота. "
+        "Чужие аккаунты, сессии и номера никогда не копируются.\n\n"
+        "<b>Запуск:</b> скрипт повторяет полный маршрут бесконечно до кнопки «Остановить». "
+        "После подписки по кнопке-каналу сохраняется то же окружение бота, без нового /start."
     )
     await callback.message.edit_text(text, reply_markup=get_help_feature_keyboard())
     await callback.answer()
@@ -12516,6 +12861,78 @@ async def help_ai_handler(callback: CallbackQuery):
         f"целевую аудиторию, ограничение по длине.\n"
         f"• Free: ограниченное число генераций в день. Pro: без лимитов.\n"
         f"• Сгенерированный текст перед отправкой лучше подредактировать."
+    )
+    await callback.message.edit_text(text, reply_markup=get_help_feature_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "help_ai_chat")
+async def help_ai_chat_handler(callback: CallbackQuery):
+    text = (
+        f"{emoji('AI')} <b>Чат с нейросетями</b>\n\n"
+        "Откройте кнопку «Чат с нейросетями» рядом с подпиской, отправьте сообщение "
+        "и продолжайте диалог — последние реплики сохраняются в контексте.\n\n"
+        "• Можно очистить историю диалога отдельной кнопкой.\n"
+        "• Используется выбранная модель и личный API, если он настроен; иначе базовый API.\n"
+        f"• Free: <b>{AI_CHAT_FREE_DAILY_LIMIT}</b> успешных запроса в день.\n"
+        f"• Pro: <b>{AI_CHAT_PRO_DAILY_LIMIT}</b> успешных запросов в день.\n\n"
+        "Если API вернул ошибку или пустой ответ, лимит за такой запрос возвращается."
+    )
+    await callback.message.edit_text(text, reply_markup=get_help_feature_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "help_neurocomment")
+async def help_neurocomment_handler(callback: CallbackQuery):
+    text = (
+        f"{emoji('AI')} <b>Нейрокомментинг</b>\n\n"
+        "Функции → «Нейрокомментинг» → выберите аккаунт и каналы. Можно выбрать "
+        "любое количество каналов из загруженных, но для более безопасной нагрузки "
+        "рекомендуется до 30.\n\n"
+        "<b>Режимы:</b>\n"
+        "• <b>Только ИИ</b> — выберите модель; текст поста передаётся в ИИ, а если текста нет — фото.\n"
+        "• <b>Заготовленные сообщения</b> — добавьте от 1 до 100 вариантов; вариант выбирается случайно.\n\n"
+        "Укажите задержку после выхода поста, затем запустите конфигурацию. "
+        "Работают только новые посты. Комментарии доступны лишь там, где у канала включено обсуждение; "
+        "возможные ошибки видны в карточке конфигурации."
+    )
+    await callback.message.edit_text(text, reply_markup=get_help_feature_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "help_monitoring")
+async def help_monitoring_handler(callback: CallbackQuery):
+    text = (
+        f"{emoji('STATS')} <b>Автоматический мониторинг аккаунтов</b>\n\n"
+        "• Валидность активных Telegram-аккаунтов проверяется примерно раз в час.\n"
+        "• Только подтверждённо отозванная/неавторизованная сессия удаляется из работы; "
+        "временная ошибка сети или прокси не удаляет аккаунт.\n"
+        "• Раз в 7 дней владелец получает AI-анализ логов и FloodWait.\n"
+        "• Проверка ограничений через @SpamBot выполняется раз в 12 часов; уведомления можно выключить в карточке аккаунта.\n"
+        "• Текущие FloodWait и результаты мониторинга отображаются в карточке аккаунта."
+    )
+    await callback.message.edit_text(text, reply_markup=get_help_feature_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "help_tariffs")
+async def help_tariffs_handler(callback: CallbackQuery):
+    text = (
+        f"{emoji('STAR')} <b>Тарифы Free и Pro</b>\n\n"
+        "<b>Free</b>\n"
+        "• Управление аккаунтами, прокси, парсинг, скрипты, нейрокомментинг и основные функции доступны.\n"
+        "• AI-генератор: 1 запрос в день.\n"
+        f"• Чат с нейросетями: {AI_CHAT_FREE_DAILY_LIMIT} успешных запроса в день.\n"
+        f"• Рассылки: до {FREE_BROADCAST_LIMIT_HOURS} часов суммарного времени работы в неделю.\n"
+        "• Базовые AI-функции используют доступную модель/базовый API.\n\n"
+        "<b>Pro</b>\n"
+        "• AI-генератор без дневного лимита.\n"
+        f"• Чат с нейросетями: {AI_CHAT_PRO_DAILY_LIMIT} успешных запросов в день.\n"
+        "• Без лимита по времени рассылок.\n"
+        "• Ручной AI-анализ риска аккаунта.\n"
+        "• AI-автоответчик на аккаунте.\n"
+        "• Приоритетная поддержка и ранний доступ к новым функциям.\n\n"
+        f"Стоимость Pro: <b>{PRO_PRICE_LABEL}</b>."
     )
     await callback.message.edit_text(text, reply_markup=get_help_feature_keyboard())
     await callback.answer()
