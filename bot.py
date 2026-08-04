@@ -144,6 +144,7 @@ GLOBAL_LLM_RUNTIME_READY = False
 # --- Чат с нейросетями ---
 AI_CHAT_FREE_DAILY_LIMIT = 3
 AI_CHAT_PRO_DAILY_LIMIT = 15
+# Admin can override per-user limit via DB column ai_chat_limit_override
 AI_CHAT_HISTORY_MESSAGES_LIMIT = 16  # 8 пар user/assistant
 AI_CHAT_HISTORY_CONTENT_LIMIT = 2000
 AI_CHAT_SYSTEM_PROMPT = (
@@ -6099,6 +6100,17 @@ async def call_llm_api_with_history(
 
 # --- Чат с нейросетями ---
 async def get_ai_chat_limit(user_id: int) -> int:
+    if db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                override = await conn.fetchval(
+                    'SELECT ai_chat_limit_override FROM users WHERE user_id = $1',
+                    user_id,
+                )
+                if override is not None and int(override) > 0:
+                    return int(override)
+        except Exception:
+            pass
     return AI_CHAT_PRO_DAILY_LIMIT if await is_pro(user_id) else AI_CHAT_FREE_DAILY_LIMIT
 
 
