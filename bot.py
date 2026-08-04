@@ -216,6 +216,10 @@ autosub_tasks: Dict[int, asyncio.Task] = {}
 autosub_stop_flags: Dict[int, bool] = {}
 autolike_tasks: Dict[int, asyncio.Task] = {}
 autolike_stop_flags: Dict[int, bool] = {}
+# Нейрокомментинг: один фоновый воркер на сохранённую конфигурацию.
+neurocomment_tasks: Dict[int, asyncio.Task] = {}
+neurocomment_stop_flags: Dict[int, bool] = {}
+neurocomment_event_locks: Dict[int, asyncio.Lock] = {}
 delete_messages_stop_flags: Dict[int, bool] = {}
 script_run_locks: Dict[int, asyncio.Lock] = {}
 # Не допускаем одновременную ручную и плановую проверку одного аккаунта.
@@ -623,6 +627,14 @@ class AutoLikeStates(StatesGroup):
     waiting_for_delay = State()
     preview = State()
 
+class NeuroCommentStates(StatesGroup):
+    waiting_for_account = State()
+    selecting_channels = State()
+    choosing_mode = State()
+    collecting_templates = State()
+    waiting_for_delay = State()
+    preview = State()
+
 class DeleteMessagesStates(StatesGroup):
     waiting_for_account = State()
     selecting_chats = State()
@@ -807,6 +819,39 @@ async def init_db():
             )
         ''')
         
+        # Нейрокомментинг: мониторинг выбранных каналов и публикация
+        # комментариев от выбранного аккаунта.
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS neurocomment_configs (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
+                channel_ids TEXT[] NOT NULL,
+                mode TEXT NOT NULL,
+                message_variants JSONB NOT NULL DEFAULT '[]'::jsonb,
+                delay_seconds INTEGER NOT NULL DEFAULT 60,
+                is_active BOOLEAN NOT NULL DEFAULT FALSE,
+                comments_sent INTEGER NOT NULL DEFAULT 0,
+                errors_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW(),
+                started_at TIMESTAMP,
+                stopped_at TIMESTAMP
+            )
+        ''')
+        try:
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_neurocomment_user_created '
+                'ON neurocomment_configs (user_id, created_at DESC)'
+            )
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_neurocomment_active '
+                'ON neurocomment_configs (is_active, account_id)'
+            )
+        except Exception:
+            pass
+
         # Логи
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS account_logs (
@@ -2506,6 +2551,18 @@ async def shutdown_account_runtime(account_id: int, user_id: int) -> None:
             task = active_broadcasts.pop(int(row['id']), None)
             if task:
                 task.cancel()
+    except Exception:
+        pass
+
+    # Конфигурации нейрокомментинга каскадно удалятся из БД вместе с
+    # аккаунтом, но живые слушатели нужно остановить заранее.
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT id FROM neurocomment_configs WHERE account_id = $1', account_id,
+            )
+        for row in rows:
+            await stop_neurocomment_worker(int(row['id']))
     except Exception:
         pass
 
@@ -7683,6 +7740,356 @@ async def execute_autolike(
     
     return {'liked': liked, 'errors': errors}
 
+
+# ============================================================
+# Нейрокомментинг: мониторинг новых постов в каналах и публикация
+# комментариев от выбранного Telegram-аккаунта.
+# ============================================================
+NEUROCOMMENT_MODE_AI = 'ai'
+NEUROCOMMENT_MODE_TEMPLATES = 'templates'
+NEUROCOMMENT_MAX_TEMPLATE_VARIANTS = 100
+NEUROCOMMENT_IMAGE_MAX_BYTES = 4 * 1024 * 1024
+NEUROCOMMENT_AI_SYSTEM_PROMPT = (
+    'Ты пишешь один естественный, уместный комментарий к посту в Telegram. '
+    'Комментарий должен быть на русском, конкретно относиться к посту, '
+    'быть дружелюбным и не выглядеть как реклама или спам. '
+    'Не используй ссылки, хэштеги, призывы купить что-либо, упоминания бота '
+    'или фразы о том, что ты ИИ. Верни только текст комментария, максимум 500 символов.'
+)
+
+
+async def get_neurocomment_configs(user_id: int) -> List[Dict[str, Any]]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            '''SELECT n.*, a.phone
+               FROM neurocomment_configs n
+               LEFT JOIN accounts a ON a.id = n.account_id
+               WHERE n.user_id = $1
+               ORDER BY n.is_active DESC, n.updated_at DESC, n.id DESC''',
+            user_id,
+        )
+    return [_normalize_neurocomment_config(dict(row)) for row in rows]
+
+
+async def get_neurocomment_config(
+    config_id: int, user_id: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    query = (
+        '''SELECT n.*, a.phone
+           FROM neurocomment_configs n
+           LEFT JOIN accounts a ON a.id = n.account_id
+           WHERE n.id = $1'''
+    )
+    args: List[Any] = [config_id]
+    if user_id is not None:
+        query += ' AND n.user_id = $2'
+        args.append(user_id)
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(query, *args)
+    return _normalize_neurocomment_config(dict(row)) if row else None
+
+
+def _normalize_neurocomment_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    variants = config.get('message_variants') or []
+    if isinstance(variants, str):
+        try:
+            variants = json.loads(variants)
+        except Exception:
+            variants = []
+    if not isinstance(variants, list):
+        variants = []
+    config['message_variants'] = [
+        str(item).strip() for item in variants
+        if isinstance(item, str) and item.strip()
+    ][:NEUROCOMMENT_MAX_TEMPLATE_VARIANTS]
+    config['channel_ids'] = [str(x) for x in (config.get('channel_ids') or [])]
+    return config
+
+
+async def create_neurocomment_config(
+    user_id: int,
+    account_id: int,
+    channel_ids: List[str],
+    mode: str,
+    message_variants: List[str],
+    delay_seconds: int,
+) -> int:
+    if mode not in (NEUROCOMMENT_MODE_AI, NEUROCOMMENT_MODE_TEMPLATES):
+        raise ValueError('Некорректный режим')
+    if not channel_ids:
+        raise ValueError('Нужно выбрать хотя бы один канал')
+    if mode == NEUROCOMMENT_MODE_TEMPLATES and not message_variants:
+        raise ValueError('Нужен хотя бы один шаблон комментария')
+    async with db_pool.acquire() as conn:
+        config_id = await conn.fetchval(
+            '''INSERT INTO neurocomment_configs
+               (user_id, account_id, channel_ids, mode, message_variants, delay_seconds)
+               VALUES ($1, $2, $3::text[], $4, $5::jsonb, $6)
+               RETURNING id''',
+            user_id,
+            account_id,
+            [str(channel_id) for channel_id in channel_ids],
+            mode,
+            json.dumps(message_variants[:NEUROCOMMENT_MAX_TEMPLATE_VARIANTS], ensure_ascii=False),
+            int(delay_seconds),
+        )
+    return int(config_id)
+
+
+async def find_active_neurocomment_for_account(account_id: int) -> Optional[int]:
+    async with db_pool.acquire() as conn:
+        config_id = await conn.fetchval(
+            '''SELECT id FROM neurocomment_configs
+               WHERE account_id = $1 AND is_active = TRUE
+               ORDER BY started_at DESC NULLS LAST, id DESC LIMIT 1''',
+            account_id,
+        )
+    return int(config_id) if config_id is not None else None
+
+
+async def set_neurocomment_active(config_id: int, active: bool, error: str = '') -> None:
+    async with db_pool.acquire() as conn:
+        if active:
+            await conn.execute(
+                '''UPDATE neurocomment_configs
+                   SET is_active = TRUE, started_at = NOW(), stopped_at = NULL,
+                       last_error = NULL, updated_at = NOW()
+                   WHERE id = $1''',
+                config_id,
+            )
+        else:
+            await conn.execute(
+                '''UPDATE neurocomment_configs
+                   SET is_active = FALSE, stopped_at = NOW(),
+                       last_error = NULLIF($2, ''), updated_at = NOW()
+                   WHERE id = $1''',
+                config_id, error[:1000],
+            )
+
+
+async def record_neurocomment_result(
+    config_id: int, success: bool, error: str = '',
+) -> None:
+    async with db_pool.acquire() as conn:
+        if success:
+            await conn.execute(
+                '''UPDATE neurocomment_configs
+                   SET comments_sent = comments_sent + 1, last_error = NULL,
+                       updated_at = NOW() WHERE id = $1''',
+                config_id,
+            )
+        else:
+            await conn.execute(
+                '''UPDATE neurocomment_configs
+                   SET errors_count = errors_count + 1, last_error = $2,
+                       updated_at = NOW() WHERE id = $1''',
+                config_id, error[:1000],
+            )
+
+
+def _neurocomment_channel_peers(channel_ids: List[str]) -> List[Any]:
+    peers: List[Any] = []
+    for channel_id in channel_ids:
+        value = str(channel_id)
+        peers.append(int(value) if value.lstrip('-').isdigit() else value)
+    return peers
+
+
+async def _neurocomment_post_payload(
+    client: TelegramClient, message,
+) -> Tuple[str, Optional[bytes]]:
+    """Возвращает текст поста или изображение, отдавая тексту приоритет."""
+    text = (getattr(message, 'raw_text', None) or getattr(message, 'message', None) or '').strip()
+    if text:
+        return text[:6000], None
+    if getattr(message, 'photo', None):
+        try:
+            image = await client.download_media(message, bytes)
+            if isinstance(image, bytes) and 0 < len(image) <= NEUROCOMMENT_IMAGE_MAX_BYTES:
+                return '', image
+        except Exception as ex:
+            logger.info('Neurocomment could not download post image: %s', ex)
+    return '', None
+
+
+async def generate_neurocomment_ai_reply(
+    user_id: int, post_text: str, image_bytes: Optional[bytes] = None,
+) -> str:
+    model = await get_user_llm_model(user_id)
+    runtime_url, runtime_key, model = await get_user_llm_runtime(user_id, model)
+    instruction = (
+        'Сформируй комментарий к следующему посту. '
+        'Используй только сведения из поста и не повторяй его дословно.\n\n'
+    )
+    if post_text:
+        content: Any = instruction + 'Текст поста:\n' + post_text
+    elif image_bytes:
+        content = [
+            {'type': 'text', 'text': instruction + 'В посте нет текста, проанализируй изображение.'},
+            {
+                'type': 'image',
+                'source': {
+                    'type': 'base64',
+                    'media_type': 'image/jpeg',
+                    'data': base64.b64encode(image_bytes).decode('ascii'),
+                },
+            },
+        ]
+    else:
+        raise ValueError('Пост не содержит текста или доступного изображения')
+
+    client = anthropic.AsyncAnthropic(
+        api_key=runtime_key,
+        base_url=runtime_url,
+        timeout=LLM_TIMEOUT,
+    )
+    try:
+        response = await client.messages.create(
+            model=model,
+            max_tokens=220,
+            system=NEUROCOMMENT_AI_SYSTEM_PROMPT,
+            messages=[{'role': 'user', 'content': content}],
+        )
+    except anthropic.APIStatusError as ex:
+        raise RuntimeError(f'LLM HTTP {ex.status_code}: {str(ex)[:500]}') from ex
+    except anthropic.APIError as ex:
+        raise RuntimeError(f'LLM {ex.__class__.__name__}: {str(ex)[:500]}') from ex
+
+    reply = _extract_llm_response_text(response).strip()
+    if not reply:
+        raise RuntimeError('LLM вернула пустой комментарий')
+    return reply[:500]
+
+
+async def _neurocomment_build_reply(
+    client: TelegramClient, config: Dict[str, Any], event,
+) -> str:
+    if config['mode'] == NEUROCOMMENT_MODE_TEMPLATES:
+        variants = config.get('message_variants') or []
+        if not variants:
+            raise RuntimeError('В конфигурации нет заготовленных комментариев')
+        return random.choice(variants)
+    post_text, image_bytes = await _neurocomment_post_payload(client, event.message)
+    return await generate_neurocomment_ai_reply(
+        int(config['user_id']), post_text, image_bytes,
+    )
+
+
+async def _neurocomment_process_post(
+    client: TelegramClient, config: Dict[str, Any], event,
+) -> None:
+    config_id = int(config['id'])
+    if neurocomment_stop_flags.get(config_id, False):
+        return
+    if getattr(event, 'out', False) or getattr(event.message, 'action', None):
+        return
+    # У событий канала post=True; оставляем None для совместимости с
+    # различными версиями Telethon.
+    if getattr(event.message, 'post', None) is False:
+        return
+
+    delay = max(0, int(config.get('delay_seconds') or 0))
+    if delay:
+        await asyncio.sleep(delay)
+    if neurocomment_stop_flags.get(config_id, False):
+        return
+
+    try:
+        reply = await _neurocomment_build_reply(client, config, event)
+        if neurocomment_stop_flags.get(config_id, False):
+            return
+        await client.send_message(
+            event.chat_id,
+            reply,
+            comment_to=event.message.id,
+            parse_mode=None,
+        )
+        chat_name = getattr(getattr(event, 'chat', None), 'title', None) or str(event.chat_id)
+        await add_account_log(
+            int(config['account_id']), chat_name, int(event.chat_id),
+            'neurocomment', reply[:100],
+        )
+        await record_neurocomment_result(config_id, True)
+    except FloodWaitError as ex:
+        await record_flood_wait(int(config['account_id']), int(event.chat_id), ex.seconds)
+        await record_neurocomment_result(
+            config_id, False, f'FloodWait: {int(ex.seconds)} сек',
+        )
+        # Соблюдаем выданный Telegram cooldown, но не пытаемся повторить
+        # комментарий автоматически, чтобы не отправить дубль.
+        await asyncio.sleep(int(ex.seconds) + 1)
+    except Exception as ex:
+        logger.info('Neurocomment failed for config %s: %s', config_id, ex)
+        await record_neurocomment_result(config_id, False, str(ex))
+
+
+async def neurocomment_worker(config_id: int) -> None:
+    config = await get_neurocomment_config(config_id)
+    if not config or not config.get('is_active'):
+        return
+    client = await get_client_for_account(int(config['account_id']))
+    if not client:
+        await set_neurocomment_active(config_id, False, 'Не удалось подключить аккаунт')
+        return
+
+    peers = _neurocomment_channel_peers(config['channel_ids'])
+    if not peers:
+        await set_neurocomment_active(config_id, False, 'Не выбраны каналы')
+        return
+    neurocomment_stop_flags[config_id] = False
+    event_lock = neurocomment_event_locks.setdefault(config_id, asyncio.Lock())
+
+    @client.on(events.NewMessage(chats=peers, incoming=True))
+    async def handler(event):
+        if neurocomment_stop_flags.get(config_id, False):
+            return
+        async with event_lock:
+            await _neurocomment_process_post(client, config, event)
+
+    worker_error = ''
+    try:
+        while not neurocomment_stop_flags.get(config_id, False) and client.is_connected():
+            await asyncio.sleep(1)
+        if not neurocomment_stop_flags.get(config_id, False) and not client.is_connected():
+            worker_error = 'Соединение аккаунта с Telegram прервано'
+    except asyncio.CancelledError:
+        raise
+    except Exception as ex:
+        worker_error = str(ex)
+        logger.exception('Neurocomment worker %s failed', config_id)
+    finally:
+        try:
+            client.remove_event_handler(handler)
+        except Exception:
+            pass
+        neurocomment_tasks.pop(config_id, None)
+        neurocomment_stop_flags.pop(config_id, None)
+        neurocomment_event_locks.pop(config_id, None)
+        if worker_error:
+            await set_neurocomment_active(config_id, False, worker_error)
+
+
+async def start_neurocomment_worker(config_id: int) -> bool:
+    task = neurocomment_tasks.get(config_id)
+    if task and not task.done():
+        return True
+    config = await get_neurocomment_config(config_id)
+    if not config or not config.get('is_active'):
+        return False
+    neurocomment_stop_flags[config_id] = False
+    task = asyncio.create_task(neurocomment_worker(config_id))
+    neurocomment_tasks[config_id] = task
+    return True
+
+
+async def stop_neurocomment_worker(config_id: int, error: str = '') -> None:
+    neurocomment_stop_flags[config_id] = True
+    task = neurocomment_tasks.get(config_id)
+    if task and not task.done():
+        task.cancel()
+    await set_neurocomment_active(config_id, False, error)
+
+
 # --- Удаление сообщений ---
 async def execute_delete_messages(
     task_id: int, account_id: int, chat_ids: List[str], hours: int
@@ -9288,10 +9695,13 @@ def get_functions_keyboard() -> InlineKeyboardMarkup:
         ),
         (
             button("Авто-лайкинг", "autolike", "LIKE"),
-            button("Удалить сообщения", "delete_messages", "SWEEP"),
+            button("Нейрокомментинг", "neurocomment", "AI"),
         ),
         (
+            button("Удалить сообщения", "delete_messages", "SWEEP"),
             button("Парсинг чата", "parsing", "USERS"),
+        ),
+        (
             button("Скрипты", "scripts", "PLAY"),
         ),
         (
@@ -10106,6 +10516,141 @@ def get_chat_selection_keyboard(
     ))
     
     return builder.as_markup()
+
+
+def get_neurocomment_channel_keyboard(
+    channels: List[Dict[str, Any]], page: int = 0,
+    selected_channels: Optional[List[str]] = None,
+) -> InlineKeyboardMarkup:
+    selected = {str(item) for item in (selected_channels or [])}
+    per_page = 10
+    page = max(0, page)
+    start = page * per_page
+    visible = channels[start:start + per_page]
+    builder = InlineKeyboardBuilder()
+    for channel in visible:
+        channel_id = str(channel['id'])
+        is_selected = channel_id in selected
+        builder.row(InlineKeyboardButton(
+            text=f"{'✓ ' if is_selected else ''}{str(channel.get('name') or 'Без названия')[:36]}",
+            callback_data=f'neurocomm:toggle:{channel_id}',
+            style='success' if is_selected else 'default',
+            icon_custom_emoji_id=get_icon('CHECK') if is_selected else get_icon('GLOBE'),
+        ))
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            text='Назад', callback_data=f'neurocomm:page:{page - 1}',
+            style='default', icon_custom_emoji_id=get_icon('BACK'),
+        ))
+    if start + per_page < len(channels):
+        nav.append(InlineKeyboardButton(
+            text='Вперёд', callback_data=f'neurocomm:page:{page + 1}',
+            style='default', icon_custom_emoji_id=get_icon('CHART_UP'),
+        ))
+    if nav:
+        builder.row(*nav)
+    builder.row(InlineKeyboardButton(
+        text=f'Готово (выбрано: {len(selected)})',
+        callback_data='neurocomm:channels_done',
+        style='success', icon_custom_emoji_id=get_icon('CHECK'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Отмена', callback_data='neurocomm:cancel',
+        style='danger', icon_custom_emoji_id=get_icon('CROSS'),
+    ))
+    return builder.as_markup()
+
+
+def get_neurocomment_mode_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text='Только ИИ', callback_data='neurocomm:mode:ai',
+        style='primary', icon_custom_emoji_id=get_icon('AI'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Заготовленные сообщения', callback_data='neurocomm:mode:templates',
+        style='default', icon_custom_emoji_id=get_icon('CLIPBOARD'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Отмена', callback_data='neurocomm:cancel',
+        style='danger', icon_custom_emoji_id=get_icon('CROSS'),
+    ))
+    return builder.as_markup()
+
+
+def get_neurocomment_templates_keyboard(count: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text=f'Готово ({count})', callback_data='neurocomm:templates_done',
+        style='success', icon_custom_emoji_id=get_icon('CHECK'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Отмена', callback_data='neurocomm:cancel',
+        style='danger', icon_custom_emoji_id=get_icon('CROSS'),
+    ))
+    return builder.as_markup()
+
+
+def get_neurocomment_preview_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text='Запустить нейрокомментинг', callback_data='neurocomm:start_new',
+        style='success', icon_custom_emoji_id=get_icon('PLAY'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Отмена', callback_data='neurocomm:cancel',
+        style='danger', icon_custom_emoji_id=get_icon('CROSS'),
+    ))
+    return builder.as_markup()
+
+
+def get_neurocomment_config_keyboard(config: Dict[str, Any]) -> InlineKeyboardMarkup:
+    config_id = int(config['id'])
+    builder = InlineKeyboardBuilder()
+    if config.get('is_active'):
+        builder.row(InlineKeyboardButton(
+            text='Остановить', callback_data=f'neurocomm:stop:{config_id}',
+            style='danger', icon_custom_emoji_id=get_icon('STOP'),
+        ))
+    else:
+        builder.row(InlineKeyboardButton(
+            text='Запустить', callback_data=f'neurocomm:start:{config_id}',
+            style='success', icon_custom_emoji_id=get_icon('PLAY'),
+        ))
+    builder.row(InlineKeyboardButton(
+        text='Удалить конфигурацию', callback_data=f'neurocomm:delete:{config_id}',
+        style='danger', icon_custom_emoji_id=get_icon('DELETE'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='К списку', callback_data='neurocomment',
+        style='default', icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    return builder.as_markup()
+
+
+def format_neurocomment_config(config: Dict[str, Any]) -> str:
+    mode = config.get('mode')
+    mode_label = 'Только ИИ' if mode == NEUROCOMMENT_MODE_AI else 'Заготовленные сообщения'
+    status = 'Запущен' if config.get('is_active') else 'Остановлен'
+    last_error = (config.get('last_error') or '').strip()
+    error_block = (
+        f"\n\n{emoji('CROSS')} Последняя ошибка:\n<code>{escape(last_error[:700])}</code>"
+        if last_error else ''
+    )
+    templates = len(config.get('message_variants') or [])
+    return (
+        f"{emoji('AI')} <b>Нейрокомментинг #{config['id']}</b>\n\n"
+        f"{emoji('PHONE')} Аккаунт: <code>{escape(str(config.get('phone') or config.get('account_id')))}</code>\n"
+        f"{emoji('GLOBE')} Каналов: <b>{len(config.get('channel_ids') or [])}</b>\n"
+        f"{emoji('AI')} Режим: <b>{mode_label}</b>\n"
+        f"{emoji('CLIPBOARD')} Шаблонов: <b>{templates}</b>\n"
+        f"{emoji('CLOCK')} Задержка после поста: <b>{config.get('delay_seconds', 0)} сек.</b>\n"
+        f"{emoji('CHECK')} Отправлено комментариев: <b>{config.get('comments_sent', 0)}</b>\n"
+        f"{emoji('CROSS')} Ошибок: <b>{config.get('errors_count', 0)}</b>\n"
+        f"{emoji('EYE')} Статус: <b>{status}</b>"
+        f"{error_block}"
+    )
 
 # --- Хендлеры команд ---
 @dp.message(Command("start"))
@@ -11043,9 +11588,10 @@ async def help_handler(callback: CallbackQuery):
         f"{emoji('CHAT')} <b>Рассылка в ЛС</b> — личные сообщения пользователям.\n"
         f"{emoji('BELL')} <b>Автоответчик</b> — авто-ответ на ключевые слова или AI.\n"
         f"{emoji('JOIN')} <b>Вступление в чаты</b> — массовое подключение.\n"
-        f"{emoji('LIKE')} <b>Авто-лайкинг</b> — ре��кции на новые сообщения.\n"
+        f"{emoji('LIKE')} <b>Авто-лайкинг</b> — реакции на новые сообщения.\n"
+        f"{emoji('AI')} <b>Нейрокомментинг</b> — комментарии к новым постам в выбранных каналах.\n"
         f"{emoji('SWEEP')} <b>Удаление сообщений</b> — очистка истории.\n"
-        f"{emoji('USERS')} <b>Па��синг чата</b> — сбор пользователей.\n"
+        f"{emoji('USERS')} <b>Парсинг чата</b> — сбор пользователей.\n"
         f"{emoji('PLAY')} <b>Скрипты</b> — запуск бота и нажатие сохранённой кнопки.\n"
         f"{emoji('AI')} <b>AI Генератор</b> — 3 варианта текста на выбор.\n"
         f"{emoji('AI')} <b>Чат с нейросетями</b> — диалог с сохранением контекста.\n\n"
@@ -17574,6 +18120,453 @@ async def delete_responder(callback: CallbackQuery):
         await callback.answer("Автоответчик удален", show_alert=True)
         await my_auto_responders(callback)
 
+# --- Нейрокомментинг ---
+def get_neurocomment_accounts_keyboard(accounts: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for account in accounts:
+        builder.row(InlineKeyboardButton(
+            text=str(account['phone']),
+            callback_data=f"neurocomm:account:{account['id']}",
+            style='default',
+            icon_custom_emoji_id=get_icon('PROFILE'),
+        ))
+    builder.row(InlineKeyboardButton(
+        text='Отмена', callback_data='neurocomm:cancel',
+        style='danger', icon_custom_emoji_id=get_icon('CROSS'),
+    ))
+    return builder.as_markup()
+
+
+async def render_neurocomment_menu(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    configs = await get_neurocomment_configs(user_id)
+    text = (
+        f"{emoji('AI')} <b>Нейрокомментинг</b>\n\n"
+        "Мониторит новые посты выбранных каналов и публикует комментарии "
+        "от имени выбранного аккаунта.\n\n"
+        f"Сохранённых конфигураций: <b>{len(configs)}</b>"
+    )
+    builder = InlineKeyboardBuilder()
+    for config in configs[:20]:
+        status = '●' if config.get('is_active') else '○'
+        mode = 'ИИ' if config.get('mode') == NEUROCOMMENT_MODE_AI else 'Шаблоны'
+        phone = str(config.get('phone') or config.get('account_id'))
+        builder.row(InlineKeyboardButton(
+            text=f"{status} {phone} · {len(config.get('channel_ids') or [])} кан. · {mode}",
+            callback_data=f"neurocomm:view:{config['id']}",
+            style='success' if config.get('is_active') else 'default',
+            icon_custom_emoji_id=get_icon('AI'),
+        ))
+    builder.row(InlineKeyboardButton(
+        text='Создать нейрокомментинг', callback_data='neurocomm:new',
+        style='primary', icon_custom_emoji_id=get_icon('ADD_TEXT'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Назад', callback_data='functions',
+        style='default', icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    return text, builder.as_markup()
+
+
+def _neurocomment_channels_text(
+    channels: List[Dict[str, Any]], page: int, selected: List[str],
+) -> str:
+    total_pages = max(1, (len(channels) - 1) // 10 + 1)
+    warning = (
+        f"\n{emoji('INFO')} Для более безопасной нагрузки рекомендуется выбрать до <b>30</b> каналов."
+    )
+    if len(selected) > 30:
+        warning += f"\n{emoji('WARNING')} Сейчас выбрано: <b>{len(selected)}</b>. Лимит не блокируется, но риск ограничений выше."
+    return (
+        f"{emoji('GLOBE')} <b>Выберите каналы для нейрокомментинга</b>\n\n"
+        f"Выбрано: <b>{len(selected)}</b>\n"
+        f"Страница {page + 1} из {total_pages}\n"
+        "Можно выбрать любое число каналов из загруженных."
+        f"{warning}"
+    )
+
+
+async def _show_neurocomment_channels(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    channels = data.get('neurocomment_channels') or []
+    selected = data.get('neurocomment_selected_channels') or []
+    page = int(data.get('neurocomment_page') or 0)
+    await callback.message.edit_text(
+        _neurocomment_channels_text(channels, page, selected),
+        reply_markup=get_neurocomment_channel_keyboard(channels, page, selected),
+    )
+
+
+async def _start_saved_neurocomment(config: Dict[str, Any]) -> Tuple[bool, str]:
+    account_id = int(config['account_id'])
+    account = await get_account(account_id)
+    if not account or not account.get('is_active'):
+        return False, 'Выбранный аккаунт не найден или неактивен'
+    other_id = await find_active_neurocomment_for_account(account_id)
+    if other_id is not None and other_id != int(config['id']):
+        return False, f'На этом аккаунте уже запущен нейрокомментинг #{other_id}'
+    await set_neurocomment_active(int(config['id']), True)
+    if not await start_neurocomment_worker(int(config['id'])):
+        await set_neurocomment_active(int(config['id']), False, 'Не удалось запустить воркер')
+        return False, 'Не удалось запустить воркер'
+    return True, ''
+
+
+@dp.callback_query(F.data == 'neurocomment')
+async def neurocomment_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    text, markup = await render_neurocomment_menu(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == 'neurocomm:new')
+async def neurocomment_new(callback: CallbackQuery, state: FSMContext):
+    accounts = [
+        item for item in await get_user_accounts(callback.from_user.id)
+        if item.get('is_active')
+    ]
+    if not accounts:
+        await callback.message.edit_text(
+            f"{emoji('CROSS')} Нет активных аккаунтов для работы.",
+            reply_markup=get_functions_keyboard(),
+        )
+        await callback.answer()
+        return
+    await state.clear()
+    await state.set_state(NeuroCommentStates.waiting_for_account)
+    await callback.message.edit_text(
+        f"{emoji('PROFILE')} <b>Выберите аккаунт для нейрокомментинга</b>",
+        reply_markup=get_neurocomment_accounts_keyboard(accounts),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('neurocomm:account:'), NeuroCommentStates.waiting_for_account)
+async def neurocomment_select_account(callback: CallbackQuery, state: FSMContext):
+    try:
+        account_id = int(callback.data.rsplit(':', 1)[1])
+    except (AttributeError, ValueError):
+        await callback.answer('Некорректный аккаунт', show_alert=True)
+        return
+    account = await get_account(account_id)
+    if not account or account.get('user_id') != callback.from_user.id or not account.get('is_active'):
+        await callback.answer('Аккаунт не найден или неактивен', show_alert=True)
+        return
+    client = await get_client_for_account(account_id)
+    if not client:
+        await callback.answer('Не удалось подключиться к аккаунту', show_alert=True)
+        return
+    await callback.message.edit_text(f"{emoji('LOADING')} Загружаю каналы…")
+    try:
+        channels = [
+            item for item in await get_chats_from_client(client, limit=1000)
+            if item.get('type') == 'channel'
+        ]
+    except Exception as ex:
+        await callback.message.edit_text(
+            f"{emoji('CROSS')} Не удалось загрузить каналы:\n<code>{escape(str(ex)[:500])}</code>",
+            reply_markup=get_functions_keyboard(),
+        )
+        await callback.answer()
+        return
+    if not channels:
+        await callback.message.edit_text(
+            f"{emoji('INFO')} У аккаунта нет доступных каналов.",
+            reply_markup=get_functions_keyboard(),
+        )
+        await callback.answer()
+        return
+    await state.update_data(
+        neurocomment_account_id=account_id,
+        neurocomment_channels=channels,
+        neurocomment_selected_channels=[],
+        neurocomment_page=0,
+        neurocomment_templates=[],
+    )
+    await state.set_state(NeuroCommentStates.selecting_channels)
+    await _show_neurocomment_channels(callback, state)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('neurocomm:toggle:'), NeuroCommentStates.selecting_channels)
+async def neurocomment_toggle_channel(callback: CallbackQuery, state: FSMContext):
+    channel_id = callback.data.rsplit(':', 1)[1]
+    data = await state.get_data()
+    selected = [str(item) for item in (data.get('neurocomment_selected_channels') or [])]
+    if channel_id in selected:
+        selected.remove(channel_id)
+    else:
+        selected.append(channel_id)
+    await state.update_data(neurocomment_selected_channels=selected)
+    await _show_neurocomment_channels(callback, state)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('neurocomm:page:'), NeuroCommentStates.selecting_channels)
+async def neurocomment_channels_page(callback: CallbackQuery, state: FSMContext):
+    try:
+        page = max(0, int(callback.data.rsplit(':', 1)[1]))
+    except (AttributeError, ValueError):
+        await callback.answer('Некорректная страница', show_alert=True)
+        return
+    await state.update_data(neurocomment_page=page)
+    await _show_neurocomment_channels(callback, state)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == 'neurocomm:channels_done', NeuroCommentStates.selecting_channels)
+async def neurocomment_channels_done(callback: CallbackQuery, state: FSMContext):
+    selected = (await state.get_data()).get('neurocomment_selected_channels') or []
+    if not selected:
+        await callback.answer('Выберите хотя бы один канал', show_alert=True)
+        return
+    await state.set_state(NeuroCommentStates.choosing_mode)
+    await callback.message.edit_text(
+        f"{emoji('AI')} <b>Выберите режим комментариев</b>\n\n"
+        "<b>Только ИИ</b> — текст поста отправляется в модель; если текста нет, "
+        "используется изображение поста.\n\n"
+        "<b>Заготовленные сообщения</b> — бот выбирает один из ваших вариантов.",
+        reply_markup=get_neurocomment_mode_keyboard(),
+    )
+    await callback.answer()
+
+
+async def _neurocomment_ask_delay(target, state: FSMContext) -> None:
+    await target.answer(
+        f"{emoji('CLOCK')} <b>Задержка перед комментарием</b>\n\n"
+        "Введите число секунд между появлением поста и публикацией комментария.\n"
+        "Допустимо: 0–86400. Для безопасности рекомендуется 30–300 секунд.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text='Отмена', callback_data='neurocomm:cancel', style='danger',
+                icon_custom_emoji_id=get_icon('CROSS'),
+            )
+        ]]),
+    )
+    await state.set_state(NeuroCommentStates.waiting_for_delay)
+
+
+@dp.callback_query(F.data == 'neurocomm:mode:ai', NeuroCommentStates.choosing_mode)
+async def neurocomment_mode_ai(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(neurocomment_mode=NEUROCOMMENT_MODE_AI)
+    await _neurocomment_ask_delay(callback.message, state)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == 'neurocomm:mode:templates', NeuroCommentStates.choosing_mode)
+async def neurocomment_mode_templates(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(neurocomment_mode=NEUROCOMMENT_MODE_TEMPLATES, neurocomment_templates=[])
+    await state.set_state(NeuroCommentStates.collecting_templates)
+    await callback.message.edit_text(
+        f"{emoji('CLIPBOARD')} <b>Заготовленные комментарии</b>\n\n"
+        "Отправьте первый вариант текста. Можно добавить от <b>1</b> до <b>100</b> вариантов.\n"
+        "После каждого варианта отправляйте следующий или нажмите «Готово».",
+        reply_markup=get_neurocomment_templates_keyboard(0),
+    )
+    await callback.answer()
+
+
+@dp.message(NeuroCommentStates.collecting_templates)
+async def neurocomment_collect_template(message: Message, state: FSMContext):
+    text = (message.text or '').strip()
+    if not text:
+        await message.answer('Отправьте вариант комментария обычным текстом.')
+        return
+    if len(text) > 1000:
+        await message.answer('Один вариант не должен превышать 1000 символов.')
+        return
+    data = await state.get_data()
+    templates = list(data.get('neurocomment_templates') or [])
+    if len(templates) >= NEUROCOMMENT_MAX_TEMPLATE_VARIANTS:
+        await message.answer(
+            f"Достигнут лимит {NEUROCOMMENT_MAX_TEMPLATE_VARIANTS} вариантов. Нажмите «Готово».",
+            reply_markup=get_neurocomment_templates_keyboard(len(templates)),
+        )
+        return
+    templates.append(text)
+    await state.update_data(neurocomment_templates=templates)
+    await message.answer(
+        f"{emoji('CHECK')} Вариант <b>#{len(templates)}</b> сохранён.\n\n"
+        "Отправьте следующий вариант или нажмите «Готово».",
+        reply_markup=get_neurocomment_templates_keyboard(len(templates)),
+    )
+
+
+@dp.callback_query(F.data == 'neurocomm:templates_done', NeuroCommentStates.collecting_templates)
+async def neurocomment_templates_done(callback: CallbackQuery, state: FSMContext):
+    templates = (await state.get_data()).get('neurocomment_templates') or []
+    if not templates:
+        await callback.answer('Добавьте хотя бы один вариант текста', show_alert=True)
+        return
+    await _neurocomment_ask_delay(callback.message, state)
+    await callback.answer()
+
+
+@dp.message(NeuroCommentStates.waiting_for_delay)
+async def neurocomment_delay(message: Message, state: FSMContext):
+    try:
+        delay = int((message.text or '').strip())
+        if not 0 <= delay <= 86400:
+            raise ValueError
+    except ValueError:
+        await message.answer('Введите целое число от 0 до 86400 секунд.')
+        return
+    await state.update_data(neurocomment_delay=delay)
+    data = await state.get_data()
+    mode = data.get('neurocomment_mode')
+    mode_label = 'Только ИИ' if mode == NEUROCOMMENT_MODE_AI else 'Заготовленные сообщения'
+    selected = data.get('neurocomment_selected_channels') or []
+    templates = data.get('neurocomment_templates') or []
+    await state.set_state(NeuroCommentStates.preview)
+    await message.answer(
+        f"{emoji('EYE')} <b>Предпросмотр нейрокомментинга</b>\n\n"
+        f"Каналов: <b>{len(selected)}</b>\n"
+        f"Режим: <b>{mode_label}</b>\n"
+        f"Заготовленных вариантов: <b>{len(templates)}</b>\n"
+        f"Задержка после поста: <b>{delay} сек.</b>\n\n"
+        "Бот будет обрабатывать только новые посты, которые выйдут после запуска.",
+        reply_markup=get_neurocomment_preview_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == 'neurocomm:start_new', NeuroCommentStates.preview)
+async def neurocomment_start_new(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    account_id = int(data.get('neurocomment_account_id') or 0)
+    account = await get_account(account_id)
+    if not account or account.get('user_id') != callback.from_user.id:
+        await callback.answer('Аккаунт не найден', show_alert=True)
+        return
+    active_id = await find_active_neurocomment_for_account(account_id)
+    if active_id is not None:
+        await callback.answer(
+            f'На этом аккаунте уже работает конфигурация #{active_id}. Сначала остановите её.',
+            show_alert=True,
+        )
+        return
+    try:
+        config_id = await create_neurocomment_config(
+            callback.from_user.id,
+            account_id,
+            [str(item) for item in (data.get('neurocomment_selected_channels') or [])],
+            data.get('neurocomment_mode') or NEUROCOMMENT_MODE_AI,
+            list(data.get('neurocomment_templates') or []),
+            int(data.get('neurocomment_delay') or 0),
+        )
+        config = await get_neurocomment_config(config_id, callback.from_user.id)
+        ok, error = await _start_saved_neurocomment(config)
+    except Exception as ex:
+        logger.exception('Could not create neurocomment config')
+        await callback.answer(f'Ошибка: {str(ex)[:200]}', show_alert=True)
+        return
+    await state.clear()
+    config = await get_neurocomment_config(config_id, callback.from_user.id)
+    if not ok:
+        await callback.message.edit_text(
+            f"{emoji('CROSS')} <b>Конфигурация сохранена, но не запущена.</b>\n\n"
+            f"{escape(error)}\n\n{format_neurocomment_config(config)}",
+            reply_markup=get_neurocomment_config_keyboard(config),
+        )
+    else:
+        await callback.message.edit_text(
+            f"{emoji('CHECK')} <b>Нейрокомментинг запущен.</b>\n\n"
+            f"{format_neurocomment_config(config)}",
+            reply_markup=get_neurocomment_config_keyboard(config),
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('neurocomm:view:'))
+async def neurocomment_view(callback: CallbackQuery):
+    try:
+        config_id = int(callback.data.rsplit(':', 1)[1])
+    except (AttributeError, ValueError):
+        await callback.answer('Некорректная конфигурация', show_alert=True)
+        return
+    config = await get_neurocomment_config(config_id, callback.from_user.id)
+    if not config:
+        await callback.answer('Конфигурация не найдена', show_alert=True)
+        return
+    await callback.message.edit_text(
+        format_neurocomment_config(config),
+        reply_markup=get_neurocomment_config_keyboard(config),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('neurocomm:start:'))
+async def neurocomment_start_saved(callback: CallbackQuery):
+    try:
+        config_id = int(callback.data.rsplit(':', 1)[1])
+    except (AttributeError, ValueError):
+        await callback.answer('Некорректная конфигурация', show_alert=True)
+        return
+    config = await get_neurocomment_config(config_id, callback.from_user.id)
+    if not config:
+        await callback.answer('Конфигурация не найдена', show_alert=True)
+        return
+    ok, error = await _start_saved_neurocomment(config)
+    config = await get_neurocomment_config(config_id, callback.from_user.id)
+    if not ok:
+        await callback.answer(error, show_alert=True)
+    else:
+        await callback.answer('Запущено')
+    await callback.message.edit_text(
+        format_neurocomment_config(config),
+        reply_markup=get_neurocomment_config_keyboard(config),
+    )
+
+
+@dp.callback_query(F.data.startswith('neurocomm:stop:'))
+async def neurocomment_stop(callback: CallbackQuery):
+    try:
+        config_id = int(callback.data.rsplit(':', 1)[1])
+    except (AttributeError, ValueError):
+        await callback.answer('Некорректная конфигурация', show_alert=True)
+        return
+    config = await get_neurocomment_config(config_id, callback.from_user.id)
+    if not config:
+        await callback.answer('Конфигурация не найдена', show_alert=True)
+        return
+    await stop_neurocomment_worker(config_id)
+    config = await get_neurocomment_config(config_id, callback.from_user.id)
+    await callback.message.edit_text(
+        format_neurocomment_config(config),
+        reply_markup=get_neurocomment_config_keyboard(config),
+    )
+    await callback.answer('Остановлено')
+
+
+@dp.callback_query(F.data.startswith('neurocomm:delete:'))
+async def neurocomment_delete(callback: CallbackQuery):
+    try:
+        config_id = int(callback.data.rsplit(':', 1)[1])
+    except (AttributeError, ValueError):
+        await callback.answer('Некорректная конфигурация', show_alert=True)
+        return
+    config = await get_neurocomment_config(config_id, callback.from_user.id)
+    if not config:
+        await callback.answer('Конфигурация не найдена', show_alert=True)
+        return
+    await stop_neurocomment_worker(config_id)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            'DELETE FROM neurocomment_configs WHERE id = $1 AND user_id = $2',
+            config_id, callback.from_user.id,
+        )
+    text, markup = await render_neurocomment_menu(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer('Удалено')
+
+
+@dp.callback_query(F.data == 'neurocomm:cancel')
+async def neurocomment_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    text, markup = await render_neurocomment_menu(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer('Отменено')
+
+
 # --- Авто-лайкинг ---
 @dp.callback_query(F.data == "autolike")
 async def autolike_menu(callback: CallbackQuery, state: FSMContext):
@@ -20662,6 +21655,12 @@ async def cmd_cancel_acct_ar(message: Message, state: FSMContext):
         AdminLLMConfigStates.waiting_for_model_api_name.state,
         AdminLLMConfigStates.waiting_for_model_display_name.state,
         AIChatStates.waiting_for_message.state,
+        NeuroCommentStates.waiting_for_account.state,
+        NeuroCommentStates.selecting_channels.state,
+        NeuroCommentStates.choosing_mode.state,
+        NeuroCommentStates.collecting_templates.state,
+        NeuroCommentStates.waiting_for_delay.state,
+        NeuroCommentStates.preview.state,
     }:
         await state.clear()
         await message.answer("Ок, отменил.")
@@ -20728,6 +21727,21 @@ async def on_startup():
                     f"on_startup: не удалось запустить AI-автоответчик "
                     f"для account_id={row['account_id']}: {ex}"
                 )
+
+    # Нейрокомментинг сохраняется в БД, поэтому после перезапуска
+    # восстанавливаем только конфигурации, которые пользователь не остановил.
+    async with db_pool.acquire() as conn:
+        neuro_configs = await conn.fetch(
+            'SELECT id FROM neurocomment_configs WHERE is_active = TRUE'
+        )
+    for row in neuro_configs:
+        try:
+            await start_neurocomment_worker(int(row['id']))
+        except Exception as ex:
+            logger.warning(
+                'on_startup: не удалось восстановить нейрокомментинг %s: %s',
+                row['id'], ex,
+            )
 
     asyncio.create_task(check_scheduled_broadcasts())
     asyncio.create_task(task_queue_worker())
