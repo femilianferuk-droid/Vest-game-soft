@@ -631,6 +631,7 @@ class NeuroCommentStates(StatesGroup):
     waiting_for_account = State()
     selecting_channels = State()
     choosing_mode = State()
+    choosing_model = State()
     collecting_templates = State()
     waiting_for_delay = State()
     preview = State()
@@ -828,6 +829,7 @@ async def init_db():
                 account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
                 channel_ids TEXT[] NOT NULL,
                 mode TEXT NOT NULL,
+                model TEXT,
                 message_variants JSONB NOT NULL DEFAULT '[]'::jsonb,
                 delay_seconds INTEGER NOT NULL DEFAULT 60,
                 is_active BOOLEAN NOT NULL DEFAULT FALSE,
@@ -840,6 +842,12 @@ async def init_db():
                 stopped_at TIMESTAMP
             )
         ''')
+        try:
+            await conn.execute(
+                'ALTER TABLE neurocomment_configs ADD COLUMN IF NOT EXISTS model TEXT'
+            )
+        except Exception:
+            pass
         try:
             await conn.execute(
                 'CREATE INDEX IF NOT EXISTS idx_neurocomment_user_created '
@@ -7811,6 +7819,7 @@ async def create_neurocomment_config(
     account_id: int,
     channel_ids: List[str],
     mode: str,
+    model: Optional[str],
     message_variants: List[str],
     delay_seconds: int,
 ) -> int:
@@ -7823,13 +7832,14 @@ async def create_neurocomment_config(
     async with db_pool.acquire() as conn:
         config_id = await conn.fetchval(
             '''INSERT INTO neurocomment_configs
-               (user_id, account_id, channel_ids, mode, message_variants, delay_seconds)
-               VALUES ($1, $2, $3::text[], $4, $5::jsonb, $6)
+               (user_id, account_id, channel_ids, mode, model, message_variants, delay_seconds)
+               VALUES ($1, $2, $3::text[], $4, $5, $6::jsonb, $7)
                RETURNING id''',
             user_id,
             account_id,
             [str(channel_id) for channel_id in channel_ids],
             mode,
+            model.strip() if model else None,
             json.dumps(message_variants[:NEUROCOMMENT_MAX_TEMPLATE_VARIANTS], ensure_ascii=False),
             int(delay_seconds),
         )
@@ -7913,10 +7923,15 @@ async def _neurocomment_post_payload(
 
 
 async def generate_neurocomment_ai_reply(
-    user_id: int, post_text: str, image_bytes: Optional[bytes] = None,
+    user_id: int,
+    post_text: str,
+    image_bytes: Optional[bytes] = None,
+    model: Optional[str] = None,
 ) -> str:
-    model = await get_user_llm_model(user_id)
-    runtime_url, runtime_key, model = await get_user_llm_runtime(user_id, model)
+    selected_model = model or await get_user_llm_model(user_id)
+    runtime_url, runtime_key, selected_model = await get_user_llm_runtime(
+        user_id, selected_model,
+    )
     instruction = (
         'Сформируй комментарий к следующему посту. '
         'Используй только сведения из поста и не повторяй его дословно.\n\n'
@@ -7945,7 +7960,7 @@ async def generate_neurocomment_ai_reply(
     )
     try:
         response = await client.messages.create(
-            model=model,
+            model=selected_model,
             max_tokens=220,
             system=NEUROCOMMENT_AI_SYSTEM_PROMPT,
             messages=[{'role': 'user', 'content': content}],
@@ -7971,7 +7986,10 @@ async def _neurocomment_build_reply(
         return random.choice(variants)
     post_text, image_bytes = await _neurocomment_post_payload(client, event.message)
     return await generate_neurocomment_ai_reply(
-        int(config['user_id']), post_text, image_bytes,
+        int(config['user_id']),
+        post_text,
+        image_bytes,
+        model=(config.get('model') or None),
     )
 
 
@@ -10579,6 +10597,25 @@ def get_neurocomment_mode_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def get_neurocomment_model_keyboard(
+    models: List[str], current: str,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for index, model in enumerate(models):
+        label = LLM_MODELS.get(model, model)
+        builder.row(InlineKeyboardButton(
+            text=f"{'✓ ' if model == current else ''}{str(label)[:52]}",
+            callback_data=f'neurocomm:model:{index}',
+            style='success' if model == current else 'default',
+            icon_custom_emoji_id=get_icon('CHECK') if model == current else get_icon('AI'),
+        ))
+    builder.row(InlineKeyboardButton(
+        text='Отмена', callback_data='neurocomm:cancel',
+        style='danger', icon_custom_emoji_id=get_icon('CROSS'),
+    ))
+    return builder.as_markup()
+
+
 def get_neurocomment_templates_keyboard(count: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(
@@ -10639,11 +10676,18 @@ def format_neurocomment_config(config: Dict[str, Any]) -> str:
         if last_error else ''
     )
     templates = len(config.get('message_variants') or [])
+    model = config.get('model') or ''
+    model_label = LLM_MODELS.get(model, model) if model else 'По умолчанию'
+    model_line = (
+        f"{emoji('AI')} Модель: <b>{escape(str(model_label))}</b>\n"
+        if mode == NEUROCOMMENT_MODE_AI else ''
+    )
     return (
         f"{emoji('AI')} <b>Нейрокомментинг #{config['id']}</b>\n\n"
         f"{emoji('PHONE')} Аккаунт: <code>{escape(str(config.get('phone') or config.get('account_id')))}</code>\n"
         f"{emoji('GLOBE')} Каналов: <b>{len(config.get('channel_ids') or [])}</b>\n"
         f"{emoji('AI')} Режим: <b>{mode_label}</b>\n"
+        f"{model_line}"
         f"{emoji('CLIPBOARD')} Шаблонов: <b>{templates}</b>\n"
         f"{emoji('CLOCK')} Задержка после поста: <b>{config.get('delay_seconds', 0)} сек.</b>\n"
         f"{emoji('CHECK')} Отправлено комментариев: <b>{config.get('comments_sent', 0)}</b>\n"
@@ -18348,9 +18392,42 @@ async def _neurocomment_ask_delay(target, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == 'neurocomm:mode:ai', NeuroCommentStates.choosing_mode)
 async def neurocomment_mode_ai(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(neurocomment_mode=NEUROCOMMENT_MODE_AI)
-    await _neurocomment_ask_delay(callback.message, state)
+    models = await get_user_llm_models(callback.from_user.id)
+    if not models:
+        await callback.answer('Для выбранного API нет доступных моделей', show_alert=True)
+        return
+    current = await get_user_llm_model(callback.from_user.id)
+    if current not in models:
+        current = models[0]
+    await state.update_data(
+        neurocomment_mode=NEUROCOMMENT_MODE_AI,
+        neurocomment_models=models,
+        neurocomment_model=current,
+    )
+    await state.set_state(NeuroCommentStates.choosing_model)
+    await callback.message.edit_text(
+        f"{emoji('AI')} <b>Выберите модель для нейрокомментинга</b>\n\n"
+        "Эта модель будет использоваться для генерации комментариев к новым постам.",
+        reply_markup=get_neurocomment_model_keyboard(models, current),
+    )
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('neurocomm:model:'), NeuroCommentStates.choosing_model)
+async def neurocomment_select_model(callback: CallbackQuery, state: FSMContext):
+    try:
+        index = int(callback.data.rsplit(':', 1)[1])
+    except (AttributeError, ValueError):
+        await callback.answer('Некорректная модель', show_alert=True)
+        return
+    models = (await state.get_data()).get('neurocomment_models') or []
+    if not 0 <= index < len(models):
+        await callback.answer('Модель не найдена', show_alert=True)
+        return
+    selected_model = str(models[index])
+    await state.update_data(neurocomment_model=selected_model)
+    await _neurocomment_ask_delay(callback.message, state)
+    await callback.answer(f"Модель: {LLM_MODELS.get(selected_model, selected_model)}")
 
 
 @dp.callback_query(F.data == 'neurocomm:mode:templates', NeuroCommentStates.choosing_mode)
@@ -18417,11 +18494,17 @@ async def neurocomment_delay(message: Message, state: FSMContext):
     mode_label = 'Только ИИ' if mode == NEUROCOMMENT_MODE_AI else 'Заготовленные сообщения'
     selected = data.get('neurocomment_selected_channels') or []
     templates = data.get('neurocomment_templates') or []
+    model = data.get('neurocomment_model') or ''
+    model_line = (
+        f"Модель ИИ: <b>{escape(str(LLM_MODELS.get(model, model)))}</b>\n"
+        if mode == NEUROCOMMENT_MODE_AI else ''
+    )
     await state.set_state(NeuroCommentStates.preview)
     await message.answer(
         f"{emoji('EYE')} <b>Предпросмотр нейрокомментинга</b>\n\n"
         f"Каналов: <b>{len(selected)}</b>\n"
         f"Режим: <b>{mode_label}</b>\n"
+        f"{model_line}"
         f"Заготовленных вариантов: <b>{len(templates)}</b>\n"
         f"Задержка после поста: <b>{delay} сек.</b>\n\n"
         "Бот будет обрабатывать только новые посты, которые выйдут после запуска.",
@@ -18450,6 +18533,7 @@ async def neurocomment_start_new(callback: CallbackQuery, state: FSMContext):
             account_id,
             [str(item) for item in (data.get('neurocomment_selected_channels') or [])],
             data.get('neurocomment_mode') or NEUROCOMMENT_MODE_AI,
+            data.get('neurocomment_model') or None,
             list(data.get('neurocomment_templates') or []),
             int(data.get('neurocomment_delay') or 0),
         )
@@ -21658,6 +21742,7 @@ async def cmd_cancel_acct_ar(message: Message, state: FSMContext):
         NeuroCommentStates.waiting_for_account.state,
         NeuroCommentStates.selecting_channels.state,
         NeuroCommentStates.choosing_mode.state,
+        NeuroCommentStates.choosing_model.state,
         NeuroCommentStates.collecting_templates.state,
         NeuroCommentStates.waiting_for_delay.state,
         NeuroCommentStates.preview.state,
