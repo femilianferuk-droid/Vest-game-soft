@@ -222,6 +222,10 @@ neurocomment_stop_flags: Dict[int, bool] = {}
 neurocomment_event_locks: Dict[int, asyncio.Lock] = {}
 delete_messages_stop_flags: Dict[int, bool] = {}
 script_run_locks: Dict[int, asyncio.Lock] = {}
+script_tasks: Dict[int, asyncio.Task] = {}
+script_stop_flags: Dict[int, bool] = {}
+SCRIPT_CYCLE_DELAY_SECONDS = 5
+SCRIPT_RETRY_DELAY_SECONDS = 10
 # Не допускаем одновременную ручную и плановую проверку одного аккаунта.
 spam_check_locks: Dict[int, asyncio.Lock] = {}
 
@@ -2587,6 +2591,18 @@ async def shutdown_account_runtime(account_id: int, user_id: int) -> None:
     except Exception:
         pass
 
+    # Долгие маршруты скриптов также не должны продолжаться с удалённой
+    # сессией аккаунта.
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT id FROM user_scripts WHERE account_id = $1', account_id,
+            )
+        for row in rows:
+            await stop_script_runner(int(row['id']), user_id)
+    except Exception:
+        pass
+
     for storage in (active_clients, pending_clients):
         client = storage.pop(account_id, None)
         if client:
@@ -4459,7 +4475,15 @@ def find_script_button(message: Any, step: Dict[str, Any]) -> Any:
         candidate = rows[row_index][col_index]
         kind = type(getattr(candidate, 'button', None)).__name__
         text = str(getattr(candidate, 'text', '') or '').strip() or 'Без названия'
-        if kind in SCRIPT_ALLOWED_BUTTON_KINDS and text == expected_text:
+        if kind in SCRIPT_ALLOWED_BUTTON_KINDS:
+            # Приоритет у позиции: бот может переименовать кнопку, но если
+            # на её прежнем месте появилась другая обычная кнопка — маршрут
+            # продолжает работу по текущему расположению.
+            if text != expected_text:
+                logger.info(
+                    'Script button text changed at %s:%s: %r -> %r; using position',
+                    row_index, col_index, expected_text, text,
+                )
             return candidate
     matches = []
     for row in rows:
@@ -4800,120 +4824,217 @@ async def delete_user_script(script_id: int, user_id: int) -> bool:
             'DELETE FROM user_scripts WHERE id = $1 AND user_id = $2', script_id, user_id,
         )
     script_run_locks.pop(script_id, None)
+    script_stop_flags[script_id] = True
+    task = script_tasks.pop(script_id, None)
+    if task and not task.done():
+        task.cancel()
+    script_stop_flags.pop(script_id, None)
     return result.endswith('1')
 
 
+async def _execute_script_route_once(script_id: int, user_id: int) -> Dict[str, Any]:
+    """Один проход сохранённого маршрута без изменения состояния runner-а."""
+    script = await get_user_script(script_id, user_id)
+    if not script:
+        raise ValueError('Скрипт не найден')
+    if not script.get('account_is_active'):
+        raise RuntimeError('Выбранный аккаунт отключён')
+    steps = normalize_script_steps(script)
+    if not steps:
+        raise RuntimeError('В маршруте нет шагов')
+
+    client = await get_client_for_account(int(script['account_id']))
+    if not client:
+        raise RuntimeError('Не удалось подключиться к выбранному аккаунту')
+    menu = await load_script_bot_menu(int(script['account_id']), script['bot_url'])
+    captcha_solved = 0
+    if script.get('captcha_enabled') and menu.get('has_photo'):
+        menu, solved = await _resolve_script_captcha_chain(client, menu, require_buttons=True)
+        captcha_solved += solved
+
+    completed: List[str] = []
+    for index, step in enumerate(steps):
+        if script_stop_flags.get(script_id, False):
+            raise asyncio.CancelledError
+        is_last = index == len(steps) - 1
+        if step['action'] == 'join_channel':
+            await _script_join_channel_url(client, step.get('url') or '')
+            completed.append(script_step_label(step))
+            await add_account_log(
+                int(script['account_id']), f"@{script['bot_username']}", 0,
+                'script', f"Подписка по кнопке: {step['text']}",
+            )
+            # Важно: остаёмся в текущем окружении бота. Повторный /start
+            # не посылается, а следующая кнопка ищется в том же меню.
+            if not is_last:
+                await asyncio.sleep(SCRIPT_CYCLE_DELAY_SECONDS)
+            continue
+
+        try:
+            menu = await _click_script_step(
+                client, menu, step,
+                require_buttons=(not is_last or bool(script.get('captcha_enabled'))),
+            )
+        except TimeoutError:
+            if not is_last:
+                raise
+            menu = None
+        completed.append(script_step_label(step))
+        await add_account_log(
+            int(script['account_id']), f"@{script['bot_username']}",
+            int(getattr(menu.get('message'), 'chat_id', 0) or 0) if menu else 0,
+            'script', f"Нажата кнопка: {step['text']}",
+        )
+        if menu and script.get('captcha_enabled') and menu.get('has_photo'):
+            menu, solved = await _resolve_script_captcha_chain(
+                client, menu, require_buttons=not is_last,
+            )
+            captcha_solved += solved
+
+    return {
+        'script_id': script_id,
+        'bot_username': script['bot_username'],
+        'completed_steps': completed,
+        'captcha_solved': captcha_solved,
+        'message_id': int(menu['message_id']) if menu else None,
+    }
+
+
 async def execute_user_script(script_id: int, user_id: int) -> Dict[str, Any]:
-    """Выполняет сохранённый маршрут, загружая меню после каждого шага."""
+    """Выполняет один проход маршрута (используется очередью задач)."""
     lock = script_run_locks.setdefault(script_id, asyncio.Lock())
     if lock.locked():
         raise RuntimeError('Этот скрипт уже выполняется')
-
     async with lock:
-        script = await get_user_script(script_id, user_id)
-        if not script:
-            raise ValueError('Скрипт не найден')
-        if not script.get('account_is_active'):
-            raise RuntimeError('Выбранный аккаунт отключён')
-        steps = normalize_script_steps(script)
-        if not steps:
-            raise RuntimeError('В маршруте нет шагов')
+        return await _execute_script_route_once(script_id, user_id)
 
-        async with db_pool.acquire() as conn:
-            recent = await conn.fetchval(
-                'SELECT EXTRACT(EPOCH FROM (NOW() - last_run_at)) FROM user_scripts WHERE id = $1',
-                script_id,
+
+async def _mark_script_runner_state(
+    script_id: int,
+    run_id: int,
+    status: str,
+    *,
+    summary: str = '',
+    error: str = '',
+) -> None:
+    async with db_pool.acquire() as conn:
+        if status == 'running':
+            await conn.execute(
+                '''UPDATE script_runs SET clicked_button = NULL, error = NULL
+                   WHERE id = $1''', run_id,
             )
-            if recent is not None and float(recent) < 3:
-                raise RuntimeError('Подождите 3 секунды перед повторным запуском')
-            run_id = int(await conn.fetchval(
-                '''INSERT INTO script_runs (script_id, user_id, account_id, status)
-                   VALUES ($1,$2,$3,'running') RETURNING id''',
-                script_id, user_id, script['account_id'],
-            ))
             await conn.execute(
                 '''UPDATE user_scripts SET last_status = 'running', last_error = NULL,
-                   last_run_at = NOW(), updated_at = NOW() WHERE id = $1''',
-                script_id,
+                   last_run_at = NOW(), updated_at = NOW() WHERE id = $1''', script_id,
+            )
+        else:
+            await conn.execute(
+                '''UPDATE script_runs SET status = $1, clicked_button = NULLIF($2, ''),
+                   error = NULLIF($3, ''), finished_at = NOW() WHERE id = $4''',
+                status, summary[:1000], error[:1000], run_id,
+            )
+            await conn.execute(
+                '''UPDATE user_scripts SET last_status = $1, last_error = NULLIF($2, ''),
+                   updated_at = NOW() WHERE id = $3''',
+                status, error[:1000], script_id,
             )
 
-        completed: List[str] = []
-        captcha_solved = 0
+
+async def _script_runner(script_id: int, user_id: int, run_id: int) -> None:
+    cycles = 0
+    last_summary = ''
+    last_error = ''
+    stopped = False
+    try:
+        while not script_stop_flags.get(script_id, False):
+            try:
+                result = await execute_user_script(script_id, user_id)
+                cycles += 1
+                last_summary = ' → '.join(result.get('completed_steps') or [])[:1000]
+                last_error = ''
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        '''UPDATE script_runs SET clicked_button = NULLIF($1, ''), error = NULL
+                           WHERE id = $2''', last_summary, run_id,
+                    )
+                    await conn.execute(
+                        '''UPDATE user_scripts SET last_status = 'running', last_error = NULL,
+                           updated_at = NOW() WHERE id = $1''', script_id,
+                    )
+                await asyncio.sleep(SCRIPT_CYCLE_DELAY_SECONDS)
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:
+                last_error = str(ex)[:1000]
+                logger.warning('Script %s cycle failed: %s', script_id, last_error)
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        '''UPDATE script_runs SET error = $1 WHERE id = $2''',
+                        last_error, run_id,
+                    )
+                    await conn.execute(
+                        '''UPDATE user_scripts SET last_status = 'running', last_error = $1,
+                           updated_at = NOW() WHERE id = $2''', last_error, script_id,
+                    )
+                # Скрипт не прекращается от единичной ошибки: ждём и пробуем
+                # следующий полный цикл до явной остановки пользователя.
+                await asyncio.sleep(SCRIPT_RETRY_DELAY_SECONDS)
+    except asyncio.CancelledError:
+        stopped = True
+        raise
+    finally:
+        stopped = stopped or script_stop_flags.get(script_id, False)
+        final_status = 'stopped' if stopped else 'failed'
         try:
-            parsed = parse_telegram_bot_url(script['bot_url'])
-            client = await get_client_for_account(int(script['account_id']))
-            if not client:
-                raise RuntimeError('Не удалось подключиться к выбранному аккаунту')
-            menu = await load_script_bot_menu(int(script['account_id']), script['bot_url'])
-            if script.get('captcha_enabled') and menu.get('has_photo'):
-                menu, solved = await _resolve_script_captcha_chain(
-                    client, menu, require_buttons=True,
-                )
-                captcha_solved += solved
-
-            for index, step in enumerate(steps):
-                is_last = index == len(steps) - 1
-                if step['action'] == 'join_channel':
-                    await _script_join_channel_url(client, step.get('url') or '')
-                    completed.append(script_step_label(step))
-                    await add_account_log(
-                        int(script['account_id']), f"@{script['bot_username']}", 0,
-                        'script', f"Подписка по кнопке: {step['text']}",
-                    )
-                    # Главное окружение бота уже открыто: /start повторно не шлём.
-                    continue
-
-                try:
-                    menu = await _click_script_step(
-                        client, menu, step,
-                        require_buttons=(not is_last or bool(script.get('captcha_enabled'))),
-                    )
-                except TimeoutError:
-                    if not is_last:
-                        raise
-                    menu = None
-                completed.append(script_step_label(step))
-                await add_account_log(
-                    int(script['account_id']), f"@{script['bot_username']}",
-                    int(getattr(menu.get('message'), 'chat_id', 0) or 0) if menu else 0,
-                    'script', f"Нажата кнопка: {step['text']}",
-                )
-                if menu and script.get('captcha_enabled') and menu.get('has_photo'):
-                    menu, solved = await _resolve_script_captcha_chain(
-                        client, menu, require_buttons=not is_last,
-                    )
-                    captcha_solved += solved
-
-            clicked_summary = ' → '.join(completed)[:1000]
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    '''UPDATE script_runs SET status = 'completed', clicked_button = $1,
-                       finished_at = NOW() WHERE id = $2''', clicked_summary, run_id,
-                )
-                await conn.execute(
-                    '''UPDATE user_scripts SET last_status = 'completed', last_error = NULL,
-                       updated_at = NOW() WHERE id = $1''', script_id,
-                )
-            return {
-                'script_id': script_id,
-                'bot_username': script['bot_username'],
-                'completed_steps': completed,
-                'captcha_solved': captcha_solved,
-                'message_id': int(menu['message_id']) if menu else None,
-            }
+            await _mark_script_runner_state(
+                script_id, run_id, final_status,
+                summary=last_summary,
+                error='' if stopped else last_error,
+            )
         except Exception as ex:
-            error = str(ex)[:1000]
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    '''UPDATE script_runs SET status = 'failed', error = $1,
-                       finished_at = NOW() WHERE id = $2''', error, run_id,
-                )
-                await conn.execute(
-                    '''UPDATE user_scripts SET last_status = 'failed', last_error = $1,
-                       updated_at = NOW() WHERE id = $2''', error, script_id,
-                )
-            raise
+            logger.warning('Could not finalize script runner %s: %s', script_id, ex)
+        script_tasks.pop(script_id, None)
+        script_stop_flags.pop(script_id, None)
 
+
+async def start_script_runner(script_id: int, user_id: int) -> Tuple[bool, str]:
+    task = script_tasks.get(script_id)
+    if task and not task.done():
+        return False, 'Этот скрипт уже запущен'
+    script = await get_user_script(script_id, user_id)
+    if not script:
+        return False, 'Скрипт не найден'
+    if not script.get('account_is_active'):
+        return False, 'Выбранный аккаунт отключён'
+    if not normalize_script_steps(script):
+        return False, 'В маршруте нет шагов'
+    async with db_pool.acquire() as conn:
+        run_id = int(await conn.fetchval(
+            '''INSERT INTO script_runs (script_id, user_id, account_id, status)
+               VALUES ($1, $2, $3, 'running') RETURNING id''',
+            script_id, user_id, script['account_id'],
+        ))
+    await _mark_script_runner_state(script_id, run_id, 'running')
+    script_stop_flags[script_id] = False
+    task = asyncio.create_task(_script_runner(script_id, user_id, run_id))
+    script_tasks[script_id] = task
+    return True, ''
+
+
+async def stop_script_runner(script_id: int, user_id: int) -> bool:
+    script = await get_user_script(script_id, user_id)
+    if not script:
+        return False
+    script_stop_flags[script_id] = True
+    task = script_tasks.get(script_id)
+    if task and not task.done():
+        task.cancel()
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            '''UPDATE user_scripts SET last_status = 'stopped', updated_at = NOW()
+               WHERE id = $1 AND user_id = $2''', script_id, user_id,
+        )
+    return True
 async def get_chats_from_client(
     client: TelegramClient, limit: int = 200
 ) -> List[Dict]:
@@ -9559,11 +9680,13 @@ async def process_queue_task(task: Dict[str, Any]):
 
         if task_type == 'run_script':
             script_id = int(payload['script_id'])
-            result = await execute_user_script(
+            started, error = await start_script_runner(
                 script_id, int(task['user_id'])
             )
+            if not started:
+                raise RuntimeError(error)
             await update_queue_task(
-                task_id, 'completed', result, entity_id=script_id
+                task_id, 'completed', {'script_id': script_id, 'started': True}, entity_id=script_id
             )
             return
 
@@ -10029,6 +10152,7 @@ def get_scripts_keyboard(
         'completed': '✅',
         'failed': '❌',
         'running': '⏳',
+        'stopped': '⏹',
         'never': '•',
     }
     for script in scripts:
@@ -10149,14 +10273,24 @@ def get_script_step_confirmation_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def get_script_actions_keyboard(script_id: int) -> InlineKeyboardMarkup:
+def get_script_actions_keyboard(
+    script_id: int, is_running: bool = False,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(
-        text="Загрузить и запустить",
-        callback_data=f"script:run:{script_id}",
-        style='success',
-        icon_custom_emoji_id=get_icon("PLAY"),
-    ))
+    if is_running:
+        builder.row(InlineKeyboardButton(
+            text="Остановить скрипт",
+            callback_data=f"script:stop:{script_id}",
+            style='danger',
+            icon_custom_emoji_id=get_icon("STOP"),
+        ))
+    else:
+        builder.row(InlineKeyboardButton(
+            text="Запустить бесконечно",
+            callback_data=f"script:run:{script_id}",
+            style='success',
+            icon_custom_emoji_id=get_icon("PLAY"),
+        ))
     builder.row(InlineKeyboardButton(
         text="Обновить маршрут",
         callback_data=f"script:refresh:{script_id}",
@@ -10181,8 +10315,9 @@ def get_script_actions_keyboard(script_id: int) -> InlineKeyboardMarkup:
 def format_script_card(script: Dict[str, Any]) -> str:
     status_labels = {
         'completed': 'Выполнен',
-        'failed': 'О��ибка',
-        'running': 'Выполняется',
+        'failed': 'Ошибка',
+        'running': 'Выполняется бесконечно',
+        'stopped': 'Остановлен',
         'never': 'Ещё не запускался',
     }
     status = status_labels.get(
@@ -10815,13 +10950,13 @@ def get_chat_selection_keyboard(
 ) -> InlineKeyboardMarkup:
     if selected_chats is None:
         selected_chats = []
-    
+
     builder = InlineKeyboardBuilder()
     per_page = 10
     start_idx = page * per_page
     end_idx = start_idx + per_page
     page_chats = chats[start_idx:end_idx]
-    
+
     for chat in page_chats:
         is_selected = chat['id'] in selected_chats
         prefix = " " if is_selected else ""
@@ -10833,7 +10968,7 @@ def get_chat_selection_keyboard(
                 get_icon("CHECK") if is_selected else get_icon("PEOPLE")
             )
         ))
-    
+
     nav_buttons = []
     if page > 0:
         nav_buttons.append(InlineKeyboardButton(
@@ -10851,7 +10986,7 @@ def get_chat_selection_keyboard(
         ))
     if nav_buttons:
         builder.row(*nav_buttons)
-    
+
     builder.row(InlineKeyboardButton(
         text=f"Готово (выбрано: {len(selected_chats)})",
         callback_data="chats_done",
@@ -10864,7 +10999,7 @@ def get_chat_selection_keyboard(
         style='danger',
         icon_custom_emoji_id=get_icon("CROSS")
     ))
-    
+
     return builder.as_markup()
 
 
@@ -11886,7 +12021,9 @@ async def _save_script_route(callback: CallbackQuery, state: FSMContext) -> None
     script = await get_user_script(script_id, callback.from_user.id)
     await callback.message.edit_text(
         f"{emoji('CHECK')} <b>Маршрут скрипта сохранён.</b>\n\n" + format_script_card(script),
-        reply_markup=get_script_actions_keyboard(script_id),
+        reply_markup=get_script_actions_keyboard(
+            script_id, script.get('last_status') == 'running'
+        ),
     )
     await callback.answer('Готово')
 
@@ -11908,7 +12045,9 @@ async def script_view(callback: CallbackQuery):
         return
     await callback.message.edit_text(
         format_script_card(script),
-        reply_markup=get_script_actions_keyboard(script_id),
+        reply_markup=get_script_actions_keyboard(
+            script_id, script.get('last_status') == 'running'
+        ),
     )
     await callback.answer()
 
@@ -11924,41 +12063,38 @@ async def script_run(callback: CallbackQuery):
     if not script:
         await callback.answer('Скрипт не найден', show_alert=True)
         return
-
-    await callback.answer('Запускаю…')
-    steps = normalize_script_steps(script)
+    ok, error = await start_script_runner(script_id, callback.from_user.id)
+    if not ok:
+        await callback.answer(error, show_alert=True)
+        return
+    script = await get_user_script(script_id, callback.from_user.id)
     await callback.message.edit_text(
-        f"{emoji('LOADING')} <b>Выполняю маршрут скрипта…</b>\n\n"
-        f"Открываю <code>@{escape(script['bot_username'])}</code> и выполняю "
-        f"<b>{len(steps)}</b> шаг(ов) с загрузкой меню после каждого перехода."
+        f"{emoji('PLAY')} <b>Скрипт запущен в бесконечном цикле.</b>\n\n"
+        "Каждый цикл начинает маршрут заново, выполняет все шаги и ждёт 5 секунд. "
+        "Остановите его кнопкой «Остановить скрипт».\n\n"
+        + format_script_card(script),
+        reply_markup=get_script_actions_keyboard(script_id, True),
     )
-    try:
-        result = await execute_user_script(
-            script_id, callback.from_user.id
-        )
-        script = await get_user_script(script_id, callback.from_user.id)
-        completed = ' → '.join(escape(str(item)) for item in result.get('completed_steps', [])) or '—'
-        captcha_note = (
-            f"\nФото-капча пройдена: <b>{result.get('captcha_solved', 0)}</b>"
-            if result.get('captcha_solved') else ''
-        )
-        await callback.message.edit_text(
-            f"{emoji('CHECK')} <b>Скрипт выполнен.</b>\n\n"
-            f"Маршрут: <i>{completed}</i>{captcha_note}\n\n"
-            + format_script_card(script),
-            reply_markup=get_script_actions_keyboard(script_id),
-        )
-    except Exception as ex:
-        logger.exception('Script execution failed')
-        script = await get_user_script(script_id, callback.from_user.id)
-        body = format_script_card(script) if script else ''
-        await callback.message.edit_text(
-            f"{emoji('CROSS')} <b>Скрипт не выполнен.</b>\n\n"
-            f"<code>{escape(str(ex)[:700])}</code>\n\n"
-            f"{body}",
-            reply_markup=get_script_actions_keyboard(script_id),
-        )
+    await callback.answer('Запущено')
 
+
+@dp.callback_query(F.data.startswith("script:stop:"))
+async def script_stop(callback: CallbackQuery):
+    try:
+        script_id = int(callback.data.rsplit(':', 1)[1])
+    except ValueError:
+        await callback.answer('Некорректный скрипт', show_alert=True)
+        return
+    if not await stop_script_runner(script_id, callback.from_user.id):
+        await callback.answer('Скрипт не найден', show_alert=True)
+        return
+    script = await get_user_script(script_id, callback.from_user.id)
+    await callback.message.edit_text(
+        f"{emoji('STOP')} <b>Остановка скрипта запрошена.</b>\n\n"
+        + format_script_card(script),
+        reply_markup=get_script_actions_keyboard(script_id, False),
+    )
+    await callback.answer('Остановлено')
 
 @dp.callback_query(F.data.startswith("script:refresh:"))
 async def script_refresh_buttons(
@@ -11972,6 +12108,9 @@ async def script_refresh_buttons(
     script = await get_user_script(script_id, callback.from_user.id)
     if not script:
         await callback.answer('Скрипт не найден', show_alert=True)
+        return
+    if script.get('last_status') == 'running':
+        await callback.answer('Сначала остановите запущенный скрипт', show_alert=True)
         return
     await callback.answer('Обновляю маршрут…')
     await callback.message.edit_text(
@@ -18595,19 +18734,19 @@ async def start_responder(callback: CallbackQuery):
 async def delete_responder(callback: CallbackQuery):
     responder_id = int(callback.data.split("_")[2])
     responder = await get_auto_responder(responder_id)
-    
+
     if responder and responder['user_id'] == callback.from_user.id:
         if callback.from_user.id in active_auto_responders:
             if responder['account_id'] in active_auto_responders[callback.from_user.id]:
                 active_auto_responders[callback.from_user.id][responder['account_id']].cancel()
                 del active_auto_responders[callback.from_user.id][responder['account_id']]
-        
+
         async with db_pool.acquire() as conn:
             await conn.execute(
                 'DELETE FROM auto_responders WHERE id = $1',
                 responder_id
             )
-        
+
         await callback.answer("Автоответчик удален", show_alert=True)
         await my_auto_responders(callback)
 
@@ -22275,6 +22414,20 @@ async def on_startup():
             logger.warning(
                 'on_startup: не удалось восстановить нейрокомментинг %s: %s',
                 row['id'], ex,
+            )
+
+    # Бесконечные маршруты скриптов продолжаются после перезапуска, пока
+    # пользователь явно не нажмёт «Остановить скрипт».
+    async with db_pool.acquire() as conn:
+        running_scripts = await conn.fetch(
+            "SELECT id, user_id FROM user_scripts WHERE last_status = 'running'"
+        )
+    for row in running_scripts:
+        try:
+            await start_script_runner(int(row['id']), int(row['user_id']))
+        except Exception as ex:
+            logger.warning(
+                'on_startup: не удалось восстановить скрипт %s: %s', row['id'], ex,
             )
 
     asyncio.create_task(check_scheduled_broadcasts())
