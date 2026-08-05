@@ -86,8 +86,8 @@ MSK_TZ = pytz.timezone('Europe/Moscow')
 # Данные магазина Platega прописаны в открытом виде по требованию заказчика.
 PLATEGA_API = "https://app.platega.io"
 PLATEGA_MERCHANT_ID = "39cd4a01-a435-4c17-bff2-19519d043d6b"
-# ВНИМАНИЕ: API-ключ пришёл в замаскированном виде — замените на реальный секрет.
-PLATEGA_SECRET = "sh7BhDGLhBnqJxECAGBGkSd68hZ9Xdaqdb1Wmu1SXMbIAR6alPk5F9AyV34VRCx2AChkMoNvTkTEJ1WJo9PFb4aPsCbcwZQRVsl1"
+# Секрет хранится только в окружении развёртывания.
+PLATEGA_SECRET = os.getenv('PLATEGA_SECRET')
 # СБП (QR-код) + Sberpay.
 PLATEGA_PAYMENT_METHOD_SBP = 2
 # Pro-подписка по СБП: 40₽/мес.
@@ -100,12 +100,8 @@ TOPUP_RUB_PER_USDT = 80
 # прокси SmartAPI (https://api.smartapi.shop). Клиент ходит в
 # {base_url}/v1/messages — формат Anthropic Messages API.
 LLM_BASE_URL = os.getenv('LLM_BASE_URL') or 'https://api.smartapi.shop'
-# Токен SmartAPI. Можно переопределить через переменную окружения LLM_API_KEY,
-# иначе используется значение по умолчанию ниже.
-LLM_API_KEY = (
-    os.getenv('LLM_API_KEY')
-    or 'sk-smart-3XD55m5XyNjpez1edNzGkuaqvnnXs6qKm1pf5hQqHEA'
-)
+# Токен SmartAPI хранится только в окружении развёртывания.
+LLM_API_KEY = os.getenv('LLM_API_KEY')
 # Выбранная модель: Sonnet 4.6 (Anthropic Claude) — лучшее качество
 # для копирайтерских задач в связке с SmartAPI-прокси. Если потребуется
 # подключить другие модели (mimo-v2.5, deepseek-v4-flash, minimax-m3),
@@ -144,7 +140,6 @@ GLOBAL_LLM_RUNTIME_READY = False
 # --- Чат с нейросетями ---
 AI_CHAT_FREE_DAILY_LIMIT = 3
 AI_CHAT_PRO_DAILY_LIMIT = 10          # чуть строже
-AI_CHAT_MAX_DAILY_LIMIT = int(os.getenv('AI_CHAT_MAX_DAILY_LIMIT') or '40')
 # Admin can override per-user limit via DB column ai_chat_limit_override
 AI_CHAT_HISTORY_MESSAGES_LIMIT = 16  # 8 пар user/assistant
 AI_CHAT_HISTORY_CONTENT_LIMIT = 2000
@@ -6100,7 +6095,13 @@ async def call_llm_api_with_history(
 
 
 # --- Чат с нейросетями ---
-async def get_ai_chat_limit(user_id: int) -> int:
+async def get_ai_chat_limit(user_id: int) -> Optional[int]:
+    sub = await get_subscription(user_id)
+    tier = sub.get('tier', 'free')
+    # MAX не имеет тарифного лимита. Пользовательский override также не
+    # должен случайно вернуть ограничение владельцу MAX.
+    if tier == 'max':
+        return None
     if db_pool is not None:
         try:
             async with db_pool.acquire() as conn:
@@ -6112,10 +6113,6 @@ async def get_ai_chat_limit(user_id: int) -> int:
                     return int(override)
         except Exception:
             pass
-    sub = await get_subscription(user_id)
-    tier = sub.get('tier', 'free')
-    if tier == 'max':
-        return AI_CHAT_MAX_DAILY_LIMIT
     if tier == 'pro':
         return AI_CHAT_PRO_DAILY_LIMIT
     return AI_CHAT_FREE_DAILY_LIMIT
@@ -6135,11 +6132,25 @@ async def get_ai_chat_usage(user_id: int) -> int:
     return int(count or 0)
 
 
-async def reserve_ai_chat_request(user_id: int) -> Tuple[bool, int, int]:
+async def reserve_ai_chat_request(
+    user_id: int,
+) -> Tuple[bool, int, Optional[int]]:
     """Атомарно резервирует запрос в дневном лимите чата."""
     limit = await get_ai_chat_limit(user_id)
     usage_date = _ai_chat_usage_date()
     async with db_pool.acquire() as conn:
+        if limit is None:
+            used = await conn.fetchval(
+                '''INSERT INTO ai_chat_usage
+                   (user_id, usage_date, request_count, updated_at)
+                   VALUES ($1, $2, 1, NOW())
+                   ON CONFLICT (user_id, usage_date) DO UPDATE SET
+                     request_count = ai_chat_usage.request_count + 1,
+                     updated_at = NOW()
+                   RETURNING request_count''',
+                user_id, usage_date,
+            )
+            return True, int(used), None
         used = await conn.fetchval(
             '''INSERT INTO ai_chat_usage (user_id, usage_date, request_count, updated_at)
                VALUES ($1, $2, 1, NOW())
@@ -6245,11 +6256,14 @@ async def render_ai_chat_screen(user_id: int) -> str:
     model_label = LLM_MODELS.get(model, model)
     sub = await get_subscription(user_id)
     tier = {'max': 'MAX', 'pro': 'Pro'}.get(sub.get('tier'), 'Free')
+    usage_text = (
+        f"{used} (без лимита)" if limit is None else f"{used}/{limit}"
+    )
     return (
         f"{emoji('AI')} <b>Чат с нейросетями</b>\n\n"
         f"Модель: <b>{escape(str(model_label))}</b>\n"
         f"Тариф: <b>{tier}</b>\n"
-        f"Запросов сегодня: <b>{used}/{limit}</b>\n\n"
+        f"Запросов сегодня: <b>{usage_text}</b>\n\n"
         "Отправьте сообщение — я сохраню контекст последних реплик. "
         "Кнопка «Очистить диалог» удалит историю, но не дневной счётчик."
     )
@@ -8848,8 +8862,8 @@ async def smart_delay(
 # ПОДПИСКИ (Free / Pro / MAX) + CRYPTO PAY
 # ============================================================
 CRYPTO_PAY_API = "https://pay.crypt.bot/api"
-# Токен Crypto Pay (@CryptoBot) — основной способ оплаты Pro.
-CRYPTO_PAY_TOKEN = os.getenv("CRYPTO_PAY_TOKEN") or "490665:AAEwanehVerJ8FvFsTf81CWtyY9wSFW86aF"
+# Токен Crypto Pay (@CryptoBot) хранится только в окружении развёртывания.
+CRYPTO_PAY_TOKEN = os.getenv("CRYPTO_PAY_TOKEN")
 # Pro и MAX: несколько сроков на выбор (см. PRO_PLANS).
 # Legacy-константы оставлены для совместимости со старым кодом:
 # это параметры базового 30-дневного тарифа.
@@ -8857,8 +8871,8 @@ PRO_PRICE_USD = "0.60"
 PRO_PRICE_LABEL = "40₽ / 30 дней"
 PRO_DURATION_DAYS = 30
 MAX_DURATION_DAYS = int(os.getenv('MAX_DURATION_DAYS') or '30')
-MAX_PRICE_RUB = int(os.getenv('MAX_PRICE_RUB') or '100')
-MAX_PRICE_USD = os.getenv('MAX_PRICE_USD') or '1.50'
+MAX_PRICE_RUB = int(os.getenv('MAX_PRICE_RUB') or '150')
+MAX_PRICE_USD = os.getenv('MAX_PRICE_USD') or '2.25'
 
 # ------------------------------------------------------------
 # Каталог тарифов Pro и MAX.
@@ -8890,15 +8904,15 @@ PRO_PLANS: Dict[str, Dict[str, Any]] = {
     },
     # MAX — отдельный тариф
     "max_1d": {
-        "code": "max_1d", "tier": "max", "days": 1, "rub": 20, "usd": "0.30",
+        "code": "max_1d", "tier": "max", "days": 1, "rub": 25, "usd": "0.375",
         "title": "1 день", "badge": "MAX",
     },
     "max_30d": {
-        "code": "max_30d", "tier": "max", "days": 30, "rub": 120, "usd": "1.80",
+        "code": "max_30d", "tier": "max", "days": 30, "rub": 150, "usd": "2.25",
         "title": "30 дней", "badge": "MAX",
     },
     "max_90d": {
-        "code": "max_90d", "tier": "max", "days": 90, "rub": 200, "usd": "3.00",
+        "code": "max_90d", "tier": "max", "days": 90, "rub": 250, "usd": "3.75",
         "title": "90 дней", "badge": "MAX · выгодно",
     },
 }
@@ -8927,23 +8941,36 @@ def pro_plan_button_text(plan: Dict[str, Any]) -> str:
     return f"{tier}{plan['title']} — {plan['rub']}₽{badge}"
 
 
-def pro_plans_text() -> str:
-    """Список тарифов для текстовых экранов."""
+def pro_plans_text(plan_tier: Optional[str] = None) -> str:
+    """Список тарифов для текстовых экранов с фильтром по тиру."""
     lines = []
     for code in PRO_PLAN_ORDER:
         plan = PRO_PLANS[code]
+        if plan_tier and plan.get("tier") != plan_tier:
+            continue
         badge = f" — {plan['badge']}" if plan.get("badge") else ""
         per_day = plan["rub"] / plan["days"]
         extra = f" (~{per_day:.1f}₽/день)" if plan["days"] > 1 else ""
-        tier = 'MAX · ' if plan.get('tier') == 'max' else ''
+        tier_prefix = 'MAX · ' if plan.get('tier') == 'max' else ''
         lines.append(
-            f"  • <b>{tier}{plan['title']}</b> — {plan['rub']}₽{extra}{badge}"
+            f"  • <b>{tier_prefix}{plan['title']}</b> — {plan['rub']}₽{extra}{badge}"
         )
     return "\n".join(lines)
 
 
 def pro_min_price_label() -> str:
-    cheapest = min(PRO_PLANS.values(), key=lambda p: p["rub"])
+    cheapest = min(
+        (plan for plan in PRO_PLANS.values() if plan.get("tier") == "pro"),
+        key=lambda plan: plan["rub"],
+    )
+    return f"от {cheapest['rub']}₽ / {cheapest['title']}"
+
+
+def max_min_price_label() -> str:
+    cheapest = min(
+        (plan for plan in PRO_PLANS.values() if plan.get("tier") == "max"),
+        key=lambda plan: plan["rub"],
+    )
     return f"от {cheapest['rub']}₽ / {cheapest['title']}"
 
 
@@ -9087,8 +9114,8 @@ async def activate_pro_plan(
 ) -> datetime:
     """Включает Pro/MAX на срок тарифа.
 
-    MAX — отдельный тариф.
-    Если у пользователя уже активен Pro, то MAX начнётся только после окончания Pro.
+    При переходе с активного Pro тариф MAX включается сразу. Оставшийся срок
+    Pro сохраняется, и к нему прибавляются дни купленного MAX.
     """
     now = datetime.now(MSK_TZ).replace(tzinfo=None)
     base = now
@@ -9106,12 +9133,6 @@ async def activate_pro_plan(
         logger.warning(f"activate_pro_plan: could not read current sub: {ex}")
     expires = base + timedelta(days=int(plan["days"]))
     target_tier = plan.get('tier', 'pro')
-
-    # MAX — отдельный тариф.
-    # Если уже есть Pro — MAX начнётся только после окончания Pro.
-    if target_tier == 'max' and sub.get('tier') == 'pro' and base > now:
-        # MAX начисляется после окончания Pro
-        pass
 
     # Не понижаем действующий MAX, если пользователь купил обычный Pro.
     if target_tier == 'pro' and sub.get('tier') == 'max' and base > now:
@@ -13077,7 +13098,7 @@ async def help_ai_chat_handler(callback: CallbackQuery):
         "• Используется выбранная модель и личный API, если он настроен; иначе базовый API.\n"
         f"• Free: <b>{AI_CHAT_FREE_DAILY_LIMIT}</b> успешных запроса в день.\n"
         f"• Pro: <b>{AI_CHAT_PRO_DAILY_LIMIT}</b> успешных запросов в день.\n"
-        f"• MAX: <b>{AI_CHAT_MAX_DAILY_LIMIT}</b> успешных запросов в день.\n\n"
+        "• MAX: <b>без лимита</b>.\n\n"
         "Если API вернул ошибку или пустой ответ, лимит за такой запрос возвращается."
     )
     await callback.message.edit_text(text, reply_markup=get_help_feature_keyboard())
@@ -13134,6 +13155,10 @@ async def help_tariffs_handler(callback: CallbackQuery):
         "• Ручной AI-анализ риска аккаунта.\n"
         "• AI-автоответчик на аккаунте.\n"
         "• Приоритетная поддержка и ранний доступ к новым функциям.\n\n"
+        "<b>MAX</b>\n"
+        "• Никаких тарифных лимитов внутри сервиса.\n"
+        "• Без ограничений на AI-генератор, чат с нейросетями и рассылки.\n"
+        "• Все возможности Pro включены.\n\n"
         f"<b>Сроки и цены Pro/MAX:</b>\n{pro_plans_text()}\n\n"
         "Срок можно взять любой — при продлении дни складываются."
     )
@@ -13155,12 +13180,26 @@ def get_subscription_keyboard(tier: str) -> InlineKeyboardMarkup:
             style='success',
             icon_custom_emoji_id=get_icon("CHECK")
         ))
-        builder.row(InlineKeyboardButton(
-            text=f"Продлить {tier_label}",
-            callback_data="buy_pro",
-            style='primary',
-            icon_custom_emoji_id=get_icon("MONEY_SEND")
-        ))
+        if tier == 'pro':
+            builder.row(InlineKeyboardButton(
+                text="Продлить Pro",
+                callback_data="buy_pro",
+                style='primary',
+                icon_custom_emoji_id=get_icon("MONEY_SEND")
+            ))
+            builder.row(InlineKeyboardButton(
+                text=f"Перейти на MAX — {max_min_price_label()}",
+                callback_data="buy_max",
+                style='primary',
+                icon_custom_emoji_id=get_icon("STAR")
+            ))
+        else:
+            builder.row(InlineKeyboardButton(
+                text="Продлить MAX",
+                callback_data="buy_max",
+                style='primary',
+                icon_custom_emoji_id=get_icon("MONEY_SEND")
+            ))
     else:
         builder.row(InlineKeyboardButton(
             text=f"Купить Pro — {pro_min_price_label()}",
@@ -13188,16 +13227,20 @@ async def format_limits_text(user_id: int) -> str:
     """Returns a short usage-counter block to embed in subscription/menu messages."""
     sub = await get_subscription(user_id)
     tier = sub.get('tier', 'free')
-    if tier in ('pro', 'max'):
+    if tier == 'max':
+        return (
+            f"{emoji('STAR')} <b>MAX — без лимитов</b>\n"
+            "  Никаких дневных или недельных тарифных ограничений"
+        )
+    if tier == 'pro':
         try:
             chat_used = await get_ai_chat_usage(user_id)
         except Exception:
             chat_used = 0
-        chat_limit = AI_CHAT_MAX_DAILY_LIMIT if tier == 'max' else AI_CHAT_PRO_DAILY_LIMIT
         return (
             f"{emoji('STAR')} <b>Лимиты:</b> {subscription_tier_label(tier)}\n"
             f"  AI-генератор: без ограничений\n"
-            f"  Чат с нейросетями: {chat_used}/{chat_limit} сегодня"
+            f"  Чат с нейросетями: {chat_used}/{AI_CHAT_PRO_DAILY_LIMIT} сегодня"
         )
 
     # Счётчики использования — не критичны. Если БД недоступна или
@@ -13290,7 +13333,10 @@ async def my_subscription(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "noop")
 async def noop_handler(callback: CallbackQuery):
-    await callback.answer("У вас уже Pro — можно продлить срок", show_alert=False)
+    await callback.answer(
+        "Тариф активен — его можно продлить в этом разделе",
+        show_alert=False,
+    )
 
 
 @dp.callback_query(F.data == "buy_pro")
@@ -13329,7 +13375,7 @@ async def buy_pro(callback: CallbackQuery):
     await callback.message.edit_text(
         header +
         "Выберите срок:\n"
-        f"{pro_plans_text()}\n\n"
+        f"{pro_plans_text('pro')}\n\n"
         "Оплата: СБП (₽) или Crypto Pay (USDT).",
         reply_markup=builder.as_markup()
     )
@@ -13340,8 +13386,7 @@ async def buy_max(callback: CallbackQuery):
     """Шаг 1 — выбор срока MAX (отдельный тариф)."""
     await callback.answer()
     sub = await get_subscription(callback.from_user.id)
-    is_active_pro = sub.get("tier") in ("pro", "max")
-    active_label = subscription_tier_label(sub.get("tier"))
+    current_tier = sub.get("tier", "free")
 
     builder = InlineKeyboardBuilder()
     for code in PRO_PLAN_ORDER:
@@ -13361,25 +13406,27 @@ async def buy_max(callback: CallbackQuery):
         icon_custom_emoji_id=get_icon("BACK")
     ))
 
-    header = (
-        f"{emoji('MONEY_SEND')} <b>Продление {active_label}</b>\n\n"
-        "MAX начнётся только после окончания текущей подписки.\n\n"
-        if is_active_pro else
-        f"{emoji('STAR')} <b>Покупка MAX (отдельный тариф)</b>\n\n"
-    )
-
-    note = ""
-    if sub.get("tier") == "pro" and sub.get("expires_at") and sub["expires_at"] > datetime.now(MSK_TZ).replace(tzinfo=None):
-        note = "\n⚠️ У вас уже есть <b>Pro</b>. MAX начнётся только после окончания Pro-тарифа.\n"
-
-    limits = await format_limits_text(callback.from_user.id)
+    if current_tier == "max":
+        header = (
+            f"{emoji('STAR')} <b>Продление MAX</b>\n\n"
+            "Новый срок прибавится к текущей подписке.\n\n"
+        )
+    elif current_tier == "pro":
+        header = (
+            f"{emoji('STAR')} <b>Переход с Pro на MAX</b>\n\n"
+            "После оплаты MAX включится сразу. Оставшиеся дни Pro "
+            "сохранятся, а выбранный срок MAX прибавится к ним.\n\n"
+        )
+    else:
+        header = f"{emoji('STAR')} <b>Покупка MAX</b>\n\n"
 
     await callback.message.edit_text(
         header +
+        f"{emoji('CHECK')} <b>В MAX не будет никаких тарифных лимитов:</b> "
+        "без дневных и недельных ограничений внутри сервиса.\n\n"
         "Выберите срок MAX:\n"
-        f"{pro_plans_text()}\n\n"
-        f"{limits}\n\n"
-        f"Оплата: СБП (₽) или Crypto Pay (USDT).{note}",
+        f"{pro_plans_text('max')}\n\n"
+        "Оплата: СБП (₽) или Crypto Pay (USDT).",
         reply_markup=builder.as_markup()
     )
 
@@ -13389,6 +13436,8 @@ async def buy_pro_choose_method(callback: CallbackQuery):
     """Шаг 2 — выбор способа оплаты для выбранного срока."""
     await callback.answer()
     plan = get_pro_plan(callback.data.split(":", 1)[1])
+    is_max = plan.get("tier") == "max"
+    back_callback = "buy_max" if is_max else "buy_pro"
 
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(
@@ -13405,7 +13454,7 @@ async def buy_pro_choose_method(callback: CallbackQuery):
     ))
     builder.row(InlineKeyboardButton(
         text="Другой срок",
-        callback_data="buy_pro",
+        callback_data=back_callback,
         style='default',
         icon_custom_emoji_id=get_icon("BACK")
     ))
@@ -13416,9 +13465,14 @@ async def buy_pro_choose_method(callback: CallbackQuery):
         icon_custom_emoji_id=get_icon("BACK")
     ))
     await callback.message.edit_text(
-        f"{emoji('MONEY_SEND')} <b>Оплата подписки</b>\n\n"
+        f"{emoji('MONEY_SEND')} <b>Оплата {subscription_tier_label(plan.get('tier'))}</b>\n\n"
         f"Срок: <b>{plan['title']}</b>\n"
         f"Стоимость: <b>{plan['rub']}₽</b> / <b>{plan['usd']} USDT</b>\n\n"
+        + (
+            f"{emoji('CHECK')} <b>После покупки MAX тарифных лимитов "
+            "внутри сервиса не будет.</b>\n\n"
+            if is_max else ""
+        ) +
         f"Выберите удобный способ оплаты:\n"
         f"  {emoji('CHECK')} <b>СБП</b> — оплата по QR-коду / Sberpay (₽)\n"
         f"  {emoji('CHECK')} <b>Crypto Pay</b> — оплата в USDT через @CryptoBot",
@@ -13488,6 +13542,10 @@ async def buy_pro_crypto(callback: CallbackQuery):
         f"{emoji('MONEY_SEND')} <b>Счёт на оплату подписки</b>\n\n"
         f"Тариф: <b>{subscription_tier_label(plan.get('tier'))} · {plan['title']}</b>\n"
         f"Сумма: <b>{amount} {asset}</b>\n\n"
+        + (
+            f"{emoji('CHECK')} MAX будет без тарифных лимитов внутри сервиса.\n\n"
+            if plan.get('tier') == 'max' else ""
+        ) +
         f"{emoji('CLOCK')} Оплата проверяется автоматически...",
         reply_markup=builder.as_markup()
     )
@@ -13551,6 +13609,10 @@ async def buy_pro_sbp(callback: CallbackQuery):
         f"{emoji('MONEY_SEND')} <b>Счёт на оплату подписки (СБП)</b>\n\n"
         f"Тариф: <b>{subscription_tier_label(plan.get('tier'))} · {plan['title']}</b>\n"
         f"Сумма: <b>{plan['rub']} ₽</b>\n\n"
+        + (
+            f"{emoji('CHECK')} MAX будет без тарифных лимитов внутри сервиса.\n\n"
+            if plan.get('tier') == 'max' else ""
+        ) +
         f"{emoji('CLOCK')} Оплата проверяется автоматически...",
         reply_markup=builder.as_markup()
     )
