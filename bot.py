@@ -31,7 +31,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup,
-    InlineKeyboardButton, WebAppInfo, FSInputFile, BufferedInputFile
+    InlineKeyboardButton, WebAppInfo, FSInputFile, BufferedInputFile,
+    LabeledPrice, PreCheckoutQuery
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from telethon import TelegramClient, events, Button
@@ -253,6 +254,36 @@ WARMING_DEFAULT_COOLDOWN_MIN = 5 * 60     # 5 минут между волнам
 WARMING_DEFAULT_COOLDOWN_MAX = 18 * 60    # 18 минут — потолок
 WARMING_ACTIONS_PER_CYCLE_MIN = 2
 WARMING_ACTIONS_PER_CYCLE_MAX = 4
+
+# Уровни прогрева задают реальные границы нагрузки. LLM формирует наполнение
+# плана, но не может выйти за выбранные интервалы и число действий.
+WARMING_LEVEL_PROFILES: Dict[str, Dict[str, Any]] = {
+    'low': {
+        'label': 'Низкий',
+        'description': 'для новых аккаунтов',
+        'intervals_min_sec': 18 * 60,
+        'intervals_max_sec': 30 * 60,
+        'actions_min': 1,
+        'actions_max': 2,
+    },
+    'medium': {
+        'label': 'Средний',
+        'description': 'для аккаунтов после низкого уровня',
+        'intervals_min_sec': 10 * 60,
+        'intervals_max_sec': 20 * 60,
+        'actions_min': 2,
+        'actions_max': 3,
+    },
+    'high': {
+        'label': 'Высокий',
+        'description': 'только для старых и уже прогретых аккаунтов',
+        'intervals_min_sec': 6 * 60,
+        'intervals_max_sec': 15 * 60,
+        'actions_min': 3,
+        'actions_max': 4,
+    },
+}
+DEFAULT_WARMING_LEVEL = 'medium'
 
 # --- Эмодзи ---
 EMOJI = {
@@ -1437,6 +1468,7 @@ async def init_db():
                 external_id TEXT NOT NULL,
                 amount_usdt NUMERIC(12, 6),
                 amount_rub NUMERIC(12, 2),
+                amount_stars INTEGER,
                 status TEXT NOT NULL DEFAULT 'paid',
                 metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
                 created_at TIMESTAMP DEFAULT NOW(),
@@ -1444,6 +1476,13 @@ async def init_db():
                 UNIQUE(provider, external_id)
             )
         ''')
+        try:
+            await conn.execute(
+                'ALTER TABLE payment_events '
+                'ADD COLUMN IF NOT EXISTS amount_stars INTEGER'
+            )
+        except Exception:
+            pass
         try:
             await conn.execute(
                 'CREATE INDEX IF NOT EXISTS idx_payment_events_paid_at '
@@ -2804,6 +2843,7 @@ async def update_account_warming(account_id: int, enabled: bool):
 # ========== ПЛАНЫ ПРОГРЕВА (LLM) ==========
 # План — это JSONB, сгенерированный LLM на WARMING_PLAN_SYSTEM_PROMPT.
 # Структура плана (поля, которые ожидает воркер):
+#   warming_level      — low / medium / high
 #   duration_hours      — окно прогрева (по умолчанию 12)
 #   total_cycles        — оценочное число волн
 #   intervals_min_sec   — мин. пауза между волнами (сек)
@@ -2917,23 +2957,39 @@ async def mark_warming_plan_started(plan_id: int) -> None:
         logger.debug(f"mark_warming_plan_started failed: {ex}")
 
 
+def normalize_warming_level(value: Optional[str]) -> str:
+    level = str(value or '').strip().lower()
+    return level if level in WARMING_LEVEL_PROFILES else DEFAULT_WARMING_LEVEL
+
+
+def warming_level_label(value: Optional[str]) -> str:
+    level = normalize_warming_level(value)
+    return str(WARMING_LEVEL_PROFILES[level]['label'])
+
+
 def _safe_plan_defaults(base: dict) -> dict:
     """Подмешивает безопасные дефолты, если LLM что-то не вернула."""
     p = dict(base or {})
+    level = normalize_warming_level(p.get('warming_level'))
+    profile = WARMING_LEVEL_PROFILES[level]
+    p['warming_level'] = level
     p.setdefault('duration_hours', 12)
     p.setdefault('total_cycles', 24)
-    p.setdefault('intervals_min_sec', 5 * 60)
-    p.setdefault('intervals_max_sec', 18 * 60)
-    # Нормируем интервалы в безопасный диапазон 300..1800 сек.
+    # Интервалы определяются выбранным пользователем уровнем. Это защищает
+    # новые аккаунты от слишком активного плана, даже если LLM ошиблась.
+    p['intervals_min_sec'] = int(profile['intervals_min_sec'])
+    p['intervals_max_sec'] = int(profile['intervals_max_sec'])
     try:
-        imin = int(p['intervals_min_sec'])
-        imax = int(p['intervals_max_sec'])
+        duration_hours = max(1, int(p.get('duration_hours', 12)))
     except (TypeError, ValueError):
-        imin, imax = 5 * 60, 18 * 60
-    imin = max(300, min(imin, 1700))
-    imax = max(imin + 60, min(imax, 1800))
-    p['intervals_min_sec'] = imin
-    p['intervals_max_sec'] = imax
+        duration_hours = 12
+    p['duration_hours'] = duration_hours
+    average_interval = (
+        p['intervals_min_sec'] + p['intervals_max_sec']
+    ) / 2
+    p['total_cycles'] = max(
+        1, round(duration_hours * 3600 / average_interval)
+    )
 
     p.setdefault('distribution', {
         'read_dialogs': 0.35,
@@ -2950,13 +3006,33 @@ def _safe_plan_defaults(base: dict) -> dict:
     if not isinstance(p['reaction_pool'], list) or not p['reaction_pool']:
         p['reaction_pool'] = list(WARMING_REACTIONS)
     p.setdefault('schedule', [])
+    normalized_schedule = []
+    if isinstance(p['schedule'], list):
+        actions_min = int(profile['actions_min'])
+        actions_max = int(profile['actions_max'])
+        for raw_item in p['schedule']:
+            if not isinstance(raw_item, dict):
+                continue
+            item = dict(raw_item)
+            try:
+                item_min = int(item.get('actions_count_min', actions_min))
+                item_max = int(item.get('actions_count_max', actions_max))
+            except (TypeError, ValueError):
+                item_min, item_max = actions_min, actions_max
+            item_min = max(actions_min, min(item_min, actions_max))
+            item_max = max(item_min, min(item_max, actions_max))
+            item['actions_count_min'] = item_min
+            item['actions_count_max'] = item_max
+            normalized_schedule.append(item)
+    p['schedule'] = normalized_schedule
     p.setdefault('quiet_periods', ['00:00-07:00'])
     p.setdefault('narrative', 'План прогрева без подробного описания.')
     return p
 
 
 async def generate_warming_plan_llm(
-    account: dict, user_id: int, duration_hours: int = 12
+    account: dict, user_id: int, duration_hours: int = 12,
+    warming_level: str = DEFAULT_WARMING_LEVEL,
 ) -> dict:
     """Генерирует план прогрева через LLM. Возвращает dict с полями
     {plan, narrative, raw, elapsed_sec}.
@@ -2975,16 +3051,26 @@ async def generate_warming_plan_llm(
     proxy_id = account.get('proxy_id')
     has_proxy = bool(proxy_id)
     cycles = account.get('warming_cycles') or 0
+    warming_level = normalize_warming_level(warming_level)
+    level_profile = WARMING_LEVEL_PROFILES[warming_level]
 
     # Контекстный промпт с конкретикой по аккаунту.
     user_prompt = (
         f"Аккаунт: {phone}\n"
         f"Прокси: {'есть' if has_proxy else 'нет'}\n"
         f"Пройдено циклов прогрева ранее: {cycles}\n"
+        f"Выбранный уровень: {level_profile['label']} "
+        f"({level_profile['description']}).\n"
+        f"Разрешённые паузы: "
+        f"{level_profile['intervals_min_sec']//60}–"
+        f"{level_profile['intervals_max_sec']//60} минут.\n"
+        f"Действий в одной волне: "
+        f"{level_profile['actions_min']}–{level_profile['actions_max']}.\n"
         f"Окно прогрева: {duration_hours} часов.\n"
         f"Текущее время (МСК): {datetime.now(MSK_TZ).strftime('%H:%M')}, "
         f"день недели: {datetime.now(MSK_TZ).strftime('%A')}.\n\n"
-        f"Сгенерируй план прогрева на {duration_hours} часов. "
+        f"Сгенерируй план прогрева на {duration_hours} часов строго для "
+        f"уровня «{level_profile['label']}». "
         f"Учти время суток: ночью активность минимальна, утром "
         f"нарастает, днём полная, вечером осторожная. "
         f"Все интервалы и интенсивности — плавные, без резких пиков. "
@@ -3016,6 +3102,7 @@ async def generate_warming_plan_llm(
         content = ''
 
     plan = _parse_warming_plan_json(content)
+    plan['warming_level'] = warming_level
     plan = _safe_plan_defaults(plan)
 
     # narrative — из ответа LLM, иначе генерим короткий по distribution.
@@ -3062,6 +3149,8 @@ def _parse_warming_plan_json(content: str) -> dict:
 def _format_warming_plan_message(plan: dict, narrative: str) -> str:
     """Готовим красивое текстовое представление плана для юзера."""
     p = _safe_plan_defaults(plan)
+    level = normalize_warming_level(p.get('warming_level'))
+    level_profile = WARMING_LEVEL_PROFILES[level]
     d = p.get('distribution', {}) or {}
     duration = p.get('duration_hours', 12)
     total = p.get('total_cycles', '—')
@@ -3080,6 +3169,8 @@ def _format_warming_plan_message(plan: dict, narrative: str) -> str:
 
     lines = [
         f"{emoji('FIRE')} <b>План прогрева готов</b>\n",
+        f"{emoji('CHART_UP')} Уровень: <b>{level_profile['label']}</b> — "
+        f"{level_profile['description']}\n",
         f"{emoji('CLOCK')} Окно: <b>{duration} ч</b> · "
         f"Волн: <b>~{total}</b> · "
         f"Паузы: <b>{imin}–{imax} мин</b>\n",
@@ -3144,7 +3235,35 @@ def _format_warming_plan_message(plan: dict, narrative: str) -> str:
     return ''.join(lines)
 
 
-def _warming_plan_keyboard(plan_id: int, account_id: int) -> InlineKeyboardMarkup:
+def _warming_level_keyboard(account_id: int) -> InlineKeyboardMarkup:
+    """Выбор нагрузки до генерации AI-плана."""
+    builder = InlineKeyboardBuilder()
+    for level in ('low', 'medium', 'high'):
+        profile = WARMING_LEVEL_PROFILES[level]
+        builder.row(InlineKeyboardButton(
+            text=(
+                f"{profile['label']} — "
+                f"{profile['description']}"
+            ),
+            callback_data=f"warming_level:{account_id}:{level}",
+            style='success' if level == 'low' else 'default',
+            icon_custom_emoji_id=get_icon(
+                'CHECK' if level == 'low' else 'FIRE'
+            ),
+        ))
+    builder.row(InlineKeyboardButton(
+        text="Назад",
+        callback_data=f"manage_account_{account_id}",
+        style='default',
+        icon_custom_emoji_id=get_icon("BACK"),
+    ))
+    return builder.as_markup()
+
+
+def _warming_plan_keyboard(
+    plan_id: int, account_id: int,
+    warming_level: str = DEFAULT_WARMING_LEVEL,
+) -> InlineKeyboardMarkup:
     """Кнопки после генерации плана: запустить / перегенерировать / отмена."""
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(
@@ -3156,7 +3275,10 @@ def _warming_plan_keyboard(plan_id: int, account_id: int) -> InlineKeyboardMarku
     builder.row(
         InlineKeyboardButton(
             text="Перегенерировать",
-            callback_data=f"regen_warming_{account_id}",
+            callback_data=(
+                f"regen_warming_{account_id}_"
+                f"{normalize_warming_level(warming_level)}"
+            ),
             style='primary',
             icon_custom_emoji_id=get_icon("REFRESH")
         ),
@@ -5306,6 +5428,7 @@ PAYMENT_KIND_WALLET_TOPUP = 'wallet_topup'
 PAYMENT_KIND_PRO_SUBSCRIPTION = 'pro_subscription'
 PAYMENT_PROVIDER_CRYPTOPAY = 'cryptopay'
 PAYMENT_PROVIDER_PLATEGA = 'platega'
+PAYMENT_PROVIDER_TELEGRAM_STARS = 'telegram_stars'
 
 ADMIN_FINANCE_PERIODS = {
     1: '24 часа',
@@ -5322,6 +5445,7 @@ FINANCE_KIND_LABELS = {
 FINANCE_PROVIDER_LABELS = {
     PAYMENT_PROVIDER_CRYPTOPAY: 'Crypto Pay',
     PAYMENT_PROVIDER_PLATEGA: 'СБП / Platega',
+    PAYMENT_PROVIDER_TELEGRAM_STARS: 'Telegram Stars',
 }
 
 
@@ -5359,7 +5483,9 @@ def format_finance_usdt(value: Any) -> str:
     return result.rstrip('0').rstrip('.') or '0'
 
 
-def format_finance_amounts(amount_rub: Any, amount_usdt: Any) -> str:
+def format_finance_amounts(
+    amount_rub: Any, amount_usdt: Any, amount_stars: Any = None,
+) -> str:
     values = []
     try:
         if amount_rub is not None and float(amount_rub) != 0:
@@ -5369,6 +5495,11 @@ def format_finance_amounts(amount_rub: Any, amount_usdt: Any) -> str:
     try:
         if amount_usdt is not None and float(amount_usdt) != 0:
             values.append(f'{format_finance_usdt(amount_usdt)} USDT')
+    except (TypeError, ValueError):
+        pass
+    try:
+        if amount_stars is not None and int(amount_stars) != 0:
+            values.append(f'{int(amount_stars)} ⭐')
     except (TypeError, ValueError):
         pass
     return ' · '.join(values) if values else '0 ₽'
@@ -5390,6 +5521,7 @@ async def get_admin_finance_stats(days: int = 30) -> Dict[str, Any]:
                     COUNT(*) AS payment_count,
                     COALESCE(SUM(p.amount_rub), 0) AS rub_total,
                     COALESCE(SUM(p.amount_usdt), 0) AS usdt_total,
+                    COALESCE(SUM(p.amount_stars), 0) AS stars_total,
                     COUNT(*) FILTER (
                         WHERE p.kind = '{PAYMENT_KIND_WALLET_TOPUP}'
                     ) AS topup_count,
@@ -5407,7 +5539,10 @@ async def get_admin_finance_stats(days: int = 30) -> Dict[str, Any]:
                     ), 0) AS pro_rub,
                     COALESCE(SUM(p.amount_usdt) FILTER (
                         WHERE p.kind = '{PAYMENT_KIND_PRO_SUBSCRIPTION}'
-                    ), 0) AS pro_usdt
+                    ), 0) AS pro_usdt,
+                    COALESCE(SUM(p.amount_stars) FILTER (
+                        WHERE p.kind = '{PAYMENT_KIND_PRO_SUBSCRIPTION}'
+                    ), 0) AS pro_stars
                 FROM payment_events p
                 WHERE {where}''',
             *params,
@@ -5416,7 +5551,8 @@ async def get_admin_finance_stats(days: int = 30) -> Dict[str, Any]:
             f'''SELECT p.provider,
                        COUNT(*) AS payment_count,
                        COALESCE(SUM(p.amount_rub), 0) AS rub_total,
-                       COALESCE(SUM(p.amount_usdt), 0) AS usdt_total
+                       COALESCE(SUM(p.amount_usdt), 0) AS usdt_total,
+                       COALESCE(SUM(p.amount_stars), 0) AS stars_total
                 FROM payment_events p
                 WHERE {where}
                 GROUP BY p.provider
@@ -5466,7 +5602,7 @@ async def get_admin_payment_events(
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             f'''SELECT p.id, p.user_id, p.kind, p.provider, p.external_id,
-                       p.amount_rub, p.amount_usdt, p.paid_at,
+                       p.amount_rub, p.amount_usdt, p.amount_stars, p.paid_at,
                        u.username, u.first_name
                 FROM payment_events p
                 LEFT JOIN users u ON u.user_id = p.user_id
@@ -5526,7 +5662,7 @@ async def render_admin_finance(days: int = 30) -> Tuple[str, InlineKeyboardMarku
         provider = FINANCE_PROVIDER_LABELS.get(row['provider'], row['provider'])
         provider_lines.append(
             f"• {escape(str(provider))}: <b>{row['payment_count']}</b> — "
-            f"{format_finance_amounts(row['rub_total'], row['usdt_total'])}"
+            f"{format_finance_amounts(row['rub_total'], row['usdt_total'], row['stars_total'])}"
         )
     if not provider_lines:
         provider_lines.append('• Подтверждённых платежей пока нет')
@@ -5537,12 +5673,13 @@ async def render_admin_finance(days: int = 30) -> Tuple[str, InlineKeyboardMarku
         f"{emoji('MONEY_SEND')} <b>Выручка</b>\n"
         f"Подтверждённых платежей: <b>{stats.get('payment_count', 0)}</b>\n"
         f"Рубли (СБП): <b>{format_finance_rub(stats.get('rub_total'))} ₽</b>\n"
-        f"USDT (Crypto Pay): <b>{format_finance_usdt(stats.get('usdt_total'))} USDT</b>\n\n"
+        f"USDT (Crypto Pay): <b>{format_finance_usdt(stats.get('usdt_total'))} USDT</b>\n"
+        f"Telegram Stars: <b>{int(stats.get('stars_total') or 0)} ⭐</b>\n\n"
         f"<b>По продуктам</b>\n"
         f"• Пополнения баланса: <b>{stats.get('topup_count', 0)}</b> — "
         f"{format_finance_amounts(stats.get('topup_rub'), stats.get('topup_usdt'))}\n"
         f"• Pro/MAX-подписки: <b>{stats.get('pro_count', 0)}</b> — "
-        f"{format_finance_amounts(stats.get('pro_rub'), stats.get('pro_usdt'))}\n\n"
+        f"{format_finance_amounts(stats.get('pro_rub'), stats.get('pro_usdt'), stats.get('pro_stars'))}\n\n"
         f"<b>По способу оплаты</b>\n"
         + '\n'.join(provider_lines)
         + f"\n\n{emoji('MONEY_SEND')} "
@@ -5565,7 +5702,7 @@ def build_admin_finance_csv(rows: List[Dict[str, Any]]) -> bytes:
     output = io.StringIO(newline='')
     writer = csv.writer(output, delimiter=';')
     writer.writerow([
-        'Дата оплаты', 'Тип', 'Провайдер', 'Сумма, ₽', 'Сумма, USDT',
+        'Дата оплаты', 'Тип', 'Провайдер', 'Сумма, ₽', 'Сумма, USDT', 'Stars',
         'Telegram ID', 'Username', 'Имя', 'Внешний ID',
     ])
     for row in rows:
@@ -5580,6 +5717,7 @@ def build_admin_finance_csv(rows: List[Dict[str, Any]]) -> bytes:
             FINANCE_PROVIDER_LABELS.get(row.get('provider'), row.get('provider') or ''),
             format_finance_rub(row.get('amount_rub')) if row.get('amount_rub') is not None else '',
             format_finance_usdt(row.get('amount_usdt')) if row.get('amount_usdt') is not None else '',
+            int(row.get('amount_stars') or 0) if row.get('amount_stars') is not None else '',
             finance_csv_cell(row.get('user_id')),
             finance_csv_cell(row.get('username')),
             finance_csv_cell(row.get('first_name')),
@@ -5774,17 +5912,19 @@ WARMING_PLAN_SYSTEM_PROMPT = """Ты — эксперт по безопасно�
   - status_toggle : сменить online/offline (использовать редко)
 
 Правила генерации:
-  1. Интервалы между волнами (intervals) — В СЕКУНДАХ, в диапазоне 300..1800 (5..30 минут). Ночью интервалы длиннее, днём короче.
-  2. distribution — сумма вероятностей примерно 1.0. Безопасные действия (read, view_stories) имеют больший вес.
-  3. saved_notes — МАССИВ из 8-12 КОРОТКИХ текстов на русском (как будто человек пишет самому себе). Каждый до 80 символов. БЕЗ спама, БЕЗ рекламы. Разнообразные: напоминалки, мысли, короткие заметки.
-  4. reaction_pool — 4-6 эмодзи из безопасного набора: «👍», «🔥», «❤️», «😂», «😢», «🙏».
-  5. schedule — массив объектов {hour_offset, intensity, focus, actions_count_min, actions_count_max}. intensity ∈ {low, medium, high}. focus — короткая подсказка что делать (например «active_dialogs», «stories_only», «rest»).
-  6. quiet_periods — массив строк вида «HH:MM-HH:MM» в МСК, когда активность минимальна (например ночь 00:00-07:00). Если время сейчас попадает в quiet_period — бот должен уйти в длинный сон.
-  7. narrative — 2-3 предложения на русском, КРАТКОЕ описание стратегии плана (человеческим языком, без JSON). Будет показано пользователю в карточке плана.
-  8. total_cycles — оценочное число волн за всё окно.
+  1. warming_level — выбранный пользователем уровень low, medium или high. Не меняй выбранный уровень.
+  2. Интервалы между волнами (intervals) — В СЕКУНДАХ и строго внутри границ, переданных пользователем. Ночью интервалы длиннее, днём короче.
+  3. distribution — сумма вероятностей примерно 1.0. Безопасные действия (read, view_stories) имеют больший вес.
+  4. saved_notes — МАССИВ из 8-12 КОРОТКИХ текстов на русском (как будто человек пишет самому себе). Каждый до 80 символов. БЕЗ спама, БЕЗ рекламы. Разнообразные: напоминалки, мысли, короткие заметки.
+  5. reaction_pool — 4-6 эмодзи из безопасного набора: «👍», «🔥», «❤️», «😂», «😢», «🙏».
+  6. schedule — массив объектов {hour_offset, intensity, focus, actions_count_min, actions_count_max}. intensity ∈ {low, medium, high}. focus — короткая подсказка что делать (например «active_dialogs», «stories_only», «rest»).
+  7. quiet_periods — массив строк вида «HH:MM-HH:MM» в МСК, когда активность минимальна (например ночь 00:00-07:00). Если время сейчас попадает в quiet_period — бот должен уйти в длинный сон.
+  8. narrative — 2-3 предложения на русском, КРАТКОЕ описание стратегии плана (человеческим языком, без JSON). Будет показано пользователю в карточке плана.
+  9. total_cycles — оценочное число волн за всё окно.
 
 Формат ответа — СТРОГО JSON, без markdown, без пояснений, без префиксов. Только валидный JSON (пример структуры):
 {
+  "warming_level": "low",
   "duration_hours": 12,
   "total_cycles": 24,
   "intervals_min_sec": 480,
@@ -7085,14 +7225,20 @@ def _build_weighted_pool(distribution: Dict[str, float]) -> List[str]:
 
 
 def _actions_count_for_now(
-    schedule: List[Dict[str, Any]], distribution: Dict[str, float]
+    schedule: List[Dict[str, Any]], distribution: Dict[str, float],
+    warming_level: str = DEFAULT_WARMING_LEVEL,
 ) -> int:
     """Сколько действий выполнить в текущей волне — на основе
     schedule из плана. Если для текущего часа нет фазы, берём
     дефолт 2-3 действия.
     """
+    profile = WARMING_LEVEL_PROFILES[
+        normalize_warming_level(warming_level)
+    ]
+    profile_min = int(profile['actions_min'])
+    profile_max = int(profile['actions_max'])
     if not schedule:
-        return random.randint(2, 3)
+        return random.randint(profile_min, profile_max)
     now_h = datetime.now(MSK_TZ).hour
     best = None
     for s in schedule:
@@ -7103,7 +7249,7 @@ def _actions_count_for_now(
         if best is None or abs(ho - now_h) < abs(best[0] - now_h):
             best = (ho, s)
     if not best:
-        return random.randint(2, 3)
+        return random.randint(profile_min, profile_max)
     s = best[1]
     try:
         amin = int(s.get('actions_count_min', 2))
@@ -7120,7 +7266,8 @@ def _actions_count_for_now(
     elif inten == 'high':
         amin = amin + 1
         amax = amax + 1
-    return random.randint(amin, max(amin, amax))
+    chosen = random.randint(amin, max(amin, amax))
+    return max(profile_min, min(chosen, profile_max))
 
 
 def _warming_random_cooldown() -> int:
@@ -7397,6 +7544,9 @@ async def warming_worker(account_id: int, user_id: int) -> None:
         reaction_pool = (plan or {}).get('reaction_pool') or list(WARMING_REACTIONS)
         distribution = (plan or {}).get('distribution') or {}
         schedule = (plan or {}).get('schedule') or []
+        warming_level = normalize_warming_level(
+            (plan or {}).get('warming_level')
+        )
         quiet_periods = (plan or {}).get('quiet_periods') or ['00:00-07:00']
         try:
             intervals_min = int((plan or {}).get('intervals_min_sec', WARMING_DEFAULT_COOLDOWN_MIN))
@@ -7486,7 +7636,9 @@ async def warming_worker(account_id: int, user_id: int) -> None:
             # === ВЫБОР ДЕЙСТВИЙ ПО ПЛАНУ ===
             if plan is not None and distribution:
                 # Сколько действий в этой волне — по schedule для текущего часа
-                n_actions = _actions_count_for_now(schedule, distribution)
+                n_actions = _actions_count_for_now(
+                    schedule, distribution, warming_level
+                )
                 # Сэмплируем N действий по distribution (без повторов).
                 chosen: List = []
                 pool = _build_weighted_pool(distribution)
@@ -8884,35 +9036,43 @@ MAX_PRICE_USD = os.getenv('MAX_PRICE_USD') or '2.25'
 PRO_PLANS: Dict[str, Dict[str, Any]] = {
     "pro_1d": {
         "code": "pro_1d", "tier": "pro", "days": 1, "rub": 5, "usd": "0.08",
+        "stars": int(os.getenv("STARS_PRO_1D") or "5"),
         "title": "1 день", "badge": "тест",
     },
     "pro_7d": {
         "code": "pro_7d", "tier": "pro", "days": 7, "rub": 15, "usd": "0.23",
+        "stars": int(os.getenv("STARS_PRO_7D") or "12"),
         "title": "7 дней", "badge": "",
     },
     "pro_30d": {
         "code": "pro_30d", "tier": "pro", "days": 30, "rub": 40, "usd": "0.60",
+        "stars": int(os.getenv("STARS_PRO_30D") or "30"),
         "title": "30 дней", "badge": "популярный",
     },
     "pro_90d": {
         "code": "pro_90d", "tier": "pro", "days": 90, "rub": 100, "usd": "1.50",
+        "stars": int(os.getenv("STARS_PRO_90D") or "75"),
         "title": "90 дней", "badge": "выгодно",
     },
     "pro_365d": {
         "code": "pro_365d", "tier": "pro", "days": 365, "rub": 350, "usd": "5.25",
+        "stars": int(os.getenv("STARS_PRO_365D") or "250"),
         "title": "365 дней", "badge": "выгодно",
     },
     # MAX — отдельный тариф
     "max_1d": {
         "code": "max_1d", "tier": "max", "days": 1, "rub": 25, "usd": "0.375",
+        "stars": int(os.getenv("STARS_MAX_1D") or "20"),
         "title": "1 день", "badge": "MAX",
     },
     "max_30d": {
         "code": "max_30d", "tier": "max", "days": 30, "rub": 150, "usd": "2.25",
+        "stars": int(os.getenv("STARS_MAX_30D") or "110"),
         "title": "30 дней", "badge": "MAX",
     },
     "max_90d": {
         "code": "max_90d", "tier": "max", "days": 90, "rub": 250, "usd": "3.75",
+        "stars": int(os.getenv("STARS_MAX_90D") or "180"),
         "title": "90 дней", "badge": "MAX · выгодно",
     },
 }
@@ -8920,6 +9080,7 @@ PRO_PLANS: Dict[str, Dict[str, Any]] = {
 PRO_PLAN_ORDER = ["pro_1d", "pro_7d", "pro_30d", "pro_90d", "pro_365d",
                   "max_1d", "max_30d", "max_90d"]
 DEFAULT_PRO_PLAN = "pro_30d"
+STARS_SUBSCRIPTION_PAYLOAD_PREFIX = "vest_subscription"
 
 
 def get_pro_plan(code: Optional[str]) -> Dict[str, Any]:
@@ -8932,6 +9093,27 @@ def get_pro_plan(code: Optional[str]) -> Dict[str, Any]:
         if key in PRO_PLANS:
             return PRO_PLANS[key]
     return PRO_PLANS[DEFAULT_PRO_PLAN]
+
+
+def build_stars_subscription_payload(plan_code: str, user_id: int) -> str:
+    return f"{STARS_SUBSCRIPTION_PAYLOAD_PREFIX}:{plan_code}:{user_id}"
+
+
+def parse_stars_subscription_payload(
+    payload: Optional[str],
+) -> Optional[Tuple[Dict[str, Any], int]]:
+    """Строго разбирает payload Stars без fallback на случайный план."""
+    parts = str(payload or '').split(':')
+    if len(parts) != 3 or parts[0] != STARS_SUBSCRIPTION_PAYLOAD_PREFIX:
+        return None
+    plan = PRO_PLANS.get(parts[1])
+    if not plan:
+        return None
+    try:
+        user_id = int(parts[2])
+    except (TypeError, ValueError):
+        return None
+    return plan, user_id
 
 
 def pro_plan_button_text(plan: Dict[str, Any]) -> str:
@@ -8982,6 +9164,7 @@ async def record_payment_event(
     *,
     amount_usdt: Optional[float] = None,
     amount_rub: Optional[float] = None,
+    amount_stars: Optional[int] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Сохраняет подтверждённый платёж для финансовой админ-панели.
@@ -8998,8 +9181,8 @@ async def record_payment_event(
             result = await conn.execute(
                 '''INSERT INTO payment_events
                    (user_id, kind, provider, external_id, amount_usdt,
-                    amount_rub, metadata)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                    amount_rub, amount_stars, metadata)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
                    ON CONFLICT (provider, external_id) DO NOTHING''',
                 user_id,
                 kind,
@@ -9007,6 +9190,7 @@ async def record_payment_event(
                 event_id,
                 amount_usdt,
                 amount_rub,
+                amount_stars,
                 json.dumps(metadata or {}, ensure_ascii=False),
             )
         return result.endswith(' 1')
@@ -12776,6 +12960,31 @@ async def script_cancel(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer('Отменено')
 
+# --- Условия и поддержка платежей ---
+@dp.message(Command("terms"))
+async def payment_terms(message: Message):
+    await message.answer(
+        f"{emoji('CLIPBOARD')} <b>Условия покупки подписки</b>\n\n"
+        "• Pro и MAX являются цифровыми подписками Vest Game Soft.\n"
+        "• Срок и стоимость показываются до подтверждения платежа.\n"
+        "• Подписка активируется после получения подтверждённого платежа.\n"
+        "• При продлении неиспользованные дни сохраняются.\n"
+        "• По вопросам оплаты и возврата обратитесь в поддержку: "
+        f"{SUPPORT_USERNAME}.\n\n"
+        "Нажимая кнопку оплаты, вы подтверждаете согласие с этими условиями."
+    )
+
+
+@dp.message(Command("paysupport"))
+async def payment_support(message: Message):
+    await message.answer(
+        f"{emoji('SUPPORT')} <b>Поддержка по платежам</b>\n\n"
+        f"Напишите {SUPPORT_USERNAME} и укажите Telegram ID: "
+        f"<code>{message.from_user.id}</code>.\n"
+        "Не отправляйте пароли, коды входа и секретные ключи."
+    )
+
+
 # --- Помощь ---
 @dp.callback_query(F.data == "help")
 async def help_handler(callback: CallbackQuery):
@@ -12823,7 +13032,9 @@ async def help_accounts_handler(callback: CallbackQuery):
         f"(socks5 / http / mtproxy).\n\n"
         f"<b>Советы:</b>\n"
         f"• На один аккаунт — один прокси (иначе Telegram забанит).\n"
-        f"• Прогрев нового аккаунта включается автоматически.\n"
+        f"• При создании плана прогрева выберите уровень: низкий — для "
+        f"нового аккаунта, средний — после низкого, высокий — только для "
+        f"старого аккаунта, уже прошедшего более низкие уровни.\n"
         f"• Сессия хранится в строке (StringSession) — её можно выгрузить."
     )
     await callback.message.edit_text(text, reply_markup=get_help_feature_keyboard())
@@ -13309,7 +13520,7 @@ def _format_sub_text_sync(sub: Dict[str, Any], limits_text: str = "") -> str:
         f"  {emoji('CHECK')} Ранний доступ к новым функциям\n"
         f"  {emoji('CHECK')} Smart Delay Engine в усиленном режиме\n\n"
         f"<b>Сроки:</b>\n{pro_plans_text()}\n\n"
-        f"Оплата: СБП (₽) или @CryptoBot (USDT)."
+        "Оплата: Telegram Stars, СБП (₽) или @CryptoBot (USDT)."
         f"{limits_block}"
     )
 
@@ -13376,7 +13587,7 @@ async def buy_pro(callback: CallbackQuery):
         header +
         "Выберите срок:\n"
         f"{pro_plans_text('pro')}\n\n"
-        "Оплата: СБП (₽) или Crypto Pay (USDT).",
+        "Оплата: Telegram Stars, СБП (₽) или Crypto Pay (USDT).",
         reply_markup=builder.as_markup()
     )
 
@@ -13426,7 +13637,7 @@ async def buy_max(callback: CallbackQuery):
         "без дневных и недельных ограничений внутри сервиса.\n\n"
         "Выберите срок MAX:\n"
         f"{pro_plans_text('max')}\n\n"
-        "Оплата: СБП (₽) или Crypto Pay (USDT).",
+        "Оплата: Telegram Stars, СБП (₽) или Crypto Pay (USDT).",
         reply_markup=builder.as_markup()
     )
 
@@ -13440,6 +13651,12 @@ async def buy_pro_choose_method(callback: CallbackQuery):
     back_callback = "buy_max" if is_max else "buy_pro"
 
     builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text=f"Telegram Stars — {plan['stars']} ⭐",
+        callback_data=f"buy_pro_stars:{plan['code']}",
+        style='success',
+        icon_custom_emoji_id=get_icon("STAR")
+    ))
     builder.row(InlineKeyboardButton(
         text=f"СБП — {plan['rub']}₽",
         callback_data=f"buy_pro_sbp:{plan['code']}",
@@ -13467,16 +13684,140 @@ async def buy_pro_choose_method(callback: CallbackQuery):
     await callback.message.edit_text(
         f"{emoji('MONEY_SEND')} <b>Оплата {subscription_tier_label(plan.get('tier'))}</b>\n\n"
         f"Срок: <b>{plan['title']}</b>\n"
-        f"Стоимость: <b>{plan['rub']}₽</b> / <b>{plan['usd']} USDT</b>\n\n"
+        f"Стоимость: <b>{plan['stars']} ⭐</b> / <b>{plan['rub']}₽</b> / "
+        f"<b>{plan['usd']} USDT</b>\n\n"
         + (
             f"{emoji('CHECK')} <b>После покупки MAX тарифных лимитов "
             "внутри сервиса не будет.</b>\n\n"
             if is_max else ""
         ) +
         f"Выберите удобный способ оплаты:\n"
+        f"  {emoji('STAR')} <b>Telegram Stars</b> — встроенная оплата Telegram\n"
         f"  {emoji('CHECK')} <b>СБП</b> — оплата по QR-коду / Sberpay (₽)\n"
-        f"  {emoji('CHECK')} <b>Crypto Pay</b> — оплата в USDT через @CryptoBot",
+        f"  {emoji('CHECK')} <b>Crypto Pay</b> — оплата в USDT через @CryptoBot\n\n"
+        "Оплачивая подписку, вы принимаете /terms.",
         reply_markup=builder.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith("buy_pro_stars:"))
+async def buy_pro_stars(callback: CallbackQuery):
+    """Создаёт нативный Telegram Stars-инвойс для Pro или MAX."""
+    plan_code = callback.data.split(":", 1)[1]
+    plan = PRO_PLANS.get(plan_code)
+    if not plan:
+        await callback.answer("Тариф не найден", show_alert=True)
+        return
+    stars = int(plan.get('stars') or 0)
+    if stars <= 0:
+        await callback.answer("Цена в Stars настроена неверно", show_alert=True)
+        return
+
+    await callback.answer("Создаю счёт в Telegram Stars…")
+    payload = build_stars_subscription_payload(
+        plan['code'], callback.from_user.id
+    )
+    try:
+        await bot.send_invoice(
+            chat_id=callback.message.chat.id,
+            title=(
+                f"Vest Game Soft — "
+                f"{subscription_tier_label(plan.get('tier'))}"
+            ),
+            description=(
+                f"Подписка {subscription_tier_label(plan.get('tier'))} "
+                f"на {plan['title']}. Активация сразу после оплаты."
+            ),
+            payload=payload,
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(
+                label=(
+                    f"{subscription_tier_label(plan.get('tier'))} · "
+                    f"{plan['title']}"
+                ),
+                amount=stars,
+            )],
+        )
+    except Exception as ex:
+        logger.exception("Could not create Telegram Stars invoice: %s", ex)
+        await callback.message.answer(
+            f"{emoji('CROSS')} Не удалось создать счёт в Stars. "
+            f"Попробуйте позже или напишите {SUPPORT_USERNAME}."
+        )
+
+
+@dp.pre_checkout_query()
+async def stars_subscription_pre_checkout(query: PreCheckoutQuery):
+    """Проверяет владельца, тариф, валюту и сумму до списания Stars."""
+    parsed = parse_stars_subscription_payload(query.invoice_payload)
+    if not parsed:
+        await query.answer(
+            ok=False,
+            error_message="Счёт устарел или содержит неверный тариф.",
+        )
+        return
+    plan, payload_user_id = parsed
+    valid = (
+        payload_user_id == query.from_user.id
+        and query.currency == "XTR"
+        and query.total_amount == int(plan.get('stars') or 0)
+    )
+    if not valid:
+        await query.answer(
+            ok=False,
+            error_message="Параметры счёта изменились. Создайте новый счёт.",
+        )
+        return
+    await query.answer(ok=True)
+
+
+@dp.message(F.successful_payment)
+async def stars_subscription_success(message: Message):
+    """Активирует подписку только после successful_payment от Telegram."""
+    payment = message.successful_payment
+    if not payment or payment.currency != "XTR":
+        return
+    parsed = parse_stars_subscription_payload(payment.invoice_payload)
+    if not parsed or not message.from_user:
+        logger.warning("Unknown Stars payment payload: %r", payment.invoice_payload)
+        return
+    plan, payload_user_id = parsed
+    user_id = message.from_user.id
+    if (
+        payload_user_id != user_id
+        or payment.total_amount != int(plan.get('stars') or 0)
+    ):
+        logger.warning("Rejected mismatched Stars payment for user_id=%s", user_id)
+        return
+
+    charge_id = payment.telegram_payment_charge_id
+    if not charge_id:
+        logger.error("Stars payment has no telegram_payment_charge_id")
+        return
+    fresh = await record_payment_event(
+        user_id,
+        PAYMENT_KIND_PRO_SUBSCRIPTION,
+        PAYMENT_PROVIDER_TELEGRAM_STARS,
+        charge_id,
+        amount_stars=int(payment.total_amount),
+        metadata={
+            'duration_days': plan['days'],
+            'plan': plan['code'],
+            'currency': 'XTR',
+        },
+    )
+    if await should_activate_pro(
+        PAYMENT_PROVIDER_TELEGRAM_STARS, charge_id, fresh
+    ):
+        await activate_pro_plan(user_id, plan)
+
+    new_sub = await get_subscription(user_id)
+    limits = await format_limits_text(user_id)
+    await message.answer(
+        f"{emoji('FIRE')} <b>Оплата Stars получена!</b>\n\n"
+        + _format_sub_text_sync(new_sub, limits),
+        reply_markup=get_subscription_keyboard(new_sub.get('tier', 'free')),
     )
 
 
@@ -16867,7 +17208,11 @@ async def toggle_warming(callback: CallbackQuery):
     генерируем план через LLM, показывая «Думаю... {время}»,
     и только после подтверждения — запускаем воркер.
     """
-    account_id = int(callback.data.split("_")[2])
+    parts = callback.data.split("_")
+    account_id = int(parts[2])
+    selected_level = (
+        normalize_warming_level(parts[3]) if len(parts) > 3 else None
+    )
     account = await get_account(account_id)
 
     if not account or account['user_id'] != callback.from_user.id:
@@ -16897,11 +17242,29 @@ async def toggle_warming(callback: CallbackQuery):
         )
         return
 
+    # До генерации плана пользователь явно выбирает реальную нагрузку.
+    if selected_level is None:
+        await callback.message.edit_text(
+            f"{emoji('FIRE')} <b>Выберите уровень прогрева</b>\n\n"
+            "<b>Низкий</b> — для новых аккаунтов.\n"
+            "<b>Средний</b> — после прохождения низкого уровня.\n"
+            "<b>Высокий</b> — только для старых аккаунтов, уже "
+            "прогретых на низком и среднем уровнях.\n\n"
+            f"{emoji('INFO')} Более высокий уровень увеличивает частоту "
+            "и число действий, но не гарантирует отсутствие ограничений Telegram.",
+            reply_markup=_warming_level_keyboard(account_id),
+        )
+        await callback.answer("Выберите уровень")
+        return
+
+    level_profile = WARMING_LEVEL_PROFILES[selected_level]
+
     # Шаг 1: сразу отвечаем «Думаю...» и обновляем сообщение по таймеру.
     started = time.monotonic()
     try:
         await callback.message.edit_text(
             f"{emoji('BRAIN')} <b>Готовлю план прогрева</b>\n\n"
+            f"Уровень: <b>{level_profile['label']}</b>\n"
             f"{emoji('HOURGLASS')} Думаю… <code>0.0 с</code>",
             reply_markup=None
         )
@@ -16929,6 +17292,7 @@ async def toggle_warming(callback: CallbackQuery):
                 t_str = f"{mins} мин {secs} с"
             text = (
                 f"{emoji('BRAIN')} <b>Готовлю план прогрева</b>\n\n"
+                f"Уровень: <b>{level_profile['label']}</b>\n"
                 f"{emoji('HOURGLASS')} Думаю… <code>{t_str}</code>"
             )
             if text != last_text:
@@ -16949,7 +17313,8 @@ async def toggle_warming(callback: CallbackQuery):
     # Шаг 3: генерируем план через LLM.
     try:
         result = await generate_warming_plan_llm(
-            account, callback.from_user.id, duration_hours=12
+            account, callback.from_user.id, duration_hours=12,
+            warming_level=selected_level,
         )
     except Exception as ex:
         indicator_stop.set()
@@ -17011,7 +17376,9 @@ async def toggle_warming(callback: CallbackQuery):
             text=plan_text[:4000],
             chat_id=chat_id,
             message_id=msg_id,
-            reply_markup=_warming_plan_keyboard(plan_id, account_id)
+            reply_markup=_warming_plan_keyboard(
+                plan_id, account_id, selected_level
+            )
         )
     except Exception:
         # Если не влезло в edit — отправляем отдельным сообщением
@@ -17019,10 +17386,32 @@ async def toggle_warming(callback: CallbackQuery):
             await bot.send_message(
                 chat_id,
                 plan_text[:4000],
-                reply_markup=_warming_plan_keyboard(plan_id, account_id)
+                reply_markup=_warming_plan_keyboard(
+                    plan_id, account_id, selected_level
+                )
             )
         except Exception:
             pass
+
+
+@dp.callback_query(F.data.startswith("warming_level:"))
+async def select_warming_level(callback: CallbackQuery):
+    """Продолжает создание плана после выбора уровня."""
+    try:
+        _, account_raw, level_raw = callback.data.split(":", 2)
+        account_id = int(account_raw)
+    except (AttributeError, TypeError, ValueError):
+        await callback.answer("Некорректный уровень", show_alert=True)
+        return
+    if level_raw not in WARMING_LEVEL_PROFILES:
+        await callback.answer("Неизвестный уровень", show_alert=True)
+        return
+    account = await get_account(account_id)
+    if not account or account['user_id'] != callback.from_user.id:
+        await callback.answer("Аккаунт не найден", show_alert=True)
+        return
+    callback.data = f"toggle_warming_{account_id}_{level_raw}"
+    await toggle_warming(callback)
 
 
 @dp.callback_query(F.data.startswith("confirm_warming_"))
@@ -17050,6 +17439,9 @@ async def confirm_warming_plan(callback: CallbackQuery):
         status_text = "включен"
 
     plan_narrative = (plan.get('narrative') or '').strip()
+    plan_data = _safe_plan_defaults(plan.get('plan') or {})
+    level_label = warming_level_label(plan_data.get('warming_level'))
+    duration_hours = int(plan_data.get('duration_hours', 12))
     extra = (
         f"\n\n{emoji('BRAIN')} <b>Стратегия ИИ:</b>\n"
         f"<i>{escape(plan_narrative[:400])}</i>"
@@ -17061,7 +17453,8 @@ async def confirm_warming_plan(callback: CallbackQuery):
             f"{emoji('FIRE')} <b>Прогрев запущен по плану ИИ</b>\n\n"
             f"Аккаунт: <code>{account['phone']}</code>\n"
             f"Статус: <b>{status_text}</b>\n"
-            f"Окно плана: <b>12 часов</b>{extra}"
+            f"Уровень: <b>{level_label}</b>\n"
+            f"Окно плана: <b>{duration_hours} часов</b>{extra}"
         )
     except Exception:
         pass
@@ -17073,14 +17466,18 @@ async def confirm_warming_plan(callback: CallbackQuery):
 async def regenerate_warming_plan(callback: CallbackQuery):
     """Перегенерировать план — просто вызываем toggle_warming заново
     (он заново покажет «Думаю...» и сгенерирует свежий план)."""
-    account_id = int(callback.data.split("_")[2])
+    parts = callback.data.split("_")
+    account_id = int(parts[2])
+    warming_level = normalize_warming_level(
+        parts[3] if len(parts) > 3 else DEFAULT_WARMING_LEVEL
+    )
     # Деактивируем предыдущий план, чтобы воркер не цеплял его.
     try:
         await deactivate_warming_plans(account_id)
     except Exception:
         pass
     # Имитируем повторное нажатие «Включить прогрев»
-    callback.data = f"toggle_warming_{account_id}"
+    callback.data = f"toggle_warming_{account_id}_{warming_level}"
     await toggle_warming(callback)
 
 
@@ -21004,7 +21401,7 @@ async def admin_finance_recent(callback: CallbackQuery):
             user_id = row.get('user_id')
             lines.append(
                 f"<b>{escape(str(kind))}</b> · {escape(str(provider))}\n"
-                f"{format_finance_amounts(row.get('amount_rub'), row.get('amount_usdt'))} · "
+                f"{format_finance_amounts(row.get('amount_rub'), row.get('amount_usdt'), row.get('amount_stars'))} · "
                 f"{date_text}\n"
                 f"{escape(user_label)} · <code>{escape(str(user_id or '—'))}</code>"
             )
