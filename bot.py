@@ -9085,9 +9085,10 @@ async def activate_pro_plan(
     invoice_id: Optional[int] = None,
     platega_id: Optional[str] = None,
 ) -> datetime:
-    """Включает Pro на срок тарифа. Если Pro ещё активна — продлевает её.
+    """Включает Pro/MAX на срок тарифа.
 
-    Возвращает новую дату окончания подписки (naive, МСК).
+    MAX — отдельный тариф.
+    Если у пользователя уже активен Pro, то MAX начнётся только после окончания Pro.
     """
     now = datetime.now(MSK_TZ).replace(tzinfo=None)
     base = now
@@ -9105,9 +9106,17 @@ async def activate_pro_plan(
         logger.warning(f"activate_pro_plan: could not read current sub: {ex}")
     expires = base + timedelta(days=int(plan["days"]))
     target_tier = plan.get('tier', 'pro')
+
+    # MAX — отдельный тариф.
+    # Если уже есть Pro — MAX начнётся только после окончания Pro.
+    if target_tier == 'max' and sub.get('tier') == 'pro' and base > now:
+        # MAX начисляется после окончания Pro
+        pass
+
     # Не понижаем действующий MAX, если пользователь купил обычный Pro.
     if target_tier == 'pro' and sub.get('tier') == 'max' and base > now:
         target_tier = 'max'
+
     await set_subscription(
         user_id, target_tier, expires,
         invoice_id=invoice_id,
@@ -13308,11 +13317,16 @@ async def buy_pro(callback: CallbackQuery):
         if is_active_pro else
         f"{emoji('MONEY_SEND')} <b>Покупка Pro/MAX</b>\n\n"
     )
+
+    note = ""
+    if sub.get("tier") == "pro" and sub.get("expires_at") and sub["expires_at"] > datetime.now(MSK_TZ).replace(tzinfo=None):
+        note = "\n⚠️ У вас уже есть <b>Pro</b>. При покупке <b>MAX</b> он начнётся только после окончания Pro-тарифа.\n"
+
     await callback.message.edit_text(
         header +
         "Выберите срок:\n"
         f"{pro_plans_text()}\n\n"
-        f"Оплата: СБП (₽) или Crypto Pay (USDT).",
+        f"Оплата: СБП (₽) или Crypto Pay (USDT).{note}",
         reply_markup=builder.as_markup()
     )
 
