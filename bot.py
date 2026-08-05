@@ -226,6 +226,37 @@ SCRIPT_CYCLE_DELAY_SECONDS = 5
 SCRIPT_RETRY_DELAY_SECONDS = 10
 # Не допускаем одновременную ручную и плановую проверку одного аккаунта.
 spam_check_locks: Dict[int, asyncio.Lock] = {}
+# Один AI-разбор FloodWait на аккаунт за раз. Повторные события всё равно
+# продлевают обязательный cooldown в БД, но не создают шторм LLM-запросов.
+flood_protection_tasks: Dict[int, asyncio.Task] = {}
+flood_protection_locks: Dict[int, asyncio.Lock] = {}
+
+FLOOD_AI_EXCLUDED_SOURCES = {'channel_creation', 'autosub'}
+FLOOD_AI_ALLOWED_ACTIONS = {'wait', 'slow_down', 'pause_active'}
+FLOOD_AI_SYSTEM_PROMPT = """Ты — защитный контроллер Telegram-аккаунта.
+Тебе передают один FloodWait, историю ограничений и список процессов,
+которые сейчас работают на аккаунте. Выбери только безопасную реакцию.
+
+Разрешённые действия:
+- wait: соблюсти cooldown Telegram без дополнительного вмешательства;
+- slow_down: соблюсти cooldown и увеличить задержки дальнейших операций;
+- pause_active: соблюсти cooldown и временно приостановить активные процессы.
+
+Нельзя уменьшать Telegram cooldown, повторять запрос раньше срока,
+отключать защиту, создавать команды или предлагать обход ограничений.
+Верни строго JSON без markdown:
+{"action":"wait|slow_down|pause_active","extra_pause_seconds":0,
+ "delay_multiplier":1.0,"severity":"info|warning|critical",
+ "reason":"короткая причина на русском"}
+extra_pause_seconds: 0..3600, delay_multiplier: 1.0..4.0.
+"""
+
+NOTIFICATION_CATEGORIES = {
+    'floodwait': 'FloodWait и AI-защита',
+    'account': 'Состояние аккаунтов',
+    'tasks': 'Задачи и прогрев',
+    'payments': 'Платежи и подписка',
+}
 
 # --- Проверка ограничений @SpamBot ---
 SPAM_BLOCK_BOT_USERNAME = '@SpamBot'
@@ -1330,13 +1361,77 @@ async def init_db():
                 account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
                 chat_id BIGINT,
                 seconds INTEGER NOT NULL,
+                source TEXT NOT NULL DEFAULT 'generic',
                 occurred_at TIMESTAMP DEFAULT NOW()
             )
         ''')
         try:
             await conn.execute(
+                "ALTER TABLE flood_wait_history "
+                "ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'generic'"
+            )
+        except Exception:
+            pass
+        try:
+            await conn.execute(
                 'CREATE INDEX IF NOT EXISTS idx_flood_wait_account_time '
                 'ON flood_wait_history (account_id, occurred_at DESC)'
+            )
+        except Exception:
+            pass
+
+        # Решение AI-защиты хранится в БД, поэтому его соблюдают все
+        # процессы и все экземпляры приложения после перезапуска.
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS account_flood_protection (
+                account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+                blocked_until TIMESTAMP,
+                delay_multiplier NUMERIC(5, 2) NOT NULL DEFAULT 1.0,
+                last_action TEXT NOT NULL DEFAULT 'wait',
+                last_reason TEXT NOT NULL DEFAULT '',
+                last_source TEXT NOT NULL DEFAULT 'generic',
+                last_seconds INTEGER NOT NULL DEFAULT 0,
+                last_context JSONB NOT NULL DEFAULT '[]'::jsonb,
+                ai_used BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        try:
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_flood_protection_until '
+                'ON account_flood_protection (blocked_until)'
+            )
+        except Exception:
+            pass
+
+        # Центр уведомлений: настройки категорий и постоянная история.
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS notification_settings (
+                user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+                floodwait_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                account_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                tasks_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                payments_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS user_notifications (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+                category TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'info',
+                title TEXT NOT NULL,
+                message TEXT NOT NULL,
+                is_read BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        try:
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_user_notifications_recent '
+                'ON user_notifications (user_id, created_at DESC)'
             )
         except Exception:
             pass
@@ -2377,12 +2472,22 @@ async def notify_spam_block_result(
     """Отправляет владельцу результат плановой проверки, если он не выключил уведомления."""
     try:
         checked_at = _format_msk_datetime(result.get('checked_at'), 'только что')
-        await bot.send_message(
+        status = SPAM_BLOCK_STATUS_LABELS.get(
+            result.get('status'), 'Неизвестный статус'
+        )
+        response = (
+            result.get('response') or result.get('error') or 'Нет ответа'
+        )[:1600]
+        await create_user_notification(
             user_id,
-            f"{emoji('BELL')} <b>Автопроверка ограничений</b>\n\n"
-            f"{emoji('PHONE')} Аккаунт: <code>{escape(str(account.get('phone') or result.get('account_id')))}</code>\n"
-            f"{format_spam_block_result(result)}\n\n"
-            f"{emoji('CLOCK')} Проверено: <b>{checked_at}</b>",
+            'account',
+            'Автопроверка ограничений',
+            f"Аккаунт: {account.get('phone') or result.get('account_id')}\n"
+            f"Статус: {status}\n"
+            f"Ответ @SpamBot: {response}\n"
+            f"Проверено: {checked_at}",
+            account_id=int(result.get('account_id') or account.get('id')),
+            severity='warning' if result.get('status') == 'limited' else 'info',
         )
     except Exception as ex:
         logger.warning('Could not notify spam check result for account %s: %s',
@@ -2416,6 +2521,7 @@ async def check_account_spam_block(
             return result
 
         try:
+            await wait_for_flood_protection(account_id, 'spam_check')
             client = await get_client_for_account(account_id)
             if not client or not await client.is_user_authorized():
                 raise RuntimeError('Не удалось подключиться к Telegram-аккаунту')
@@ -2436,7 +2542,9 @@ async def check_account_spam_block(
             result['response'] = response
             result['status'] = classify_spam_block_response(response)
         except FloodWaitError as ex:
-            await record_flood_wait(account_id, 0, ex.seconds)
+            await record_flood_wait(
+                account_id, 0, ex.seconds, source='spam_check'
+            )
             result['error'] = f'FloodWait: Telegram просит подождать {int(ex.seconds)} сек.'
         except asyncio.TimeoutError:
             result['error'] = 'Не дождались ответа @SpamBot'
@@ -2699,13 +2807,16 @@ async def notify_invalid_account_removal(
     user_id: int, account: Dict[str, Any], error: str,
 ) -> None:
     try:
-        await bot.send_message(
+        await create_user_notification(
             user_id,
-            f"{emoji('CROSS')} <b>Аккаунт удалён после проверки валидности</b>\n\n"
-            f"{emoji('PHONE')} Аккаунт: <code>{escape(str(account.get('phone') or account.get('id')))}</code>\n"
+            'account',
+            'Аккаунт удалён после проверки валидности',
+            f"Аккаунт: {account.get('phone') or account.get('id')}\n"
             "Telegram не подтвердил авторизацию этой сессии, поэтому бот "
-            "полностью снял аккаунт из работы.\n\n"
-            f"Причина: <i>{escape((error or 'Сессия не авторизована')[:500])}</i>",
+            "полностью снял аккаунт из работы.\n"
+            f"Причина: {(error or 'Сессия не авторизована')[:500]}",
+            account_id=None,
+            severity='critical',
         )
     except Exception as ex:
         logger.warning('Could not notify account removal for %s: %s', account.get('id'), ex)
@@ -5288,6 +5399,7 @@ async def send_message_to_chat(
 ):
     try:
         chat_id_int = int(chat_id) if chat_id.lstrip('-').isdigit() else chat_id
+        await wait_for_flood_protection(account_id, 'message_send')
 
         # Smart Delay Engine: адаптивная задержка перед отправкой.
         # Снижает риск бана за счёт:
@@ -5326,7 +5438,10 @@ async def send_message_to_chat(
         # задержку на ближайшие сообщения.
         try:
             chat_id_for_log = int(chat_id) if str(chat_id).lstrip('-').isdigit() else 0
-            await record_flood_wait(account_id, chat_id_for_log, ex.seconds)
+            await record_flood_wait(
+                account_id, chat_id_for_log, ex.seconds,
+                source='message_send',
+            )
         except Exception:
             pass
         logger.warning(f"FloodWait in send_message_to_chat: {ex.seconds}s")
@@ -7705,6 +7820,15 @@ async def warming_worker(account_id: int, user_id: int) -> None:
                     await deactivate_warming_plans(account_id)
                 except Exception:
                     pass
+                await create_user_notification(
+                    user_id,
+                    'tasks',
+                    'План прогрева завершён',
+                    f"Аккаунт #{account_id}: выполнено волн — {cycle}. "
+                    "Прогрев можно продлить или выключить в карточке аккаунта.",
+                    account_id=account_id,
+                    severity='info',
+                )
                 plan = None
 
             # Кастомные задержки из БД, если юзер их настроил
@@ -7722,6 +7846,9 @@ async def warming_worker(account_id: int, user_id: int) -> None:
                 sleep_for = int(
                     random.randint(cooldown_min, cooldown_max)
                     * _time_of_day_multiplier()
+                )
+                sleep_for = int(
+                    sleep_for * await get_flood_delay_multiplier(account_id)
                 )
 
             # Спим, но короткими чанками, чтобы стоп-флаг реагировал быстро
@@ -7806,6 +7933,8 @@ async def warming_worker(account_id: int, user_id: int) -> None:
                     )
                 ]
 
+            # Любое решение AI-защиты применяется ко всей волне прогрева.
+            await wait_for_flood_protection(account_id, 'warming')
             for kind, action in chosen:
                 if warming_stop_flags.get(account_id, False):
                     return
@@ -8074,6 +8203,9 @@ async def execute_dm_broadcast_db(
         if (dm_broadcast_stop_flags.get(task_id, False)
                 or await dm_broadcast_cancelled(dm_id)):
             break
+        guard_multiplier = await wait_for_flood_protection(
+            account_id, 'dm_broadcast'
+        )
         
         try:
             username = username.strip()
@@ -8137,7 +8269,9 @@ async def execute_dm_broadcast_db(
             
         except FloodWaitError as ex:
             logger.warning(f"Flood wait {ex.seconds}s")
-            await record_flood_wait(account_id, 0, ex.seconds)
+            await record_flood_wait(
+                account_id, 0, ex.seconds, source='dm_broadcast'
+            )
             await asyncio.sleep(ex.seconds + 1)
         except Exception as ex:
             logger.error(f"Error sending DM to {username}: {ex}")
@@ -8145,7 +8279,7 @@ async def execute_dm_broadcast_db(
         
         if (i < total - 1 and not dm_broadcast_stop_flags.get(task_id, False)
                 and not await dm_broadcast_cancelled(dm_id)):
-            await asyncio.sleep(delay)
+            await asyncio.sleep(delay * guard_multiplier)
     
     if (dm_broadcast_stop_flags.get(task_id, False)
             or await dm_broadcast_cancelled(dm_id)):
@@ -8182,6 +8316,7 @@ async def execute_join(
     for i, link in enumerate(links):
         if join_stop_flags.get(task_id, False) or await queue_cancelled(task_id):
             break
+        guard_multiplier = await wait_for_flood_protection(account_id, 'join')
         
         try:
             link = link.strip()
@@ -8212,7 +8347,9 @@ async def execute_join(
             
         except FloodWaitError as ex:
             logger.warning(f"Flood wait {ex.seconds}s")
-            await record_flood_wait(account_id, 0, ex.seconds)
+            await record_flood_wait(
+                account_id, 0, ex.seconds, source='join'
+            )
             await asyncio.sleep(ex.seconds + 1)
         except Exception as ex:
             logger.error(f"Error joining {link}: {ex}")
@@ -8220,7 +8357,7 @@ async def execute_join(
         
         if (i < total - 1 and not join_stop_flags.get(task_id, False)
                 and not await queue_cancelled(task_id)):
-            await asyncio.sleep(delay)
+            await asyncio.sleep(delay * guard_multiplier)
     
     return {'total': total, 'joined': joined, 'failed': failed}
 
@@ -8431,7 +8568,10 @@ async def execute_chat_creation(
                 break
             except FloodWaitError as ex:
                 wait_seconds = max(1, int(ex.seconds))
-                await record_flood_wait(account_id, 0, wait_seconds)
+                await record_flood_wait(
+                    account_id, 0, wait_seconds,
+                    source='channel_creation', ai_protection=False,
+                )
                 deadline = await set_account_action_cooldown(
                     account_id,
                     CHAT_CREATION_FLOOD_ACTION,
@@ -8515,6 +8655,9 @@ async def execute_autolike(
         for chat_id in chat_ids:
             if autolike_stop_flags.get(task_id, False) or await queue_cancelled(task_id):
                 break
+            guard_multiplier = await wait_for_flood_protection(
+                account_id, 'autolike'
+            )
             try:
                 chat_id_int = (
                     int(chat_id)
@@ -8533,7 +8676,7 @@ async def execute_autolike(
                             for r in msg.reactions.results
                         )
                         if already_reacted:
-                            await asyncio.sleep(delay)
+                            await asyncio.sleep(delay * guard_multiplier)
                             continue
                     
                     await client(SendReactionRequest(
@@ -8550,20 +8693,23 @@ async def execute_autolike(
                         f"Liked message in {chat_id} ({liked} total)"
                     )
                 
-                await asyncio.sleep(delay)
+                await asyncio.sleep(delay * guard_multiplier)
                 
             except FloodWaitError as ex:
                 logger.warning(f"Flood wait {ex.seconds}s")
                 try:
                     chat_id_int = int(chat_id) if str(chat_id).lstrip('-').isdigit() else 0
-                    await record_flood_wait(account_id, chat_id_int, ex.seconds)
+                    await record_flood_wait(
+                        account_id, chat_id_int, ex.seconds,
+                        source='autolike',
+                    )
                 except Exception:
                     pass
                 await asyncio.sleep(ex.seconds + 1)
             except Exception as ex:
                 logger.error(f"Error liking in {chat_id}: {ex}")
                 errors += 1
-                await asyncio.sleep(delay)
+                await asyncio.sleep(delay * guard_multiplier)
     
     return {'liked': liked, 'errors': errors}
 
@@ -8832,6 +8978,9 @@ async def _neurocomment_process_post(
         return
 
     try:
+        await wait_for_flood_protection(
+            int(config['account_id']), 'neurocomment'
+        )
         reply = await _neurocomment_build_reply(client, config, event)
         if neurocomment_stop_flags.get(config_id, False):
             return
@@ -8848,7 +8997,10 @@ async def _neurocomment_process_post(
         )
         await record_neurocomment_result(config_id, True)
     except FloodWaitError as ex:
-        await record_flood_wait(int(config['account_id']), int(event.chat_id), ex.seconds)
+        await record_flood_wait(
+            int(config['account_id']), int(event.chat_id), ex.seconds,
+            source='neurocomment',
+        )
         await record_neurocomment_result(
             config_id, False, f'FloodWait: {int(ex.seconds)} сек',
         )
@@ -9068,23 +9220,470 @@ async def _account_flood_score(account_id: int) -> float:
     return score
 
 
-async def record_flood_wait(account_id: int, chat_id: int, seconds: int) -> None:
-    """Сохранить факт флуд-вейта, чтобы Smart Delay учитывал историю."""
+async def get_notification_settings(user_id: int) -> Dict[str, Any]:
+    """Настройки центра уведомлений с безопасными дефолтами."""
+    defaults = {
+        'user_id': user_id,
+        'floodwait_enabled': True,
+        'account_enabled': True,
+        'tasks_enabled': True,
+        'payments_enabled': True,
+    }
+    if db_pool is None:
+        return defaults
     try:
         async with db_pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO flood_wait_history "
-                "(account_id, chat_id, seconds) VALUES ($1, $2, $3)",
-                account_id, chat_id, int(seconds)
+                'INSERT INTO notification_settings (user_id) VALUES ($1) '
+                'ON CONFLICT (user_id) DO NOTHING',
+                user_id,
             )
-            # Подчищаем хвост старше 7 дней, чтобы таблица не пухла.
+            row = await conn.fetchrow(
+                'SELECT * FROM notification_settings WHERE user_id = $1',
+                user_id,
+            )
+        return dict(row) if row else defaults
+    except Exception as ex:
+        logger.warning('get_notification_settings failed: %s', ex)
+        return defaults
+
+
+async def set_notification_category(
+    user_id: int, category: str, enabled: bool,
+) -> Dict[str, Any]:
+    if category not in NOTIFICATION_CATEGORIES:
+        raise ValueError('Unknown notification category')
+    column = f'{category}_enabled'
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            'INSERT INTO notification_settings (user_id) VALUES ($1) '
+            'ON CONFLICT (user_id) DO NOTHING',
+            user_id,
+        )
+        # Имя столбца берётся только из закрытого allowlist выше.
+        await conn.execute(
+            f'UPDATE notification_settings SET {column} = $1, '
+            'updated_at = NOW() WHERE user_id = $2',
+            bool(enabled), user_id,
+        )
+    return await get_notification_settings(user_id)
+
+
+async def get_recent_notifications(
+    user_id: int, limit: int = 8,
+) -> List[Dict[str, Any]]:
+    if db_pool is None:
+        return []
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            '''SELECT id, account_id, category, severity, title, message,
+                      is_read, created_at
+               FROM user_notifications WHERE user_id = $1
+               ORDER BY created_at DESC LIMIT $2''',
+            user_id, max(1, min(int(limit), 30)),
+        )
+    return [dict(row) for row in rows]
+
+
+async def create_user_notification(
+    user_id: int,
+    category: str,
+    title: str,
+    message: str,
+    *,
+    account_id: Optional[int] = None,
+    severity: str = 'info',
+    send_now: bool = True,
+) -> Optional[int]:
+    """Сохраняет событие в центре и, если категория включена, шлёт его."""
+    if category not in NOTIFICATION_CATEGORIES:
+        category = 'tasks'
+    if severity not in {'info', 'warning', 'critical'}:
+        severity = 'info'
+    notification_id = None
+    try:
+        async with db_pool.acquire() as conn:
+            notification_id = await conn.fetchval(
+                '''INSERT INTO user_notifications
+                   (user_id, account_id, category, severity, title, message)
+                   VALUES ($1, $2, $3, $4, $5, $6) RETURNING id''',
+                user_id, account_id, category, severity,
+                str(title)[:160], str(message)[:3000],
+            )
+    except Exception as ex:
+        logger.warning('Could not persist notification: %s', ex)
+
+    settings = await get_notification_settings(user_id)
+    if send_now and settings.get(f'{category}_enabled', True):
+        icon_name = 'CROSS' if severity == 'critical' else (
+            'WARNING' if severity == 'warning' else 'BELL'
+        )
+        markup = InlineKeyboardBuilder()
+        markup.row(InlineKeyboardButton(
+            text='Центр уведомлений',
+            callback_data='notification_center',
+            style='default',
+            icon_custom_emoji_id=get_icon('BELL'),
+        ))
+        try:
+            await bot.send_message(
+                user_id,
+                f"{emoji(icon_name)} <b>{escape(str(title)[:160])}</b>\n\n"
+                f"{escape(str(message)[:3000])}",
+                reply_markup=markup.as_markup(),
+            )
+        except Exception as ex:
+            logger.warning('Could not deliver notification to %s: %s', user_id, ex)
+    return int(notification_id) if notification_id is not None else None
+
+
+async def mark_all_notifications_read(user_id: int) -> None:
+    if db_pool is None:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            'UPDATE user_notifications SET is_read = TRUE '
+            'WHERE user_id = $1 AND is_read = FALSE',
+            user_id,
+        )
+
+
+async def _get_active_account_processes(
+    account_id: int, user_id: int,
+) -> List[str]:
+    """Снимок процессов для решения AI; не запускает и не останавливает их."""
+    active = set()
+    task = warming_tasks.get(account_id)
+    if task and not task.done():
+        active.add('warming')
+    responder = active_auto_responders.get(user_id, {}).get(account_id)
+    if responder and not responder.done():
+        active.add('auto_responder')
+    if account_id in autosub_tasks and not autosub_tasks[account_id].done():
+        active.add('autosub')
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                '''SELECT
+                   EXISTS(SELECT 1 FROM broadcasts
+                          WHERE account_id = $1 AND status = 'active') AS broadcast,
+                   EXISTS(SELECT 1 FROM dm_broadcasts
+                          WHERE account_id = $1 AND status = 'active') AS dm_broadcast,
+                   EXISTS(SELECT 1 FROM neurocomment_configs
+                          WHERE account_id = $1 AND is_active = TRUE) AS neurocomment,
+                   EXISTS(SELECT 1 FROM auto_responders
+                          WHERE account_id = $1 AND is_active = TRUE) AS responder,
+                   EXISTS(SELECT 1 FROM user_scripts
+                          WHERE account_id = $1 AND last_status = 'running') AS script,
+                   EXISTS(SELECT 1 FROM autosub_configs
+                          WHERE account_id = $1 AND is_active = TRUE) AS autosub''',
+                account_id,
+            )
+        if row:
+            for name in (
+                'broadcast', 'dm_broadcast', 'neurocomment',
+                'responder', 'script', 'autosub',
+            ):
+                if row.get(name):
+                    active.add('auto_responder' if name == 'responder' else name)
+    except Exception as ex:
+        logger.debug('Could not collect FloodWait context: %s', ex)
+    return sorted(active) or ['idle']
+
+
+def _fallback_flood_decision(seconds: int, active: List[str]) -> Dict[str, Any]:
+    """Детерминированное решение, если LLM недоступна или вернула мусор."""
+    risky = any(name in active for name in (
+        'broadcast', 'dm_broadcast', 'neurocomment', 'auto_responder',
+        'autolike', 'join', 'script',
+    ))
+    if seconds >= 900 or (seconds >= 300 and risky):
+        return {
+            'action': 'pause_active',
+            'extra_pause_seconds': min(1800, max(300, seconds // 2)),
+            'delay_multiplier': 2.5,
+            'severity': 'critical' if seconds >= 3600 else 'warning',
+            'reason': 'Длительный FloodWait при активных процессах.',
+        }
+    if seconds >= 60:
+        return {
+            'action': 'slow_down',
+            'extra_pause_seconds': min(600, max(60, seconds // 4)),
+            'delay_multiplier': 1.75,
+            'severity': 'warning',
+            'reason': 'Нужны увеличенные интервалы после FloodWait.',
+        }
+    return {
+        'action': 'wait',
+        'extra_pause_seconds': 0,
+        'delay_multiplier': 1.25,
+        'severity': 'info',
+        'reason': 'Короткий FloodWait, достаточно соблюсти cooldown.',
+    }
+
+
+def _parse_flood_ai_decision(
+    content: str, fallback: Dict[str, Any],
+) -> Dict[str, Any]:
+    text = (content or '').strip()
+    fence = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if fence:
+        text = fence.group(1)
+    elif not text.startswith('{'):
+        first, last = text.find('{'), text.rfind('}')
+        text = text[first:last + 1] if first >= 0 and last > first else ''
+    try:
+        raw = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return {**fallback, '_validated': False}
+    if not isinstance(raw, dict) or raw.get('action') not in FLOOD_AI_ALLOWED_ACTIONS:
+        return {**fallback, '_validated': False}
+    action = str(raw['action'])
+    try:
+        extra = max(0, min(3600, int(raw.get('extra_pause_seconds', 0))))
+    except (TypeError, ValueError):
+        extra = int(fallback['extra_pause_seconds'])
+    try:
+        multiplier = max(1.0, min(4.0, float(raw.get('delay_multiplier', 1.0))))
+    except (TypeError, ValueError):
+        multiplier = float(fallback['delay_multiplier'])
+    # Более сильные решения получают минимальную безопасную надстройку.
+    if action == 'slow_down':
+        multiplier = max(1.5, multiplier)
+    elif action == 'pause_active':
+        extra = max(300, extra)
+        multiplier = max(2.0, multiplier)
+    severity = str(raw.get('severity') or fallback['severity']).lower()
+    if severity not in {'info', 'warning', 'critical'}:
+        severity = str(fallback['severity'])
+    reason = str(raw.get('reason') or fallback['reason']).strip()[:500]
+    return {
+        'action': action,
+        'extra_pause_seconds': extra,
+        'delay_multiplier': multiplier,
+        'severity': severity,
+        'reason': reason,
+        '_validated': True,
+    }
+
+
+async def _run_intelligent_flood_analysis(
+    account_id: int, seconds: int, source: str,
+) -> None:
+    """Отдаёт событие LLM, валидирует решение и применяет только allowlist."""
+    lock = flood_protection_locks.setdefault(account_id, asyncio.Lock())
+    async with lock:
+        account = await get_account(account_id)
+        if not account:
+            return
+        user_id = int(account['user_id'])
+        active = await _get_active_account_processes(account_id, user_id)
+        if source not in {'generic', 'spam_check'}:
+            active = sorted(set(active + [source]))
+        flood = await get_account_flood_history_stats(account_id)
+        fallback = _fallback_flood_decision(seconds, active)
+        decision = dict(fallback)
+        ai_used = False
+        prompt = (
+            f"FloodWait: {int(seconds)} секунд\n"
+            f"Источник: {source}\n"
+            f"Активные процессы: {', '.join(active)}\n"
+            f"За час: {flood.get('last_1h_count', 0)} событий / "
+            f"{flood.get('last_1h_seconds', 0)} секунд\n"
+            f"За сутки: {flood.get('last_24h_count', 0)} событий / "
+            f"{flood.get('last_24h_seconds', 0)} секунд\n"
+            "Выбери безопасное действие по заданному JSON-шаблону."
+        )
+        try:
+            raw = await call_llm_api_plain(
+                prompt,
+                user_id=user_id,
+                system_prompt=FLOOD_AI_SYSTEM_PROMPT,
+                max_tokens=350,
+            )
+            parsed = _parse_flood_ai_decision(raw, fallback)
+            ai_used = bool(parsed.pop('_validated', False))
+            decision = parsed
+        except Exception as ex:
+            logger.warning('FloodWait AI fallback for account %s: %s', account_id, ex)
+
+        total_pause = max(1, int(seconds)) + int(decision['extra_pause_seconds'])
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    '''INSERT INTO account_flood_protection
+                       (account_id, blocked_until, delay_multiplier, last_action,
+                        last_reason, last_source, last_seconds, last_context,
+                        ai_used, updated_at)
+                       VALUES ($1, NOW() + ($2::double precision * INTERVAL '1 second'), $3,
+                               $4, $5, $6, $7, $8::jsonb, $9, NOW())
+                       ON CONFLICT (account_id) DO UPDATE SET
+                         blocked_until = GREATEST(
+                             COALESCE(account_flood_protection.blocked_until, NOW()),
+                             EXCLUDED.blocked_until
+                         ),
+                         delay_multiplier = EXCLUDED.delay_multiplier,
+                         last_action = EXCLUDED.last_action,
+                         last_reason = EXCLUDED.last_reason,
+                         last_source = EXCLUDED.last_source,
+                         last_seconds = EXCLUDED.last_seconds,
+                         last_context = EXCLUDED.last_context,
+                         ai_used = EXCLUDED.ai_used,
+                         updated_at = NOW()''',
+                    account_id, total_pause, float(decision['delay_multiplier']),
+                    decision['action'], decision['reason'], source, int(seconds),
+                    json.dumps(active, ensure_ascii=False), ai_used,
+                )
+        except Exception as ex:
+            logger.warning('Could not apply FloodWait AI decision: %s', ex)
+
+        action_labels = {
+            'wait': 'соблюсти паузу Telegram',
+            'slow_down': 'замедлить дальнейшие действия',
+            'pause_active': 'временно приостановить активные процессы',
+        }
+        phone = str(account.get('phone') or account_id)
+        message = (
+            f"Аккаунт: {phone}\n"
+            f"FloodWait: {int(seconds)} сек. · источник: {source}\n"
+            f"Активно: {', '.join(active)}\n"
+            f"Решение: {action_labels[decision['action']]}\n"
+            f"Общая пауза: {total_pause} сек. · множитель: "
+            f"×{float(decision['delay_multiplier']):.2f}\n"
+            f"Причина: {decision['reason']}\n"
+            f"Источник решения: {'AI' if ai_used else 'защитный шаблон'}"
+        )
+        await create_user_notification(
+            user_id,
+            'floodwait',
+            'Умная защита FloodWait',
+            message,
+            account_id=account_id,
+            severity=str(decision['severity']),
+        )
+        try:
+            await add_account_log(
+                account_id, 'AI FloodWait', 0, 'flood_protection',
+                f"{decision['action']}: {decision['reason']}",
+            )
+        except Exception:
+            pass
+
+
+def _schedule_flood_analysis(account_id: int, seconds: int, source: str) -> None:
+    existing = flood_protection_tasks.get(account_id)
+    if existing and not existing.done():
+        return
+    task = asyncio.create_task(
+        _run_intelligent_flood_analysis(account_id, seconds, source)
+    )
+    flood_protection_tasks[account_id] = task
+
+    def _done(done_task: asyncio.Task) -> None:
+        if flood_protection_tasks.get(account_id) is done_task:
+            flood_protection_tasks.pop(account_id, None)
+        try:
+            done_task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as ex:
+            logger.exception('FloodWait AI task failed: %s', ex)
+
+    task.add_done_callback(_done)
+
+
+async def record_flood_wait(
+    account_id: int,
+    chat_id: int,
+    seconds: int,
+    source: str = 'generic',
+    *,
+    ai_protection: bool = True,
+) -> None:
+    """Сохраняет FloodWait, немедленно включает cooldown и запускает AI."""
+    seconds = max(1, int(seconds))
+    source = (source or 'generic').strip().lower()[:80]
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                '''INSERT INTO flood_wait_history
+                   (account_id, chat_id, seconds, source)
+                   VALUES ($1, $2, $3, $4)''',
+                account_id, chat_id, seconds, source,
+            )
+            # Базовый cooldown применяется до ответа LLM и никогда им
+            # не сокращается.
+            if ai_protection and source not in FLOOD_AI_EXCLUDED_SOURCES:
+                await conn.execute(
+                    '''INSERT INTO account_flood_protection
+                       (account_id, blocked_until, last_source, last_seconds,
+                        last_action, last_reason, ai_used, updated_at)
+                       VALUES ($1, NOW() + ($2::double precision * INTERVAL '1 second'), $3, $2,
+                               'wait', 'Обязательный cooldown Telegram', FALSE, NOW())
+                       ON CONFLICT (account_id) DO UPDATE SET
+                         blocked_until = GREATEST(
+                             COALESCE(account_flood_protection.blocked_until, NOW()),
+                             EXCLUDED.blocked_until
+                         ),
+                         last_source = EXCLUDED.last_source,
+                         last_seconds = EXCLUDED.last_seconds,
+                         updated_at = NOW()''',
+                    account_id, seconds, source,
+                )
             await conn.execute(
                 "DELETE FROM flood_wait_history "
                 "WHERE account_id = $1 AND occurred_at < NOW() - INTERVAL '7 days'",
-                account_id
+                account_id,
             )
     except Exception as ex:
         logger.warning(f"record_flood_wait failed: {ex}")
+    if ai_protection and source not in FLOOD_AI_EXCLUDED_SOURCES:
+        _schedule_flood_analysis(account_id, seconds, source)
+
+
+async def get_flood_delay_multiplier(account_id: int) -> float:
+    """Множитель действует шесть часов после последнего решения защиты."""
+    try:
+        async with db_pool.acquire() as conn:
+            value = await conn.fetchval(
+                '''SELECT CASE
+                     WHEN updated_at > NOW() - INTERVAL '6 hours'
+                     THEN delay_multiplier ELSE 1.0 END
+                   FROM account_flood_protection WHERE account_id = $1''',
+                account_id,
+            )
+        return max(1.0, min(4.0, float(value or 1.0)))
+    except Exception:
+        return 1.0
+
+
+async def wait_for_flood_protection(
+    account_id: int, source: str = 'generic',
+) -> float:
+    """Ждёт общий AI-cooldown; исключённые операции сюда не попадают."""
+    if source in FLOOD_AI_EXCLUDED_SOURCES:
+        return 1.0
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    '''SELECT GREATEST(
+                           EXTRACT(EPOCH FROM (blocked_until - NOW())), 0
+                       ) AS seconds_left,
+                       CASE WHEN updated_at > NOW() - INTERVAL '6 hours'
+                            THEN delay_multiplier ELSE 1.0 END AS multiplier
+                       FROM account_flood_protection WHERE account_id = $1''',
+                    account_id,
+                )
+        except Exception:
+            return 1.0
+        if not row:
+            return 1.0
+        seconds_left = max(0.0, float(row['seconds_left'] or 0))
+        multiplier = max(1.0, min(4.0, float(row['multiplier'] or 1.0)))
+        if seconds_left <= 0:
+            return multiplier
+        await asyncio.sleep(min(seconds_left + 0.5, 30.0))
 
 
 async def smart_delay(
@@ -9125,6 +9724,8 @@ async def smart_delay(
         value *= tod_mult
         # История флуд-вейтов.
         value *= flood_score
+        # Решение AI-защиты остаётся активным несколько часов после события.
+        value *= await get_flood_delay_multiplier(account_id)
 
         # Джиттер ±15%, чтобы поведение не выглядело роботизированным.
         jitter = 1.0 + random.uniform(-SMART_DELAY_JITTER, SMART_DELAY_JITTER)
@@ -10422,6 +11023,12 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
         )
     )
     builder.row(InlineKeyboardButton(
+        text="Центр уведомлений",
+        callback_data="notification_center",
+        style='default',
+        icon_custom_emoji_id=get_icon("BELL")
+    ))
+    builder.row(InlineKeyboardButton(
         text="Помощь",
         callback_data="help",
         style='default',
@@ -10434,6 +11041,71 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
         icon_custom_emoji_id=get_icon("SUPPORT")
     ))
     return builder.as_markup()
+
+
+def get_notification_center_keyboard(
+    settings: Dict[str, Any],
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for category, label in NOTIFICATION_CATEGORIES.items():
+        enabled = bool(settings.get(f'{category}_enabled', True))
+        builder.row(InlineKeyboardButton(
+            text=f"{'✅' if enabled else '❌'} {label}",
+            callback_data=f'notification_toggle:{category}',
+            style='success' if enabled else 'default',
+        ))
+    builder.row(InlineKeyboardButton(
+        text='Отметить всё прочитанным',
+        callback_data='notification_read_all',
+        style='primary',
+        icon_custom_emoji_id=get_icon('CHECK'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Обновить',
+        callback_data='notification_center',
+        style='default',
+        icon_custom_emoji_id=get_icon('REFRESH'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='В главное меню',
+        callback_data='main_menu',
+        style='default',
+        icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    return builder.as_markup()
+
+
+async def render_notification_center(
+    user_id: int,
+) -> Tuple[str, InlineKeyboardMarkup]:
+    settings = await get_notification_settings(user_id)
+    items = await get_recent_notifications(user_id, limit=8)
+    unread = sum(1 for item in items if not item.get('is_read'))
+    lines = [
+        f"{emoji('BELL')} <b>Центр уведомлений</b>\n\n",
+        f"Непрочитанных среди последних: <b>{unread}</b>\n",
+        "Нажмите категорию ниже, чтобы включить или выключить "
+        "мгновенные сообщения. История событий сохраняется в любом случае.\n",
+    ]
+    if not items:
+        lines.append("\n<i>Уведомлений пока нет.</i>")
+    else:
+        lines.append("\n<b>Последние события:</b>\n")
+        severity_icons = {
+            'critical': '🔴', 'warning': '🟠', 'info': '🔵',
+        }
+        for item in items:
+            marker = '●' if not item.get('is_read') else '○'
+            severity_icon = severity_icons.get(item.get('severity'), '🔵')
+            created = _format_msk_datetime(item.get('created_at'), '—')
+            preview = str(item.get('message') or '').replace('\n', ' ')[:140]
+            lines.append(
+                f"\n{marker} {severity_icon} <b>{escape(str(item.get('title') or 'Событие')[:100])}</b>\n"
+                f"<code>{escape(created)}</code> · "
+                f"{escape(NOTIFICATION_CATEGORIES.get(item.get('category'), 'Событие'))}\n"
+                f"<i>{escape(preview)}</i>\n"
+            )
+    return ''.join(lines), get_notification_center_keyboard(settings)
 
 def get_account_manager_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -12348,6 +13020,35 @@ async def back_to_main(callback: CallbackQuery):
     )
     await present_section(callback.message, 'welcome', text, get_main_menu_keyboard(), replace=True)
     await callback.answer()
+
+
+@dp.callback_query(F.data == 'notification_center')
+async def notification_center(callback: CallbackQuery):
+    text, markup = await render_notification_center(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('notification_toggle:'))
+async def notification_toggle(callback: CallbackQuery):
+    category = callback.data.split(':', 1)[1]
+    if category not in NOTIFICATION_CATEGORIES:
+        await callback.answer('Неизвестная категория', show_alert=True)
+        return
+    settings = await get_notification_settings(callback.from_user.id)
+    enabled = not bool(settings.get(f'{category}_enabled', True))
+    await set_notification_category(callback.from_user.id, category, enabled)
+    text, markup = await render_notification_center(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer('Уведомления включены' if enabled else 'Уведомления выключены')
+
+
+@dp.callback_query(F.data == 'notification_read_all')
+async def notification_read_all(callback: CallbackQuery):
+    await mark_all_notifications_read(callback.from_user.id)
+    text, markup = await render_notification_center(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer('Все уведомления отмечены прочитанными')
 
 @dp.callback_query(F.data == "account_manager")
 async def account_manager(callback: CallbackQuery):
@@ -19575,7 +20276,10 @@ async def autosub_worker(account_id: int, user_id: int):
                 await _autosub_join_url(client, url)
                 await add_account_log(account_id, url, 0, 'autosub_join', text[:100])
             except FloodWaitError as ex:
-                await record_flood_wait(account_id, 0, ex.seconds)
+                await record_flood_wait(
+                    account_id, 0, ex.seconds,
+                    source='autosub', ai_protection=False,
+                )
                 # Telegram уже дал точный cooldown — не обрезаем его,
                 # иначе следующая попытка снова нарушит ограничение.
                 await asyncio.sleep(ex.seconds + 1)
@@ -22935,6 +23639,9 @@ async def account_ai_responder_worker(account_id: int, user_id: int):
                 # 6) Шлём ответ (с разбивкой на куски > 4000 символов).
                 sent_ok = False
                 try:
+                    await wait_for_flood_protection(
+                        account_id, 'account_ai_responder'
+                    )
                     if len(answer) <= 4000:
                         await client.send_message(chat_id, answer)
                     else:
@@ -22950,12 +23657,17 @@ async def account_ai_responder_worker(account_id: int, user_id: int):
                     )
                     try:
                         await record_flood_wait(
-                            account_id, int(chat_id), int(fw.seconds)
+                            account_id, int(chat_id), int(fw.seconds),
+                            source='account_ai_responder',
                         )
                     except Exception:
                         pass
                     try:
-                        await asyncio.sleep(min(int(fw.seconds), 30))
+                        # Повтор разрешён только после общего cooldown,
+                        # включая дополнительную паузу из решения AI.
+                        await wait_for_flood_protection(
+                            account_id, 'account_ai_responder'
+                        )
                         await client.send_message(chat_id, answer[:4000])
                         sent_ok = True
                     except Exception as ex:
