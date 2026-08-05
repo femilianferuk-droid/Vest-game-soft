@@ -13163,10 +13163,16 @@ def get_subscription_keyboard(tier: str) -> InlineKeyboardMarkup:
         ))
     else:
         builder.row(InlineKeyboardButton(
-            text=f"Купить Pro/MAX — {pro_min_price_label()}",
+            text=f"Купить Pro — {pro_min_price_label()}",
             callback_data="buy_pro",
             style='primary',
             icon_custom_emoji_id=get_icon("MONEY_SEND")
+        ))
+        builder.row(InlineKeyboardButton(
+            text="Купить MAX (отдельный тариф)",
+            callback_data="buy_max",
+            style='primary',
+            icon_custom_emoji_id=get_icon("STAR")
         ))
 
     builder.row(InlineKeyboardButton(
@@ -13289,7 +13295,7 @@ async def noop_handler(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "buy_pro")
 async def buy_pro(callback: CallbackQuery):
-    """Шаг 1 — выбор срока подписки."""
+    """Шаг 1 — выбор срока подписки (только Pro)."""
     await callback.answer()
     sub = await get_subscription(callback.from_user.id)
     is_active_pro = sub.get("tier") in ("pro", "max")
@@ -13298,6 +13304,8 @@ async def buy_pro(callback: CallbackQuery):
     builder = InlineKeyboardBuilder()
     for code in PRO_PLAN_ORDER:
         plan = PRO_PLANS[code]
+        if plan.get("tier") != "pro":
+            continue  # показываем только Pro
         builder.row(InlineKeyboardButton(
             text=pro_plan_button_text(plan),
             callback_data=f"pro_plan:{code}",
@@ -13315,17 +13323,62 @@ async def buy_pro(callback: CallbackQuery):
         f"{emoji('MONEY_SEND')} <b>Продление {active_label}</b>\n\n"
         "Новый срок прибавится к текущей подписке.\n\n"
         if is_active_pro else
-        f"{emoji('MONEY_SEND')} <b>Покупка Pro/MAX</b>\n\n"
+        f"{emoji('MONEY_SEND')} <b>Покупка Pro</b>\n\n"
     )
-
-    note = ""
-    if sub.get("tier") == "pro" and sub.get("expires_at") and sub["expires_at"] > datetime.now(MSK_TZ).replace(tzinfo=None):
-        note = "\n⚠️ У вас уже есть <b>Pro</b>. При покупке <b>MAX</b> он начнётся только после окончания Pro-тарифа.\n"
 
     await callback.message.edit_text(
         header +
         "Выберите срок:\n"
         f"{pro_plans_text()}\n\n"
+        "Оплата: СБП (₽) или Crypto Pay (USDT).",
+        reply_markup=builder.as_markup()
+    )
+
+
+@dp.callback_query(F.data == "buy_max")
+async def buy_max(callback: CallbackQuery):
+    """Шаг 1 — выбор срока MAX (отдельный тариф)."""
+    await callback.answer()
+    sub = await get_subscription(callback.from_user.id)
+    is_active_pro = sub.get("tier") in ("pro", "max")
+    active_label = subscription_tier_label(sub.get("tier"))
+
+    builder = InlineKeyboardBuilder()
+    for code in PRO_PLAN_ORDER:
+        plan = PRO_PLANS[code]
+        if plan.get("tier") != "max":
+            continue
+        builder.row(InlineKeyboardButton(
+            text=pro_plan_button_text(plan),
+            callback_data=f"pro_plan:{code}",
+            style='primary' if code == "max_30d" else 'default',
+            icon_custom_emoji_id=get_icon("STAR")
+        ))
+    builder.row(InlineKeyboardButton(
+        text="Назад",
+        callback_data="my_subscription",
+        style='default',
+        icon_custom_emoji_id=get_icon("BACK")
+    ))
+
+    header = (
+        f"{emoji('MONEY_SEND')} <b>Продление {active_label}</b>\n\n"
+        "MAX начнётся только после окончания текущей подписки.\n\n"
+        if is_active_pro else
+        f"{emoji('STAR')} <b>Покупка MAX (отдельный тариф)</b>\n\n"
+    )
+
+    note = ""
+    if sub.get("tier") == "pro" and sub.get("expires_at") and sub["expires_at"] > datetime.now(MSK_TZ).replace(tzinfo=None):
+        note = "\n⚠️ У вас уже есть <b>Pro</b>. MAX начнётся только после окончания Pro-тарифа.\n"
+
+    limits = await format_limits_text(callback.from_user.id)
+
+    await callback.message.edit_text(
+        header +
+        "Выберите срок MAX:\n"
+        f"{pro_plans_text()}\n\n"
+        f"{limits}\n\n"
         f"Оплата: СБП (₽) или Crypto Pay (USDT).{note}",
         reply_markup=builder.as_markup()
     )
