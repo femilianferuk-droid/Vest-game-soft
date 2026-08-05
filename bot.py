@@ -2992,12 +2992,15 @@ def _safe_plan_defaults(base: dict) -> dict:
     )
 
     p.setdefault('distribution', {
-        'read_dialogs': 0.35,
-        'view_stories': 0.25,
-        'react': 0.18,
-        'saved_note': 0.12,
-        'typing': 0.07,
-        'status_toggle': 0.03,
+        'read_dialogs': 0.25,
+        'browse_recent': 0.15,
+        'view_channel_posts': 0.15,
+        'view_stories': 0.16,
+        'read_reactions': 0.08,
+        'react': 0.10,
+        'saved_note': 0.06,
+        'typing': 0.04,
+        'status_toggle': 0.01,
     })
     p.setdefault('saved_notes', list(WARMING_SAVED_NOTES))
     if not isinstance(p['saved_notes'], list) or not p['saved_notes']:
@@ -3176,7 +3179,10 @@ def _format_warming_plan_message(plan: dict, narrative: str) -> str:
         f"Паузы: <b>{imin}–{imax} мин</b>\n",
         f"{emoji('CHART')} <b>Распределение действий:</b>\n"
         f" • Чтение диалогов — <b>{pct(d.get('read_dialogs', 0))}%</b>\n"
+        f" • Последние сообщения — <b>{pct(d.get('browse_recent', 0))}%</b>\n"
+        f" • Посты каналов — <b>{pct(d.get('view_channel_posts', 0))}%</b>\n"
         f" • Сторис — <b>{pct(d.get('view_stories', 0))}%</b>\n"
+        f" • Чтение реакций — <b>{pct(d.get('read_reactions', 0))}%</b>\n"
         f" • Реакции — <b>{pct(d.get('react', 0))}%</b>\n"
         f" • Заметки в Избранном — <b>{pct(d.get('saved_note', 0))}%</b>\n"
         f" • «Печатает...» — <b>{pct(d.get('typing', 0))}%</b>\n"
@@ -5905,7 +5911,10 @@ WARMING_PLAN_SYSTEM_PROMPT = """Ты — эксперт по безопасно�
 
 Доступные типы действий (action_kind) и их смысл:
   - read_dialogs  : пометить 1-3 диалога прочитанными
+  - browse_recent : открыть 2-5 последних сообщений в одном диалоге
+  - view_channel_posts : посмотреть 1-3 свежих поста канала
   - view_stories  : посмотреть 1-2 сторис у контактов
+  - read_reactions: прочитать уведомления о реакциях в одном диалоге
   - react         : поставить лёгкую реакцию на 1 свежее сообщение
   - saved_note    : отправить короткую заметку в Избранное (self-PM)
   - typing        : подёргать «печатает...» в случайном диалоге 2-4 сек
@@ -5914,7 +5923,7 @@ WARMING_PLAN_SYSTEM_PROMPT = """Ты — эксперт по безопасно�
 Правила генерации:
   1. warming_level — выбранный пользователем уровень low, medium или high. Не меняй выбранный уровень.
   2. Интервалы между волнами (intervals) — В СЕКУНДАХ и строго внутри границ, переданных пользователем. Ночью интервалы длиннее, днём короче.
-  3. distribution — сумма вероятностей примерно 1.0. Безопасные действия (read, view_stories) имеют больший вес.
+  3. distribution — сумма вероятностей примерно 1.0. Безопасные действия чтения (read_dialogs, browse_recent, view_channel_posts, read_reactions, view_stories) имеют больший вес.
   4. saved_notes — МАССИВ из 8-12 КОРОТКИХ текстов на русском (как будто человек пишет самому себе). Каждый до 80 символов. БЕЗ спама, БЕЗ рекламы. Разнообразные: напоминалки, мысли, короткие заметки.
   5. reaction_pool — 4-6 эмодзи из безопасного набора: «👍», «🔥», «❤️», «😂», «😢», «🙏».
   6. schedule — массив объектов {hour_offset, intensity, focus, actions_count_min, actions_count_max}. intensity ∈ {low, medium, high}. focus — короткая подсказка что делать (например «active_dialogs», «stories_only», «rest»).
@@ -5930,12 +5939,15 @@ WARMING_PLAN_SYSTEM_PROMPT = """Ты — эксперт по безопасно�
   "intervals_min_sec": 480,
   "intervals_max_sec": 1200,
   "distribution": {
-    "read_dialogs": 0.35,
-    "view_stories": 0.25,
-    "react": 0.18,
-    "saved_note": 0.12,
-    "typing": 0.07,
-    "status_toggle": 0.03
+    "read_dialogs": 0.25,
+    "browse_recent": 0.15,
+    "view_channel_posts": 0.15,
+    "view_stories": 0.16,
+    "read_reactions": 0.08,
+    "react": 0.10,
+    "saved_note": 0.06,
+    "typing": 0.04,
+    "status_toggle": 0.01
   },
   "saved_notes": [
     "Напоминалка самому себе",
@@ -7185,7 +7197,10 @@ def _get_warming_actions_map() -> Dict[str, Any]:
     if _WARMING_ACTIONS_MAP is None:
         _WARMING_ACTIONS_MAP = {
             'read_dialogs':  _warming_action_read_dialogs,
+            'browse_recent': _warming_action_browse_recent,
+            'view_channel_posts': _warming_action_view_channel_posts,
             'view_stories':  _warming_action_view_stories,
+            'read_reactions': _warming_action_read_reactions,
             'react':         _warming_action_react,
             'saved_note':    _warming_action_saved_note,
             'typing':        _warming_action_typing,
@@ -7220,7 +7235,10 @@ def _build_weighted_pool(distribution: Dict[str, float]) -> List[str]:
         total += n
     if not pool:
         # фолбек — равные веса для безопасных действий
-        return ['read_dialogs', 'view_stories', 'react']
+        return [
+            'read_dialogs', 'browse_recent',
+            'view_channel_posts', 'view_stories',
+        ]
     return pool
 
 
@@ -7338,6 +7356,113 @@ async def _warming_action_read_dialogs(
     except Exception as ex:
         logger.debug(f"warming read: {ex}")
         return ""
+
+
+async def _warming_action_browse_recent(
+    client: TelegramClient, account_id: int
+) -> str:
+    """Открываем несколько последних сообщений без отправки или реакций."""
+    dialogs = await _warming_get_dialogs(client, limit=30)
+    candidates = [
+        dialog for dialog in dialogs
+        if getattr(dialog, "peer", None)
+        and getattr(dialog, "top_message", 0)
+    ]
+    if not candidates:
+        return ""
+    target = random.choice(candidates[:12])
+    try:
+        history = await client(GetHistoryRequest(
+            peer=target.peer,
+            offset_id=0,
+            offset_date=None,
+            add_offset=0,
+            limit=random.randint(2, 5),
+            max_id=0,
+            min_id=0,
+            hash=0,
+        ))
+        messages = getattr(history, "messages", None) or []
+        if not messages:
+            return ""
+        return f"открыл последние сообщения: {len(messages)}"
+    except FloodWaitError as fw:
+        await record_flood_wait(account_id, 0, fw.seconds)
+    except Exception as ex:
+        logger.debug(f"warming browse recent: {ex}")
+    return ""
+
+
+async def _warming_action_view_channel_posts(
+    client: TelegramClient, account_id: int
+) -> str:
+    """Просматриваем 1–3 свежих поста из уже доступного канала."""
+    dialogs = await _warming_get_dialogs(client, limit=40)
+    channels = [
+        dialog for dialog in dialogs
+        if isinstance(getattr(dialog, "peer", None), PeerChannel)
+        and getattr(dialog, "top_message", 0)
+    ]
+    if not channels:
+        return ""
+    target = random.choice(channels[:15])
+    try:
+        history = await client(GetHistoryRequest(
+            peer=target.peer,
+            offset_id=0,
+            offset_date=None,
+            add_offset=0,
+            limit=random.randint(1, 3),
+            max_id=0,
+            min_id=0,
+            hash=0,
+        ))
+        message_ids = [
+            int(message.id) for message in (
+                getattr(history, "messages", None) or []
+            )
+            if getattr(message, "id", None)
+        ]
+        if not message_ids:
+            return ""
+        await client(GetMessagesViewsRequest(
+            peer=target.peer,
+            id=message_ids,
+            increment=True,
+        ))
+        return f"посмотрел посты канала: {len(message_ids)}"
+    except FloodWaitError as fw:
+        await record_flood_wait(account_id, 0, fw.seconds)
+    except Exception as ex:
+        logger.debug(f"warming channel posts: {ex}")
+    return ""
+
+
+async def _warming_action_read_reactions(
+    client: TelegramClient, account_id: int
+) -> str:
+    """Снимаем отметку новых реакций в одном из недавних диалогов."""
+    dialogs = await _warming_get_dialogs(client, limit=30)
+    candidates = [
+        dialog for dialog in dialogs
+        if getattr(dialog, "peer", None)
+        and getattr(dialog, "top_message", 0)
+    ]
+    if not candidates:
+        return ""
+    with_unread = [
+        dialog for dialog in candidates
+        if getattr(dialog, "unread_reactions_count", 0)
+    ]
+    target = random.choice((with_unread or candidates)[:12])
+    try:
+        await client(ReadReactionsRequest(peer=target.peer))
+        return "прочитал уведомления о реакциях"
+    except FloodWaitError as fw:
+        await record_flood_wait(account_id, 0, fw.seconds)
+    except Exception as ex:
+        logger.debug(f"warming read reactions: {ex}")
+    return ""
 
 
 async def _warming_action_view_stories(
@@ -7662,7 +7787,10 @@ async def warming_worker(account_id: int, user_id: int) -> None:
                 )
                 actions_pool = [
                     _warming_action_read_dialogs,
+                    _warming_action_browse_recent,
+                    _warming_action_view_channel_posts,
                     _warming_action_view_stories,
+                    _warming_action_read_reactions,
                     _warming_action_typing,
                 ]
                 if cycle % 4 == 0:
@@ -9036,46 +9164,43 @@ MAX_PRICE_USD = os.getenv('MAX_PRICE_USD') or '2.25'
 PRO_PLANS: Dict[str, Dict[str, Any]] = {
     "pro_1d": {
         "code": "pro_1d", "tier": "pro", "days": 1, "rub": 5, "usd": "0.08",
-        "stars": int(os.getenv("STARS_PRO_1D") or "5"),
         "title": "1 день", "badge": "тест",
     },
     "pro_7d": {
         "code": "pro_7d", "tier": "pro", "days": 7, "rub": 15, "usd": "0.23",
-        "stars": int(os.getenv("STARS_PRO_7D") or "12"),
         "title": "7 дней", "badge": "",
     },
     "pro_30d": {
         "code": "pro_30d", "tier": "pro", "days": 30, "rub": 40, "usd": "0.60",
-        "stars": int(os.getenv("STARS_PRO_30D") or "30"),
         "title": "30 дней", "badge": "популярный",
     },
     "pro_90d": {
         "code": "pro_90d", "tier": "pro", "days": 90, "rub": 100, "usd": "1.50",
-        "stars": int(os.getenv("STARS_PRO_90D") or "75"),
         "title": "90 дней", "badge": "выгодно",
     },
     "pro_365d": {
         "code": "pro_365d", "tier": "pro", "days": 365, "rub": 350, "usd": "5.25",
-        "stars": int(os.getenv("STARS_PRO_365D") or "250"),
         "title": "365 дней", "badge": "выгодно",
     },
     # MAX — отдельный тариф
     "max_1d": {
         "code": "max_1d", "tier": "max", "days": 1, "rub": 25, "usd": "0.375",
-        "stars": int(os.getenv("STARS_MAX_1D") or "20"),
         "title": "1 день", "badge": "MAX",
     },
     "max_30d": {
         "code": "max_30d", "tier": "max", "days": 30, "rub": 150, "usd": "2.25",
-        "stars": int(os.getenv("STARS_MAX_30D") or "110"),
         "title": "30 дней", "badge": "MAX",
     },
     "max_90d": {
         "code": "max_90d", "tier": "max", "days": 90, "rub": 250, "usd": "3.75",
-        "stars": int(os.getenv("STARS_MAX_90D") or "180"),
         "title": "90 дней", "badge": "MAX · выгодно",
     },
 }
+# Цена в Telegram Stars всегда равна рублёвой цене тарифа (1 ₽ = 1 ⭐).
+# Единое вычисление не даст этим ценам случайно разойтись в будущем.
+for _plan in PRO_PLANS.values():
+    _plan["stars"] = int(_plan["rub"])
+
 # Порядок вывода тарифов в интерфейсе.
 PRO_PLAN_ORDER = ["pro_1d", "pro_7d", "pro_30d", "pro_90d", "pro_365d",
                   "max_1d", "max_30d", "max_90d"]
