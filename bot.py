@@ -143,9 +143,8 @@ GLOBAL_LLM_RUNTIME_READY = False
 
 # --- Чат с нейросетями ---
 AI_CHAT_FREE_DAILY_LIMIT = 3
-AI_CHAT_PRO_DAILY_LIMIT = 15
-# MAX gets a higher chat quota. PRO remains unchanged for now.
-AI_CHAT_MAX_DAILY_LIMIT = int(os.getenv('AI_CHAT_MAX_DAILY_LIMIT') or '50')
+AI_CHAT_PRO_DAILY_LIMIT = 10          # чуть строже
+AI_CHAT_MAX_DAILY_LIMIT = int(os.getenv('AI_CHAT_MAX_DAILY_LIMIT') or '40')
 # Admin can override per-user limit via DB column ai_chat_limit_override
 AI_CHAT_HISTORY_MESSAGES_LIMIT = 16  # 8 пар user/assistant
 AI_CHAT_HISTORY_CONTENT_LIMIT = 2000
@@ -8889,14 +8888,23 @@ PRO_PLANS: Dict[str, Dict[str, Any]] = {
         "code": "pro_365d", "tier": "pro", "days": 365, "rub": 350, "usd": "5.25",
         "title": "365 дней", "badge": "выгодно",
     },
+    # MAX — отдельный тариф
+    "max_1d": {
+        "code": "max_1d", "tier": "max", "days": 1, "rub": 20, "usd": "0.30",
+        "title": "1 день", "badge": "MAX",
+    },
     "max_30d": {
-        "code": "max_30d", "tier": "max", "days": MAX_DURATION_DAYS,
-        "rub": MAX_PRICE_RUB, "usd": MAX_PRICE_USD,
-        "title": "30 дней", "badge": "максимум",
+        "code": "max_30d", "tier": "max", "days": 30, "rub": 120, "usd": "1.80",
+        "title": "30 дней", "badge": "MAX",
+    },
+    "max_90d": {
+        "code": "max_90d", "tier": "max", "days": 90, "rub": 200, "usd": "3.00",
+        "title": "90 дней", "badge": "MAX · выгодно",
     },
 }
 # Порядок вывода тарифов в интерфейсе.
-PRO_PLAN_ORDER = ["pro_1d", "pro_7d", "pro_30d", "pro_90d", "pro_365d", "max_30d"]
+PRO_PLAN_ORDER = ["pro_1d", "pro_7d", "pro_30d", "pro_90d", "pro_365d",
+                  "max_1d", "max_30d", "max_90d"]
 DEFAULT_PRO_PLAN = "pro_30d"
 
 
@@ -13151,12 +13159,7 @@ def get_subscription_keyboard(tier: str) -> InlineKeyboardMarkup:
             style='primary',
             icon_custom_emoji_id=get_icon("MONEY_SEND")
         ))
-    builder.row(InlineKeyboardButton(
-        text="Проверить оплату",
-        callback_data="check_pro_payment",
-        style='default',
-        icon_custom_emoji_id=get_icon("REFRESH")
-    ))
+
     builder.row(InlineKeyboardButton(
         text="Назад",
         callback_data="main_menu",
