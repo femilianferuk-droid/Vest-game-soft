@@ -11,6 +11,7 @@ import re
 import tempfile
 import time
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Optional, List, Dict, Any, Tuple
 from html import escape
 from urllib.parse import urlparse, parse_qs
@@ -266,6 +267,68 @@ NOTIFICATION_CATEGORIES = {
     'account': 'Состояние аккаунтов',
     'tasks': 'Задачи и прогрев',
     'payments': 'Платежи и подписка',
+}
+
+SUPPORTED_LANGUAGES = {
+    'ru': 'Русский',
+    'en': 'English',
+    'zh': '中文',
+}
+
+UI_TEXT = {
+    'ru': {
+        'settings': 'Настройки', 'notifications': 'Центр уведомлений',
+        'language': 'Смена языка', 'promo': 'Активировать промокод',
+        'back_main': 'В главное меню', 'main_title': 'Главное меню',
+        'choose_action': 'Выберите действие:', 'open_app': 'Открыть мини-апп',
+        'accounts': 'Менеджер аккаунтов', 'functions': 'Функции',
+        'ai_chat': 'Чат с нейросетями', 'subscription': 'Моя подписка',
+        'balance': 'Баланс', 'topup': 'Пополнить баланс',
+        'help': 'Помощь', 'support': 'Поддержка',
+        'settings_text': 'Управляйте уведомлениями, языком интерфейса и промокодами.',
+        'current_language': 'Текущий язык', 'choose_language': 'Выберите язык интерфейса:',
+        'language_saved': 'Язык сохранён',
+    },
+    'en': {
+        'settings': 'Settings', 'notifications': 'Notification center',
+        'language': 'Change language', 'promo': 'Redeem promo code',
+        'back_main': 'Main menu', 'main_title': 'Main menu',
+        'choose_action': 'Choose an action:', 'open_app': 'Open mini app',
+        'accounts': 'Account manager', 'functions': 'Features',
+        'ai_chat': 'AI chat', 'subscription': 'My subscription',
+        'balance': 'Balance', 'topup': 'Top up balance',
+        'help': 'Help', 'support': 'Support',
+        'settings_text': 'Manage notifications, interface language and promo codes.',
+        'current_language': 'Current language', 'choose_language': 'Choose the interface language:',
+        'language_saved': 'Language saved',
+    },
+    'zh': {
+        'settings': '设置', 'notifications': '通知中心',
+        'language': '切换语言', 'promo': '兑换优惠码',
+        'back_main': '主菜单', 'main_title': '主菜单',
+        'choose_action': '请选择操作：', 'open_app': '打开小程序',
+        'accounts': '账号管理', 'functions': '功能',
+        'ai_chat': 'AI 聊天', 'subscription': '我的订阅',
+        'balance': '余额', 'topup': '充值余额',
+        'help': '帮助', 'support': '支持',
+        'settings_text': '管理通知、界面语言和优惠码。',
+        'current_language': '当前语言', 'choose_language': '请选择界面语言：',
+        'language_saved': '语言已保存',
+    },
+}
+
+NOTIFICATION_CATEGORY_LABELS = {
+    'ru': NOTIFICATION_CATEGORIES,
+    'en': {
+        'floodwait': 'FloodWait and AI protection',
+        'account': 'Account status', 'tasks': 'Tasks and warming',
+        'payments': 'Payments and subscription',
+    },
+    'zh': {
+        'floodwait': 'FloodWait 与 AI 保护',
+        'account': '账号状态', 'tasks': '任务与养号',
+        'payments': '付款与订阅',
+    },
 }
 
 # --- Проверка ограничений @SpamBot ---
@@ -642,6 +705,15 @@ class AdminStates(StatesGroup):
     waiting_for_revoke_user_id = State()
     waiting_for_user_lookup_id = State()
     waiting_for_media = State()
+    waiting_for_promo_code = State()
+    waiting_for_promo_balance = State()
+    waiting_for_promo_days = State()
+    waiting_for_promo_max_uses = State()
+    waiting_for_promo_expiry = State()
+
+
+class PromoStates(StatesGroup):
+    waiting_for_code = State()
 
 
 class AdminLLMConfigStates(StatesGroup):
@@ -1355,6 +1427,13 @@ async def init_db():
             )
         except Exception:
             pass
+        try:
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS language_code TEXT "
+                "NOT NULL DEFAULT 'ru'"
+            )
+        except Exception:
+            pass
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS balance_invoices (
                 invoice_id BIGINT PRIMARY KEY,
@@ -1533,6 +1612,50 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         ''')
+
+        # Промокоды двух типов: пополнение внутреннего баланса либо
+        # продление подписки Pro/MAX. Активации защищены уникальной парой
+        # promo_id + user_id и выполняются одной транзакцией.
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS promo_codes (
+                id BIGSERIAL PRIMARY KEY,
+                code TEXT NOT NULL UNIQUE,
+                reward_type TEXT NOT NULL,
+                balance_amount NUMERIC(12, 2),
+                subscription_tier TEXT,
+                subscription_days INTEGER,
+                max_uses INTEGER,
+                uses_count INTEGER NOT NULL DEFAULT 0,
+                expires_at TIMESTAMP,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_by BIGINT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW(),
+                CHECK (reward_type IN ('balance', 'subscription')),
+                CHECK (subscription_tier IS NULL OR subscription_tier IN ('pro', 'max'))
+            )
+        ''')
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS promo_redemptions (
+                id BIGSERIAL PRIMARY KEY,
+                promo_id BIGINT NOT NULL REFERENCES promo_codes(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                reward_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+                redeemed_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE (promo_id, user_id)
+            )
+        ''')
+        try:
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_promo_codes_active '
+                'ON promo_codes (is_active, expires_at)'
+            )
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_promo_redemptions_user '
+                'ON promo_redemptions (user_id, redeemed_at DESC)'
+            )
+        except Exception:
+            pass
         try:
             await conn.execute(
                 'CREATE INDEX IF NOT EXISTS idx_subscriptions_expires '
@@ -1700,6 +1823,41 @@ async def register_user(user_id: int, username: str, first_name: str):
             SET username = $2, first_name = $3''',
             user_id, username, first_name
         )
+
+
+def normalize_language(value: Optional[str]) -> str:
+    code = str(value or 'ru').lower().split('-', 1)[0]
+    return code if code in SUPPORTED_LANGUAGES else 'ru'
+
+
+def ui_text(language: str, key: str) -> str:
+    language = normalize_language(language)
+    return UI_TEXT.get(language, UI_TEXT['ru']).get(key, UI_TEXT['ru'].get(key, key))
+
+
+async def get_user_language(user_id: int) -> str:
+    if db_pool is None:
+        return 'ru'
+    try:
+        async with db_pool.acquire() as conn:
+            value = await conn.fetchval(
+                'SELECT language_code FROM users WHERE user_id = $1', user_id
+            )
+        return normalize_language(value)
+    except Exception as ex:
+        logger.warning('get_user_language failed for %s: %s', user_id, ex)
+        return 'ru'
+
+
+async def set_user_language(user_id: int, language: str) -> str:
+    language = normalize_language(language)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (user_id, language_code) VALUES ($1, $2) "
+            "ON CONFLICT (user_id) DO UPDATE SET language_code = EXCLUDED.language_code",
+            user_id, language,
+        )
+    return language
 
 # --- Логирование ---
 async def add_account_log(
@@ -9444,12 +9602,13 @@ async def create_user_notification(
 
     settings = await get_notification_settings(user_id)
     if send_now and settings.get(f'{category}_enabled', True):
+        language = await get_user_language(user_id)
         icon_name = 'CROSS' if severity == 'critical' else (
             'WARNING' if severity == 'warning' else 'BELL'
         )
         markup = InlineKeyboardBuilder()
         markup.row(InlineKeyboardButton(
-            text='Центр уведомлений',
+            text=ui_text(language, 'notifications'),
             callback_data='notification_center',
             style='default',
             icon_custom_emoji_id=get_icon('BELL'),
@@ -10328,6 +10487,144 @@ async def add_wallet_balance(user_id: int, amount: float) -> None:
         )
 
 
+def normalize_promo_code(value: str) -> str:
+    return re.sub(r'\s+', '', str(value or '')).upper()[:32]
+
+
+async def redeem_promo_code(user_id: int, raw_code: str) -> Dict[str, Any]:
+    """Атомарно активирует промокод и возвращает описание награды."""
+    code = normalize_promo_code(raw_code)
+    if not code:
+        return {'ok': False, 'reason': 'invalid'}
+    now = datetime.now(MSK_TZ).replace(tzinfo=None)
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            promo_row = await conn.fetchrow(
+                'SELECT * FROM promo_codes WHERE code = $1 FOR UPDATE', code
+            )
+            if not promo_row:
+                return {'ok': False, 'reason': 'not_found'}
+            promo = dict(promo_row)
+            if not promo.get('is_active'):
+                return {'ok': False, 'reason': 'inactive'}
+            expires_at = promo.get('expires_at')
+            if expires_at is not None and expires_at <= now:
+                return {'ok': False, 'reason': 'expired'}
+            max_uses = promo.get('max_uses')
+            if max_uses is not None and int(max_uses) > 0:
+                if int(promo.get('uses_count') or 0) >= int(max_uses):
+                    return {'ok': False, 'reason': 'limit'}
+            already_used = await conn.fetchval(
+                'SELECT 1 FROM promo_redemptions WHERE promo_id = $1 AND user_id = $2',
+                promo['id'], user_id,
+            )
+            if already_used:
+                return {'ok': False, 'reason': 'already_used'}
+
+            reward: Dict[str, Any] = {'type': promo['reward_type'], 'code': code}
+            if promo['reward_type'] == 'balance':
+                amount_value = Decimal(str(promo.get('balance_amount') or 0))
+                if amount_value <= 0:
+                    return {'ok': False, 'reason': 'invalid_reward'}
+                await conn.execute(
+                    'UPDATE users SET balance = COALESCE(balance, 0) + $1 '
+                    'WHERE user_id = $2', amount_value, user_id,
+                )
+                reward['amount'] = float(amount_value)
+                reward['balance'] = float(await conn.fetchval(
+                    'SELECT COALESCE(balance, 0) FROM users WHERE user_id = $1',
+                    user_id,
+                ) or 0)
+            else:
+                tier = str(promo.get('subscription_tier') or 'pro').lower()
+                days = int(promo.get('subscription_days') or 0)
+                if tier not in {'pro', 'max'} or days <= 0:
+                    return {'ok': False, 'reason': 'invalid_reward'}
+                await conn.execute(
+                    "INSERT INTO subscriptions (user_id, tier) VALUES ($1, 'free') "
+                    'ON CONFLICT (user_id) DO NOTHING', user_id,
+                )
+                current = await conn.fetchrow(
+                    'SELECT tier, expires_at FROM subscriptions '
+                    'WHERE user_id = $1 FOR UPDATE', user_id,
+                )
+                current_tier = str(current['tier'] or 'free')
+                current_expiry = current['expires_at']
+                active = bool(current_expiry is not None and current_expiry > now)
+                base = current_expiry if active else now
+                target_tier = tier
+                if active and current_tier == 'max' and tier == 'pro':
+                    target_tier = 'max'
+                new_expiry = base + timedelta(days=days)
+                await conn.execute(
+                    'UPDATE subscriptions SET tier = $1, expires_at = $2, '
+                    'last_invoice_payload = $3, updated_at = NOW() '
+                    'WHERE user_id = $4',
+                    target_tier, new_expiry, f'promo:{code}', user_id,
+                )
+                reward.update({
+                    'tier': target_tier, 'days': days,
+                    'expires_at': new_expiry,
+                })
+
+            await conn.execute(
+                'INSERT INTO promo_redemptions '
+                '(promo_id, user_id, reward_snapshot) VALUES ($1, $2, $3::jsonb)',
+                promo['id'], user_id, json.dumps(reward, default=str),
+            )
+            await conn.execute(
+                'UPDATE promo_codes SET uses_count = uses_count + 1, '
+                'updated_at = NOW() WHERE id = $1', promo['id'],
+            )
+            reward['ok'] = True
+            return reward
+
+
+async def create_promo_code(
+    code: str, reward_type: str, *, created_by: int,
+    balance_amount: Optional[float] = None,
+    subscription_tier: Optional[str] = None,
+    subscription_days: Optional[int] = None,
+    max_uses: Optional[int] = None,
+    expires_at: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    code = normalize_promo_code(code)
+    if not re.fullmatch(r'[A-ZА-ЯЁ0-9_-]{3,32}', code):
+        raise ValueError('Код: 3–32 символа, буквы, цифры, _ или -')
+    if reward_type not in {'balance', 'subscription'}:
+        raise ValueError('Неизвестный тип награды')
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            '''INSERT INTO promo_codes
+               (code, reward_type, balance_amount, subscription_tier,
+                subscription_days, max_uses, expires_at, created_by)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               RETURNING *''',
+            code, reward_type,
+            Decimal(str(balance_amount)) if balance_amount is not None else None,
+            subscription_tier,
+            subscription_days, max_uses, expires_at, created_by,
+        )
+    return dict(row)
+
+
+async def get_promo_codes(limit: int = 20) -> List[Dict[str, Any]]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            'SELECT * FROM promo_codes ORDER BY created_at DESC LIMIT $1',
+            max(1, min(int(limit), 50)),
+        )
+    return [dict(row) for row in rows]
+
+
+async def get_promo_code(promo_id: int) -> Optional[Dict[str, Any]]:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            'SELECT * FROM promo_codes WHERE id = $1', promo_id
+        )
+    return dict(row) if row else None
+
+
 def get_balance_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(
@@ -11202,35 +11499,36 @@ async def check_scheduled_broadcasts():
         await asyncio.sleep(30)
 
 # --- Клавиатуры ---
-def get_main_menu_keyboard() -> InlineKeyboardMarkup:
+def get_main_menu_keyboard(language: str = 'ru') -> InlineKeyboardMarkup:
+    language = normalize_language(language)
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(
-        text="Открыть мини-апп",
+        text=ui_text(language, 'open_app'),
         web_app=WebAppInfo(url="https://vestgamesoft.shop"),
         style='primary',
         icon_custom_emoji_id=get_icon("APPS")
     ))
     builder.row(InlineKeyboardButton(
-        text="Менеджер аккаунтов",
+        text=ui_text(language, 'accounts'),
         callback_data="account_manager",
         style='primary',
         icon_custom_emoji_id=get_icon("PEOPLE")
     ))
     builder.row(InlineKeyboardButton(
-        text="Функции",
+        text=ui_text(language, 'functions'),
         callback_data="functions",
         style='primary',
         icon_custom_emoji_id=get_icon("APPS")
     ))
     builder.row(
         InlineKeyboardButton(
-            text="Чат с нейросетями",
+            text=ui_text(language, 'ai_chat'),
             callback_data="ai_chat",
             style='primary',
             icon_custom_emoji_id=get_icon("AI")
         ),
         InlineKeyboardButton(
-            text="Моя подписка",
+            text=ui_text(language, 'subscription'),
             callback_data="my_subscription",
             style='success',
             icon_custom_emoji_id=get_icon("MONEY_SEND")
@@ -11238,32 +11536,32 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     )
     builder.row(
         InlineKeyboardButton(
-            text="Баланс",
+            text=ui_text(language, 'balance'),
             callback_data="wallet",
             style='default',
             icon_custom_emoji_id=get_icon("MONEY_SEND")
         ),
         InlineKeyboardButton(
-            text="Пополнить баланс",
+            text=ui_text(language, 'topup'),
             callback_data="wallet_topup",
             style='primary',
             icon_custom_emoji_id=get_icon("MONEY_SEND")
         )
     )
     builder.row(InlineKeyboardButton(
-        text="Центр уведомлений",
-        callback_data="notification_center",
+        text=ui_text(language, 'settings'),
+        callback_data="settings",
         style='default',
-        icon_custom_emoji_id=get_icon("BELL")
+        icon_custom_emoji_id=get_icon("KEY")
     ))
     builder.row(InlineKeyboardButton(
-        text="Помощь",
+        text=ui_text(language, 'help'),
         callback_data="help",
         style='default',
         icon_custom_emoji_id=get_icon("INFO")
     ))
     builder.row(InlineKeyboardButton(
-        text="Поддержка",
+        text=ui_text(language, 'support'),
         url=f"https://t.me/{SUPPORT_USERNAME.replace('@', '')}",
         style='default',
         icon_custom_emoji_id=get_icon("SUPPORT")
@@ -11271,11 +11569,52 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def get_settings_keyboard(language: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text=ui_text(language, 'notifications'),
+        callback_data='notification_center', style='primary',
+        icon_custom_emoji_id=get_icon('BELL'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text=ui_text(language, 'language'),
+        callback_data='language_menu', style='default',
+        icon_custom_emoji_id=get_icon('GLOBE'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text=ui_text(language, 'promo'),
+        callback_data='promo_redeem', style='success',
+        icon_custom_emoji_id=get_icon('STAR'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text=ui_text(language, 'back_main'), callback_data='main_menu',
+        style='default', icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    return builder.as_markup()
+
+
+def get_language_keyboard(current: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    flags = {'ru': '🇷🇺', 'en': '🇬🇧', 'zh': '🇨🇳'}
+    for code, label in SUPPORTED_LANGUAGES.items():
+        builder.row(InlineKeyboardButton(
+            text=f"{'✅ ' if code == current else ''}{flags[code]} {label}",
+            callback_data=f'language_set:{code}',
+            style='success' if code == current else 'default',
+        ))
+    builder.row(InlineKeyboardButton(
+        text=ui_text(current, 'settings'), callback_data='settings',
+        style='default', icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    return builder.as_markup()
+
+
 def get_notification_center_keyboard(
-    settings: Dict[str, Any],
+    settings: Dict[str, Any], language: str = 'ru',
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for category, label in NOTIFICATION_CATEGORIES.items():
+    labels = NOTIFICATION_CATEGORY_LABELS.get(language, NOTIFICATION_CATEGORIES)
+    for category, label in labels.items():
         enabled = bool(settings.get(f'{category}_enabled', True))
         builder.row(InlineKeyboardButton(
             text=f"{'✅' if enabled else '❌'} {label}",
@@ -11283,20 +11622,23 @@ def get_notification_center_keyboard(
             style='success' if enabled else 'default',
         ))
     builder.row(InlineKeyboardButton(
-        text='Отметить всё прочитанным',
+        text={
+            'ru': 'Отметить всё прочитанным',
+            'en': 'Mark all as read', 'zh': '全部标为已读',
+        }.get(language, 'Отметить всё прочитанным'),
         callback_data='notification_read_all',
         style='primary',
         icon_custom_emoji_id=get_icon('CHECK'),
     ))
     builder.row(InlineKeyboardButton(
-        text='Обновить',
+        text={'ru': 'Обновить', 'en': 'Refresh', 'zh': '刷新'}.get(language, 'Обновить'),
         callback_data='notification_center',
         style='default',
         icon_custom_emoji_id=get_icon('REFRESH'),
     ))
     builder.row(InlineKeyboardButton(
-        text='В главное меню',
-        callback_data='main_menu',
+        text=ui_text(language, 'settings'),
+        callback_data='settings',
         style='default',
         icon_custom_emoji_id=get_icon('BACK'),
     ))
@@ -11306,19 +11648,30 @@ def get_notification_center_keyboard(
 async def render_notification_center(
     user_id: int,
 ) -> Tuple[str, InlineKeyboardMarkup]:
+    language = await get_user_language(user_id)
     settings = await get_notification_settings(user_id)
     items = await get_recent_notifications(user_id, limit=8)
     unread = sum(1 for item in items if not item.get('is_read'))
-    lines = [
-        f"{emoji('BELL')} <b>Центр уведомлений</b>\n\n",
-        f"Непрочитанных среди последних: <b>{unread}</b>\n",
-        "Нажмите категорию ниже, чтобы включить или выключить "
-        "мгновенные сообщения. История событий сохраняется в любом случае.\n",
-    ]
+    headers = {
+        'ru': (f"{emoji('BELL')} <b>Центр уведомлений</b>\n\n",
+               f"Непрочитанных среди последних: <b>{unread}</b>\n",
+               "Нажмите категорию ниже, чтобы включить или выключить мгновенные сообщения. История сохраняется.\n"),
+        'en': (f"{emoji('BELL')} <b>Notification center</b>\n\n",
+               f"Unread among recent: <b>{unread}</b>\n",
+               "Tap a category to enable or disable instant messages. Event history is always saved.\n"),
+        'zh': (f"{emoji('BELL')} <b>通知中心</b>\n\n",
+               f"最近未读：<b>{unread}</b>\n",
+               "点击分类可开启或关闭即时通知。事件历史会始终保存。\n"),
+    }
+    lines = list(headers.get(language, headers['ru']))
     if not items:
-        lines.append("\n<i>Уведомлений пока нет.</i>")
+        lines.append({'ru': "\n<i>Уведомлений пока нет.</i>",
+                      'en': "\n<i>No notifications yet.</i>",
+                      'zh': "\n<i>暂无通知。</i>"}.get(language, "\n<i>Уведомлений пока нет.</i>"))
     else:
-        lines.append("\n<b>Последние события:</b>\n")
+        lines.append({'ru': "\n<b>Последние события:</b>\n",
+                      'en': "\n<b>Recent events:</b>\n",
+                      'zh': "\n<b>最近事件：</b>\n"}.get(language, "\n<b>Последние события:</b>\n"))
         severity_icons = {
             'critical': '🔴', 'warning': '🟠', 'info': '🔵',
         }
@@ -11330,10 +11683,10 @@ async def render_notification_center(
             lines.append(
                 f"\n{marker} {severity_icon} <b>{escape(str(item.get('title') or 'Событие')[:100])}</b>\n"
                 f"<code>{escape(created)}</code> · "
-                f"{escape(NOTIFICATION_CATEGORIES.get(item.get('category'), 'Событие'))}\n"
+                f"{escape(NOTIFICATION_CATEGORY_LABELS.get(language, NOTIFICATION_CATEGORIES).get(item.get('category'), 'Событие'))}\n"
                 f"<i>{escape(preview)}</i>\n"
             )
-    return ''.join(lines), get_notification_center_keyboard(settings)
+    return ''.join(lines), get_notification_center_keyboard(settings, language)
 
 def get_account_manager_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -12943,16 +13296,37 @@ async def cmd_start(message: Message):
     except Exception as ex:
         logger.error(f"format_limits_text failed for {user.id}: {ex}")
         limits = ""
+    language = await get_user_language(user.id)
+    welcome_by_language = {
+        'ru': (
+            f"{emoji('SMILE')} <b>Добро пожаловать в Vest Game Soft!</b>\n\n"
+            f"{emoji('BOT')} Я помогу вам управлять аккаунтами и делать рассылки.\n\n"
+            f"{emoji('PEOPLE')} <b>Менеджер аккаунтов</b> — добавление и управление\n"
+            f"{emoji('APPS')} <b>Функции</b> — рассылка, автоответчик, парсинг\n"
+            f"{emoji('SUPPORT')} <b>Поддержка:</b> {SUPPORT_USERNAME}"
+        ),
+        'en': (
+            f"{emoji('SMILE')} <b>Welcome to Vest Game Soft!</b>\n\n"
+            f"{emoji('BOT')} Manage Telegram accounts and automate messaging.\n\n"
+            f"{emoji('PEOPLE')} <b>Account manager</b> — add and manage accounts\n"
+            f"{emoji('APPS')} <b>Features</b> — broadcasts, auto-replies and parsing\n"
+            f"{emoji('SUPPORT')} <b>Support:</b> {SUPPORT_USERNAME}"
+        ),
+        'zh': (
+            f"{emoji('SMILE')} <b>欢迎使用 Vest Game Soft！</b>\n\n"
+            f"{emoji('BOT')} 管理 Telegram 账号并自动发送消息。\n\n"
+            f"{emoji('PEOPLE')} <b>账号管理</b> — 添加和管理账号\n"
+            f"{emoji('APPS')} <b>功能</b> — 群发、自动回复和解析\n"
+            f"{emoji('SUPPORT')} <b>支持：</b>{SUPPORT_USERNAME}"
+        ),
+    }
     welcome_text = (
-        f"{emoji('SMILE')} <b>Добро пожаловать в Vest Game Soft!</b>\n\n"
-        f"{emoji('BOT')} Я помогу вам управлять аккаунтами и делать рассылки.\n\n"
-        f"{emoji('PEOPLE')} <b>Менеджер аккаунтов</b> — добавление и управление\n"
-        f"{emoji('APPS')} <b>Функции</b> — рассылка, автоответчик, парсинг\n"
-        f"{emoji('SUPPORT')} <b>Поддержка:</b> {SUPPORT_USERNAME}\n\n"
-        f"{limits}\n\n"
-        f"Выберите действие:"
+        f"{welcome_by_language.get(language, welcome_by_language['ru'])}\n\n"
+        f"{limits}\n\n{ui_text(language, 'choose_action')}"
     )
-    await present_section(message, 'welcome', welcome_text, get_main_menu_keyboard())
+    await present_section(
+        message, 'welcome', welcome_text, get_main_menu_keyboard(language)
+    )
 
 async def get_section_media(section: str) -> Optional[Dict[str, Any]]:
     if section not in MEDIA_SECTIONS or db_pool is None:
@@ -13285,6 +13659,12 @@ async def build_admin_panel() -> tuple:
         icon_custom_emoji_id=get_icon("CHART")
     ))
     builder.row(InlineKeyboardButton(
+        text="Промокоды",
+        callback_data="admin_promos",
+        style='success',
+        icon_custom_emoji_id=get_icon("STAR")
+    ))
+    builder.row(InlineKeyboardButton(
         text="Базовый AI API",
         callback_data="admin_llm_menu",
         style='primary',
@@ -13330,6 +13710,362 @@ async def build_admin_panel() -> tuple:
     return admin_text, builder.as_markup()
 
 
+def _promo_reward_label(promo: Dict[str, Any]) -> str:
+    if promo.get('reward_type') == 'balance':
+        return f"{float(promo.get('balance_amount') or 0):.2f} ₽ на баланс"
+    return (
+        f"{subscription_tier_label(promo.get('subscription_tier'))} "
+        f"на {int(promo.get('subscription_days') or 0)} дн."
+    )
+
+
+async def render_admin_promos() -> Tuple[str, InlineKeyboardMarkup]:
+    promos = await get_promo_codes(20)
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text='Создать промокод', callback_data='admin_promo_create',
+        style='success', icon_custom_emoji_id=get_icon('ADD_TEXT'),
+    ))
+    for promo in promos:
+        active = bool(promo.get('is_active'))
+        max_uses = promo.get('max_uses')
+        usage = f"{promo.get('uses_count', 0)}/{max_uses}" if max_uses else f"{promo.get('uses_count', 0)}/∞"
+        builder.row(InlineKeyboardButton(
+            text=f"{'✅' if active else '❌'} {promo['code']} · {usage}",
+            callback_data=f"admin_promo_view:{promo['id']}",
+            style='success' if active else 'default',
+        ))
+    builder.row(InlineKeyboardButton(
+        text='В админ-панель', callback_data='admin_refresh_stats',
+        style='default', icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    text = (
+        f"{emoji('STAR')} <b>Промокоды</b>\n\n"
+        "Промокод может пополнять баланс либо выдавать/продлевать "
+        "подписку Pro или MAX. Один пользователь активирует каждый код один раз.\n\n"
+        f"Всего показано: <b>{len(promos)}</b>"
+    )
+    return text, builder.as_markup()
+
+
+def get_admin_promo_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text='Отмена', callback_data='admin_promos', style='default',
+            icon_custom_emoji_id=get_icon('BACK'),
+        )
+    ]])
+
+
+async def _admin_promo_ask_code(message: Message, state: FSMContext) -> None:
+    await state.set_state(AdminStates.waiting_for_promo_code)
+    await message.answer(
+        f"{emoji('KEY')} <b>Код промокода</b>\n\n"
+        "Введите 3–32 символа: буквы, цифры, <code>_</code> или "
+        "<code>-</code>. Отправьте <code>AUTO</code>, чтобы сгенерировать код.",
+        reply_markup=get_admin_promo_cancel_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == 'admin_promos')
+async def admin_promos_menu(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    await state.clear()
+    text, markup = await render_admin_promos()
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == 'admin_promo_create')
+async def admin_promo_create_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    await state.clear()
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text='На баланс', callback_data='admin_promo_type:balance',
+        style='success', icon_custom_emoji_id=get_icon('MONEY_SEND'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='На подписку', callback_data='admin_promo_type:subscription',
+        style='primary', icon_custom_emoji_id=get_icon('STAR'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Отмена', callback_data='admin_promos', style='default',
+        icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    await callback.message.edit_text(
+        f"{emoji('STAR')} <b>Новый промокод</b>\n\nВыберите тип награды:",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('admin_promo_type:'))
+async def admin_promo_type(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    reward_type = callback.data.split(':', 1)[1]
+    if reward_type == 'balance':
+        await state.update_data(promo_reward_type='balance')
+        await state.set_state(AdminStates.waiting_for_promo_balance)
+        await callback.message.edit_text(
+            f"{emoji('MONEY_SEND')} <b>Сумма награды</b>\n\n"
+            "Введите сумму в рублях от 1 до 1 000 000:",
+            reply_markup=get_admin_promo_cancel_keyboard(),
+        )
+    elif reward_type == 'subscription':
+        await state.update_data(promo_reward_type='subscription')
+        builder = InlineKeyboardBuilder()
+        for tier in ('pro', 'max'):
+            builder.row(InlineKeyboardButton(
+                text=subscription_tier_label(tier),
+                callback_data=f'admin_promo_tier:{tier}',
+                style='success' if tier == 'max' else 'primary',
+            ))
+        builder.row(InlineKeyboardButton(
+            text='Отмена', callback_data='admin_promos', style='default',
+            icon_custom_emoji_id=get_icon('BACK'),
+        ))
+        await callback.message.edit_text(
+            f"{emoji('STAR')} <b>Тариф промокода</b>\n\nВыберите тариф:",
+            reply_markup=builder.as_markup(),
+        )
+    else:
+        await callback.answer('Неизвестный тип', show_alert=True)
+        return
+    await callback.answer()
+
+
+@dp.message(AdminStates.waiting_for_promo_balance)
+async def admin_promo_balance(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        amount = round(float((message.text or '').replace(',', '.')), 2)
+        if amount < 1 or amount > 1_000_000:
+            raise ValueError
+    except ValueError:
+        await message.answer('Введите сумму от 1 до 1 000 000 ₽:')
+        return
+    await state.update_data(promo_balance_amount=amount)
+    await _admin_promo_ask_code(message, state)
+
+
+@dp.callback_query(F.data.startswith('admin_promo_tier:'))
+async def admin_promo_tier(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    tier = callback.data.split(':', 1)[1]
+    if tier not in {'pro', 'max'}:
+        await callback.answer('Неизвестный тариф', show_alert=True)
+        return
+    await state.update_data(promo_subscription_tier=tier)
+    await state.set_state(AdminStates.waiting_for_promo_days)
+    await callback.message.edit_text(
+        f"{emoji('CALENDAR')} <b>Срок подписки</b>\n\n"
+        "Введите количество дней от 1 до 3650:",
+        reply_markup=get_admin_promo_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.message(AdminStates.waiting_for_promo_days)
+async def admin_promo_days(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        days = int((message.text or '').strip())
+        if days < 1 or days > 3650:
+            raise ValueError
+    except ValueError:
+        await message.answer('Введите целое число от 1 до 3650:')
+        return
+    await state.update_data(promo_subscription_days=days)
+    await _admin_promo_ask_code(message, state)
+
+
+@dp.message(AdminStates.waiting_for_promo_code)
+async def admin_promo_code(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    raw = (message.text or '').strip()
+    if raw.upper() == 'AUTO':
+        raw = 'VEST-' + hashlib.sha256(
+            f'{message.from_user.id}:{time.time_ns()}'.encode()
+        ).hexdigest()[:10].upper()
+    code = normalize_promo_code(raw)
+    if not re.fullmatch(r'[A-ZА-ЯЁ0-9_-]{3,32}', code):
+        await message.answer('Код должен содержать 3–32 буквы, цифры, _ или -.')
+        return
+    async with db_pool.acquire() as conn:
+        exists = await conn.fetchval(
+            'SELECT 1 FROM promo_codes WHERE code = $1', code
+        )
+    if exists:
+        await message.answer('Такой промокод уже существует. Введите другой:')
+        return
+    await state.update_data(promo_code=code)
+    await state.set_state(AdminStates.waiting_for_promo_max_uses)
+    await message.answer(
+        f"{emoji('PEOPLE')} <b>Лимит активаций</b>\n\n"
+        "Введите число. <code>0</code> — без ограничения:",
+        reply_markup=get_admin_promo_cancel_keyboard(),
+    )
+
+
+@dp.message(AdminStates.waiting_for_promo_max_uses)
+async def admin_promo_max_uses(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        max_uses = int((message.text or '').strip())
+        if max_uses < 0 or max_uses > 10_000_000:
+            raise ValueError
+    except ValueError:
+        await message.answer('Введите целое число от 0 до 10 000 000:')
+        return
+    await state.update_data(promo_max_uses=max_uses or None)
+    await state.set_state(AdminStates.waiting_for_promo_expiry)
+    await message.answer(
+        f"{emoji('CLOCK')} <b>Срок действия кода</b>\n\n"
+        "Введите количество дней. <code>0</code> — бессрочно:",
+        reply_markup=get_admin_promo_cancel_keyboard(),
+    )
+
+
+@dp.message(AdminStates.waiting_for_promo_expiry)
+async def admin_promo_expiry(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        expiry_days = int((message.text or '').strip())
+        if expiry_days < 0 or expiry_days > 3650:
+            raise ValueError
+    except ValueError:
+        await message.answer('Введите целое число от 0 до 3650:')
+        return
+    data = await state.get_data()
+    expires_at = (
+        datetime.now(MSK_TZ).replace(tzinfo=None) + timedelta(days=expiry_days)
+        if expiry_days else None
+    )
+    try:
+        promo = await create_promo_code(
+            data.get('promo_code', ''), data.get('promo_reward_type', ''),
+            created_by=message.from_user.id,
+            balance_amount=data.get('promo_balance_amount'),
+            subscription_tier=data.get('promo_subscription_tier'),
+            subscription_days=data.get('promo_subscription_days'),
+            max_uses=data.get('promo_max_uses'), expires_at=expires_at,
+        )
+    except (ValueError, asyncpg.UniqueViolationError) as ex:
+        await message.answer(f"{emoji('CROSS')} Не удалось создать: {escape(str(ex))}")
+        return
+    await state.clear()
+    expiry_label = _format_msk_datetime(promo.get('expires_at'), 'бессрочно')
+    uses_label = promo.get('max_uses') or 'без ограничений'
+    await message.answer(
+        f"{emoji('CHECK')} <b>Промокод создан</b>\n\n"
+        f"Код: <code>{escape(promo['code'])}</code>\n"
+        f"Награда: <b>{escape(_promo_reward_label(promo))}</b>\n"
+        f"Активаций: <b>{uses_label}</b>\n"
+        f"Действует до: <b>{escape(str(expiry_label))}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text='К промокодам', callback_data='admin_promos',
+                style='primary', icon_custom_emoji_id=get_icon('BACK'),
+            )
+        ]]),
+    )
+
+
+@dp.callback_query(F.data.startswith('admin_promo_view:'))
+async def admin_promo_view(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    try:
+        promo_id = int(callback.data.split(':', 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer('Некорректный промокод', show_alert=True)
+        return
+    promo = await get_promo_code(promo_id)
+    if not promo:
+        await callback.answer('Промокод не найден', show_alert=True)
+        return
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text='Отключить' if promo.get('is_active') else 'Включить',
+        callback_data=f'admin_promo_toggle:{promo_id}',
+        style='danger' if promo.get('is_active') else 'success',
+    ))
+    builder.row(InlineKeyboardButton(
+        text='К списку', callback_data='admin_promos', style='default',
+        icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    expiry = _format_msk_datetime(promo.get('expires_at'), 'бессрочно')
+    limit = promo.get('max_uses') or '∞'
+    await callback.message.edit_text(
+        f"{emoji('STAR')} <b>{escape(promo['code'])}</b>\n\n"
+        f"Статус: <b>{'активен' if promo.get('is_active') else 'отключён'}</b>\n"
+        f"Награда: <b>{escape(_promo_reward_label(promo))}</b>\n"
+        f"Активации: <b>{promo.get('uses_count', 0)}/{limit}</b>\n"
+        f"Действует до: <b>{escape(str(expiry))}</b>",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('admin_promo_toggle:'))
+async def admin_promo_toggle(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer('Нет доступа', show_alert=True)
+        return
+    try:
+        promo_id = int(callback.data.split(':', 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer('Некорректный промокод', show_alert=True)
+        return
+    async with db_pool.acquire() as conn:
+        changed = await conn.fetchrow(
+            'UPDATE promo_codes SET is_active = NOT is_active, updated_at = NOW() '
+            'WHERE id = $1 RETURNING is_active', promo_id,
+        )
+    if not changed:
+        await callback.answer('Промокод не найден', show_alert=True)
+        return
+    promo = await get_promo_code(promo_id)
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text='Отключить' if promo.get('is_active') else 'Включить',
+        callback_data=f'admin_promo_toggle:{promo_id}',
+        style='danger' if promo.get('is_active') else 'success',
+    ))
+    builder.row(InlineKeyboardButton(
+        text='К списку', callback_data='admin_promos', style='default',
+        icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    expiry = _format_msk_datetime(promo.get('expires_at'), 'бессрочно')
+    limit = promo.get('max_uses') or '∞'
+    await callback.message.edit_text(
+        f"{emoji('STAR')} <b>{escape(promo['code'])}</b>\n\n"
+        f"Статус: <b>{'активен' if promo.get('is_active') else 'отключён'}</b>\n"
+        f"Награда: <b>{escape(_promo_reward_label(promo))}</b>\n"
+        f"Активации: <b>{promo.get('uses_count', 0)}/{limit}</b>\n"
+        f"Действует до: <b>{escape(str(expiry))}</b>",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer(
+        'Промокод включён' if changed['is_active'] else 'Промокод отключён'
+    )
+
+
 @dp.message(Command("admin"), StateFilter("*"))
 async def cmd_admin(message: Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
@@ -13354,14 +14090,59 @@ async def cmd_admin(message: Message, state: FSMContext):
 # --- Главное меню ---
 @dp.callback_query(F.data == "main_menu")
 async def back_to_main(callback: CallbackQuery):
+    language = await get_user_language(callback.from_user.id)
     limits = await format_limits_text(callback.from_user.id)
     text = (
-        f"{emoji('SMILE')} <b>Главное меню</b>\n\n"
+        f"{emoji('SMILE')} <b>{ui_text(language, 'main_title')}</b>\n\n"
         f"{limits}\n\n"
-        f"Выберите действие:"
+        f"{ui_text(language, 'choose_action')}"
     )
-    await present_section(callback.message, 'welcome', text, get_main_menu_keyboard(), replace=True)
+    await present_section(
+        callback.message, 'welcome', text,
+        get_main_menu_keyboard(language), replace=True,
+    )
     await callback.answer()
+
+
+@dp.callback_query(F.data == 'settings')
+async def settings_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    language = await get_user_language(callback.from_user.id)
+    await callback.message.edit_text(
+        f"{emoji('KEY')} <b>{ui_text(language, 'settings')}</b>\n\n"
+        f"{ui_text(language, 'settings_text')}\n\n"
+        f"{ui_text(language, 'current_language')}: "
+        f"<b>{SUPPORTED_LANGUAGES[language]}</b>",
+        reply_markup=get_settings_keyboard(language),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == 'language_menu')
+async def language_menu(callback: CallbackQuery):
+    language = await get_user_language(callback.from_user.id)
+    await callback.message.edit_text(
+        f"{emoji('GLOBE')} <b>{ui_text(language, 'language')}</b>\n\n"
+        f"{ui_text(language, 'choose_language')}",
+        reply_markup=get_language_keyboard(language),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('language_set:'))
+async def language_set(callback: CallbackQuery):
+    requested = callback.data.split(':', 1)[1]
+    if requested not in SUPPORTED_LANGUAGES:
+        await callback.answer('Unknown language', show_alert=True)
+        return
+    language = await set_user_language(callback.from_user.id, requested)
+    await callback.message.edit_text(
+        f"{emoji('CHECK')} <b>{ui_text(language, 'language_saved')}</b>\n\n"
+        f"{ui_text(language, 'current_language')}: "
+        f"<b>{SUPPORTED_LANGUAGES[language]}</b>",
+        reply_markup=get_settings_keyboard(language),
+    )
+    await callback.answer(ui_text(language, 'language_saved'))
 
 
 @dp.callback_query(F.data == 'notification_center')
@@ -13391,6 +14172,91 @@ async def notification_read_all(callback: CallbackQuery):
     text, markup = await render_notification_center(callback.from_user.id)
     await callback.message.edit_text(text, reply_markup=markup)
     await callback.answer('Все уведомления отмечены прочитанными')
+
+
+@dp.callback_query(F.data == 'promo_redeem')
+async def promo_redeem_start(callback: CallbackQuery, state: FSMContext):
+    language = await get_user_language(callback.from_user.id)
+    prompts = {
+        'ru': 'Отправьте промокод одним сообщением.',
+        'en': 'Send the promo code in one message.',
+        'zh': '请在一条消息中发送优惠码。',
+    }
+    await state.set_state(PromoStates.waiting_for_code)
+    await callback.message.edit_text(
+        f"{emoji('STAR')} <b>{ui_text(language, 'promo')}</b>\n\n"
+        f"{prompts.get(language, prompts['ru'])}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=ui_text(language, 'settings'), callback_data='settings',
+                style='default', icon_custom_emoji_id=get_icon('BACK'),
+            )
+        ]]),
+    )
+    await callback.answer()
+
+
+@dp.message(PromoStates.waiting_for_code)
+async def promo_redeem_process(message: Message, state: FSMContext):
+    language = await get_user_language(message.from_user.id)
+    result = await redeem_promo_code(message.from_user.id, message.text or '')
+    if not result.get('ok'):
+        reason = result.get('reason')
+        errors = {
+            'ru': {
+                'not_found': 'Промокод не найден.', 'inactive': 'Промокод отключён.',
+                'expired': 'Срок действия промокода истёк.',
+                'limit': 'Лимит активаций промокода исчерпан.',
+                'already_used': 'Вы уже активировали этот промокод.',
+                'invalid_reward': 'Награда промокода настроена неверно.',
+                'invalid': 'Введите корректный промокод.',
+            },
+            'en': {
+                'not_found': 'Promo code not found.', 'inactive': 'This promo code is disabled.',
+                'expired': 'This promo code has expired.',
+                'limit': 'This promo code has reached its activation limit.',
+                'already_used': 'You have already redeemed this promo code.',
+                'invalid_reward': 'The promo reward is configured incorrectly.',
+                'invalid': 'Enter a valid promo code.',
+            },
+            'zh': {
+                'not_found': '未找到优惠码。', 'inactive': '该优惠码已停用。',
+                'expired': '该优惠码已过期。', 'limit': '该优惠码的兑换次数已用完。',
+                'already_used': '您已经兑换过该优惠码。',
+                'invalid_reward': '优惠码奖励配置错误。', 'invalid': '请输入有效的优惠码。',
+            },
+        }
+        await message.answer(
+            f"{emoji('CROSS')} {errors.get(language, errors['ru']).get(reason, errors['ru']['invalid'])}"
+        )
+        return
+    await state.clear()
+    if result['type'] == 'balance':
+        descriptions = {
+            'ru': f"На баланс начислено <b>{result['amount']:.2f} ₽</b>.\nБаланс: <b>{result['balance']:.2f} ₽</b>",
+            'en': f"<b>{result['amount']:.2f} RUB</b> was added.\nBalance: <b>{result['balance']:.2f} RUB</b>",
+            'zh': f"已增加 <b>{result['amount']:.2f} 卢布</b>。\n余额：<b>{result['balance']:.2f} 卢布</b>",
+        }
+    else:
+        expiry = result['expires_at'].strftime('%d.%m.%Y %H:%M')
+        descriptions = {
+            'ru': f"Подписка <b>{subscription_tier_label(result['tier'])}</b> продлена на <b>{result['days']} дн.</b>\nАктивна до: <b>{expiry}</b>",
+            'en': f"<b>{subscription_tier_label(result['tier'])}</b> extended by <b>{result['days']} days</b>.\nActive until: <b>{expiry}</b>",
+            'zh': f"<b>{subscription_tier_label(result['tier'])}</b> 已延长 <b>{result['days']} 天</b>。\n有效期至：<b>{expiry}</b>",
+        }
+    titles = {'ru': 'Промокод активирован!', 'en': 'Promo code redeemed!', 'zh': '优惠码兑换成功！'}
+    notification_message = re.sub(
+        r'<[^>]+>', '', descriptions.get(language, descriptions['ru'])
+    )
+    await create_user_notification(
+        message.from_user.id, 'payments', titles.get(language, titles['ru']),
+        notification_message, send_now=False,
+    )
+    await message.answer(
+        f"{emoji('CHECK')} <b>{titles.get(language, titles['ru'])}</b>\n\n"
+        f"{descriptions.get(language, descriptions['ru'])}",
+        reply_markup=get_settings_keyboard(language),
+    )
 
 @dp.callback_query(F.data == "account_manager")
 async def account_manager(callback: CallbackQuery):
@@ -14607,9 +15473,14 @@ def get_subscription_keyboard(tier: str) -> InlineKeyboardMarkup:
 
 async def format_limits_text(user_id: int) -> str:
     """Returns a short usage-counter block to embed in subscription/menu messages."""
+    language = await get_user_language(user_id)
     sub = await get_subscription(user_id)
     tier = sub.get('tier', 'free')
     if tier == 'max':
+        if language == 'en':
+            return f"{emoji('STAR')} <b>MAX — unlimited</b>\n  No daily or weekly plan limits"
+        if language == 'zh':
+            return f"{emoji('STAR')} <b>MAX — 无限制</b>\n  无每日或每周套餐限制"
         return (
             f"{emoji('STAR')} <b>MAX — без лимитов</b>\n"
             "  Никаких дневных или недельных тарифных ограничений"
@@ -14619,6 +15490,18 @@ async def format_limits_text(user_id: int) -> str:
             chat_used = await get_ai_chat_usage(user_id)
         except Exception:
             chat_used = 0
+        if language == 'en':
+            return (
+                f"{emoji('STAR')} <b>Limits:</b> {subscription_tier_label(tier)}\n"
+                "  AI generator: unlimited\n"
+                f"  AI chat: {chat_used}/{AI_CHAT_PRO_DAILY_LIMIT} today"
+            )
+        if language == 'zh':
+            return (
+                f"{emoji('STAR')} <b>限制：</b>{subscription_tier_label(tier)}\n"
+                "  AI 生成器：无限制\n"
+                f"  AI 聊天：今日 {chat_used}/{AI_CHAT_PRO_DAILY_LIMIT}"
+            )
         return (
             f"{emoji('STAR')} <b>Лимиты:</b> {subscription_tier_label(tier)}\n"
             f"  AI-генератор: без ограничений\n"
@@ -14654,6 +15537,20 @@ async def format_limits_text(user_id: int) -> str:
         logger.error(f"get_ai_chat_usage failed for {user_id}: {ex}")
         chat_used = 0
 
+    if language == 'en':
+        return (
+            f"📊 <b>Usage (Free):</b>\n"
+            f"  AI requests today: <code>{ai_bar}</code> {ai_used}/{ai_limit}\n"
+            f"  AI chat: {chat_used}/{AI_CHAT_FREE_DAILY_LIMIT}\n"
+            f"  Broadcasts this week: {broadcast_used_h:.1f}/{broadcast_limit_h} h"
+        )
+    if language == 'zh':
+        return (
+            f"📊 <b>使用情况（Free）：</b>\n"
+            f"  今日 AI 请求：<code>{ai_bar}</code> {ai_used}/{ai_limit}\n"
+            f"  AI 聊天：{chat_used}/{AI_CHAT_FREE_DAILY_LIMIT}\n"
+            f"  本周群发：{broadcast_used_h:.1f}/{broadcast_limit_h} 小时"
+        )
     return (
         f"📊 <b>Использование (Free):</b>\n"
         f"  AI-запросы сегодня: <code>{ai_bar}</code> {ai_used}/{ai_limit}\n"
@@ -15604,10 +16501,12 @@ async def ai_chat_clear(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == 'ai_chat_exit')
 async def ai_chat_exit(callback: CallbackQuery, state: FSMContext):
     await state.clear()
+    language = await get_user_language(callback.from_user.id)
     limits = await format_limits_text(callback.from_user.id)
     await callback.message.edit_text(
-        f"{emoji('SMILE')} <b>Главное меню</b>\n\n{limits}\n\nВыберите действие:",
-        reply_markup=get_main_menu_keyboard(),
+        f"{emoji('SMILE')} <b>{ui_text(language, 'main_title')}</b>\n\n"
+        f"{limits}\n\n{ui_text(language, 'choose_action')}",
+        reply_markup=get_main_menu_keyboard(language),
     )
     await callback.answer()
 
