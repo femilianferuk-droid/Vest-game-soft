@@ -283,9 +283,9 @@ UI_TEXT = {
         'choose_action': 'Выберите действие:', 'open_app': 'Открыть мини-апп',
         'accounts': 'Менеджер аккаунтов', 'functions': 'Функции',
         'ai_chat': 'Чат с нейросетями', 'subscription': 'Моя подписка',
-        'balance': 'Баланс', 'topup': 'Пополнить баланс',
+        'balance': 'Профиль', 'topup': 'Пополнить баланс',
         'help': 'Помощь', 'support': 'Поддержка',
-        'settings_text': 'Управляйте уведомлениями, языком интерфейса и промокодами.',
+        'settings_text': 'Управляйте уведомлениями и языком интерфейса.',
         'current_language': 'Текущий язык', 'choose_language': 'Выберите язык интерфейса:',
         'language_saved': 'Язык сохранён',
     },
@@ -296,9 +296,9 @@ UI_TEXT = {
         'choose_action': 'Choose an action:', 'open_app': 'Open mini app',
         'accounts': 'Account manager', 'functions': 'Features',
         'ai_chat': 'AI chat', 'subscription': 'My subscription',
-        'balance': 'Balance', 'topup': 'Top up balance',
+        'balance': 'Profile', 'topup': 'Top up balance',
         'help': 'Help', 'support': 'Support',
-        'settings_text': 'Manage notifications, interface language and promo codes.',
+        'settings_text': 'Manage notifications and interface language.',
         'current_language': 'Current language', 'choose_language': 'Choose the interface language:',
         'language_saved': 'Language saved',
     },
@@ -309,9 +309,9 @@ UI_TEXT = {
         'choose_action': '请选择操作：', 'open_app': '打开小程序',
         'accounts': '账号管理', 'functions': '功能',
         'ai_chat': 'AI 聊天', 'subscription': '我的订阅',
-        'balance': '余额', 'topup': '充值余额',
+        'balance': '个人资料', 'topup': '充值余额',
         'help': '帮助', 'support': '支持',
-        'settings_text': '管理通知、界面语言和优惠码。',
+        'settings_text': '管理通知和界面语言。',
         'current_language': '当前语言', 'choose_language': '请选择界面语言：',
         'language_saved': '语言已保存',
     },
@@ -10638,14 +10638,23 @@ async def get_promo_code(promo_id: int) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
-def get_balance_keyboard() -> InlineKeyboardMarkup:
+def get_balance_keyboard(language: str = 'ru') -> InlineKeyboardMarkup:
+    language = normalize_language(language)
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(
-        text='Пополнить баланс', callback_data='wallet_topup', style='primary',
+        text=ui_text(language, 'topup'), callback_data='wallet_topup', style='primary',
         icon_custom_emoji_id=get_icon('MONEY_SEND')
     ))
     builder.row(InlineKeyboardButton(
-        text='Назад', callback_data='main_menu', style='default',
+        text=ui_text(language, 'promo'), callback_data='promo_redeem',
+        style='success', icon_custom_emoji_id=get_icon('STAR')
+    ))
+    builder.row(InlineKeyboardButton(
+        text=ui_text(language, 'subscription'), callback_data='my_subscription',
+        style='default', icon_custom_emoji_id=get_icon('MONEY_SEND')
+    ))
+    builder.row(InlineKeyboardButton(
+        text=ui_text(language, 'back_main'), callback_data='main_menu', style='default',
         icon_custom_emoji_id=get_icon('BACK')
     ))
     return builder.as_markup()
@@ -10653,11 +10662,41 @@ def get_balance_keyboard() -> InlineKeyboardMarkup:
 
 @dp.callback_query(F.data == 'wallet')
 async def wallet_screen(callback: CallbackQuery):
+    language = await get_user_language(callback.from_user.id)
     balance = await get_wallet_balance(callback.from_user.id)
+    subscription = await get_subscription(callback.from_user.id)
+    tier = subscription_tier_label(subscription.get('tier'))
+    expires_at = subscription.get('expires_at')
+    expires_label = _format_msk_datetime(expires_at, '—')
+    profile_texts = {
+        'ru': (
+            f"{emoji('PROFILE')} <b>Профиль</b>\n\n"
+            f"ID: <code>{callback.from_user.id}</code>\n"
+            f"Баланс: <b>{balance:.2f} ₽</b>\n"
+            f"Подписка: <b>{tier}</b>\n"
+            f"Активна до: <b>{escape(str(expires_label))}</b>\n\n"
+            "Здесь можно пополнить баланс или активировать промокод."
+        ),
+        'en': (
+            f"{emoji('PROFILE')} <b>Profile</b>\n\n"
+            f"ID: <code>{callback.from_user.id}</code>\n"
+            f"Balance: <b>{balance:.2f} RUB</b>\n"
+            f"Subscription: <b>{tier}</b>\n"
+            f"Active until: <b>{escape(str(expires_label))}</b>\n\n"
+            "Top up your balance or redeem a promo code here."
+        ),
+        'zh': (
+            f"{emoji('PROFILE')} <b>个人资料</b>\n\n"
+            f"ID：<code>{callback.from_user.id}</code>\n"
+            f"余额：<b>{balance:.2f} 卢布</b>\n"
+            f"订阅：<b>{tier}</b>\n"
+            f"有效期至：<b>{escape(str(expires_label))}</b>\n\n"
+            "您可以在此充值余额或兑换优惠码。"
+        ),
+    }
     await callback.message.edit_text(
-        f"{emoji('MONEY_SEND')} <b>Баланс</b>\n\n"
-        f"Доступно: <b>{balance:.2f} ₽</b>",
-        reply_markup=get_balance_keyboard()
+        profile_texts.get(language, profile_texts['ru']),
+        reply_markup=get_balance_keyboard(language)
     )
     await callback.answer()
 
@@ -11552,7 +11591,7 @@ def get_main_menu_keyboard(language: str = 'ru') -> InlineKeyboardMarkup:
             text=ui_text(language, 'balance'),
             callback_data="wallet",
             style='default',
-            icon_custom_emoji_id=get_icon("MONEY_SEND")
+            icon_custom_emoji_id=get_icon("PROFILE")
         ),
         InlineKeyboardButton(
             text=ui_text(language, 'topup'),
@@ -11593,11 +11632,6 @@ def get_settings_keyboard(language: str) -> InlineKeyboardMarkup:
         text=ui_text(language, 'language'),
         callback_data='language_menu', style='default',
         icon_custom_emoji_id=get_icon('GLOBE'),
-    ))
-    builder.row(InlineKeyboardButton(
-        text=ui_text(language, 'promo'),
-        callback_data='promo_redeem', style='success',
-        icon_custom_emoji_id=get_icon('STAR'),
     ))
     builder.row(InlineKeyboardButton(
         text=ui_text(language, 'back_main'), callback_data='main_menu',
@@ -14201,7 +14235,7 @@ async def promo_redeem_start(callback: CallbackQuery, state: FSMContext):
         f"{prompts.get(language, prompts['ru'])}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
-                text=ui_text(language, 'settings'), callback_data='settings',
+                text=ui_text(language, 'balance'), callback_data='wallet',
                 style='default', icon_custom_emoji_id=get_icon('BACK'),
             )
         ]]),
@@ -14268,7 +14302,7 @@ async def promo_redeem_process(message: Message, state: FSMContext):
     await message.answer(
         f"{emoji('CHECK')} <b>{titles.get(language, titles['ru'])}</b>\n\n"
         f"{descriptions.get(language, descriptions['ru'])}",
-        reply_markup=get_settings_keyboard(language),
+        reply_markup=get_balance_keyboard(language),
     )
 
 @dp.callback_query(F.data == "account_manager")
