@@ -10579,6 +10579,60 @@ async def _auto_check_sbp_topup(
 # СБП (Platega) — альтернативный способ оплаты Pro-подписки
 # Конфигурация (merchant id / api key) вынесена в начало файла.
 # ------------------------------------------------------------
+def _clean_environment_secret(value: Any) -> str:
+    """Убирает пробелы и случайные внешние кавычки из секрета хостинга."""
+    cleaned = str(value or '').strip()
+    if (
+        len(cleaned) >= 2
+        and cleaned[0] == cleaned[-1]
+        and cleaned[0] in {'"', "'"}
+    ):
+        cleaned = cleaned[1:-1].strip()
+    if cleaned.lower() in {'none', 'null'}:
+        return ''
+    return cleaned
+
+
+def _read_platega_secret_runtime() -> Tuple[str, str, str]:
+    """Читает секрет в момент запроса, не раскрывая его в диагностике.
+
+    Это помогает на хостингах с hot-reload окружения и терпимо относится
+    к случайному регистру или пробелу в имени переменной.
+    """
+    supported = ('PLATEGA_SECRET', 'PLATEGA_API_KEY')
+    exact_states = []
+    for name in supported:
+        raw = os.environ.get(name)
+        cleaned = _clean_environment_secret(raw)
+        exact_states.append(
+            f"{name}: "
+            f"{'непустая' if cleaned else ('пустая' if raw is not None else 'не видна')}"
+        )
+        if cleaned:
+            return cleaned, name, '; '.join(exact_states)
+
+    # Fallback на значение, прочитанное при импорте модуля.
+    imported = _clean_environment_secret(PLATEGA_SECRET)
+    if imported:
+        return imported, 'import-time', '; '.join(exact_states)
+
+    # Исправляет PLATEGA_SECRET<пробел> и отличающийся регистр имени.
+    for raw_name, raw_value in os.environ.items():
+        normalized_name = str(raw_name).strip().upper()
+        if normalized_name not in supported:
+            continue
+        cleaned = _clean_environment_secret(raw_value)
+        if cleaned:
+            return (
+                cleaned,
+                f'normalized:{normalized_name}',
+                '; '.join(exact_states)
+                + '; найдено имя с другим регистром/пробелом',
+            )
+
+    return '', 'missing', '; '.join(exact_states)
+
+
 def _platega_headers() -> Dict[str, str]:
     """Возвращает только строковые заголовки или понятную ошибку настройки.
 
@@ -10586,17 +10640,25 @@ def _platega_headers() -> Dict[str, str]:
     выдаёт неочевидное ``Cannot serialize non-str key None``. Поэтому
     конфигурация проверяется до создания запроса.
     """
-    merchant_id = str(PLATEGA_MERCHANT_ID or '').strip()
-    secret = str(PLATEGA_SECRET or '').strip()
+    merchant_id = str(
+        os.environ.get('PLATEGA_MERCHANT_ID')
+        or PLATEGA_MERCHANT_ID
+        or ''
+    ).strip()
+    secret, secret_source, secret_diagnostic = _read_platega_secret_runtime()
     if not merchant_id:
         raise RuntimeError(
             'СБП временно недоступно: не задан PLATEGA_MERCHANT_ID'
         )
     if not secret:
         raise RuntimeError(
-            'СБП временно недоступно: не задан PLATEGA_SECRET '
-            '(также поддерживается PLATEGA_API_KEY)'
+            'СБП временно недоступно: запущенный процесс не получил '
+            f'секрет Platega. {secret_diagnostic}'
         )
+    logger.debug(
+        'Platega credentials loaded: merchant=yes, secret=yes, source=%s',
+        secret_source,
+    )
     return {
         "X-MerchantId": merchant_id,
         "X-Secret": secret,
