@@ -10510,16 +10510,16 @@ async def redeem_promo_code(user_id: int, raw_code: str) -> Dict[str, Any]:
             expires_at = promo.get('expires_at')
             if expires_at is not None and expires_at <= now:
                 return {'ok': False, 'reason': 'expired'}
-            max_uses = promo.get('max_uses')
-            if max_uses is not None and int(max_uses) > 0:
-                if int(promo.get('uses_count') or 0) >= int(max_uses):
-                    return {'ok': False, 'reason': 'limit'}
             already_used = await conn.fetchval(
                 'SELECT 1 FROM promo_redemptions WHERE promo_id = $1 AND user_id = $2',
                 promo['id'], user_id,
             )
             if already_used:
                 return {'ok': False, 'reason': 'already_used'}
+            max_uses = promo.get('max_uses')
+            if max_uses is not None and int(max_uses) > 0:
+                if int(promo.get('uses_count') or 0) >= int(max_uses):
+                    return {'ok': False, 'reason': 'limit'}
 
             reward: Dict[str, Any] = {'type': promo['reward_type'], 'code': code}
             if promo['reward_type'] == 'balance':
@@ -10550,7 +10550,11 @@ async def redeem_promo_code(user_id: int, raw_code: str) -> Dict[str, Any]:
                 )
                 current_tier = str(current['tier'] or 'free')
                 current_expiry = current['expires_at']
-                active = bool(current_expiry is not None and current_expiry > now)
+                active = bool(
+                    current_tier in {'pro', 'max'}
+                    and current_expiry is not None
+                    and current_expiry > now
+                )
                 base = current_expiry if active else now
                 target_tier = tier
                 if active and current_tier == 'max' and tier == 'pro':
@@ -10593,6 +10597,15 @@ async def create_promo_code(
         raise ValueError('Код: 3–32 символа, буквы, цифры, _ или -')
     if reward_type not in {'balance', 'subscription'}:
         raise ValueError('Неизвестный тип награды')
+    if reward_type == 'balance':
+        amount = Decimal(str(balance_amount or 0))
+        if not amount.is_finite() or amount <= 0:
+            raise ValueError('Сумма промокода должна быть положительной')
+    else:
+        if subscription_tier not in {'pro', 'max'}:
+            raise ValueError('Для подписки нужен тариф Pro или MAX')
+        if not subscription_days or not 1 <= int(subscription_days) <= 3650:
+            raise ValueError('Срок подписки должен быть от 1 до 3650 дней')
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             '''INSERT INTO promo_codes
@@ -13847,7 +13860,7 @@ async def admin_promo_balance(message: Message, state: FSMContext):
         return
     try:
         amount = round(float((message.text or '').replace(',', '.')), 2)
-        if amount < 1 or amount > 1_000_000:
+        if not (1 <= amount <= 1_000_000):
             raise ValueError
     except ValueError:
         await message.answer('Введите сумму от 1 до 1 000 000 ₽:')
