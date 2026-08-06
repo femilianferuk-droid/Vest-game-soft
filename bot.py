@@ -54,6 +54,7 @@ from telethon.tl.functions.photos import (
     DeletePhotosRequest, GetUserPhotosRequest, UploadProfilePhotoRequest
 )
 from telethon.tl.functions.users import GetFullUserRequest
+from telethon.tl.functions.contacts import SearchRequest as SearchContactsRequest
 from telethon.tl.functions.messages import (
     ReadHistoryRequest, ReadReactionsRequest, GetDialogsRequest,
     GetHistoryRequest, GetMessagesViewsRequest,
@@ -215,6 +216,8 @@ dm_broadcast_stop_flags: Dict[int, bool] = {}
 dm_broadcast_tasks: Dict[int, asyncio.Task] = {}
 join_stop_flags: Dict[int, bool] = {}
 join_tasks: Dict[int, asyncio.Task] = {}
+# Короткоживущий кэш просмотра диалогов в карточке аккаунта.
+account_chats_view_cache: Dict[int, Dict[str, Any]] = {}
 chat_creation_stop_flags: Dict[int, bool] = {}
 chat_creation_tasks: Dict[int, asyncio.Task] = {}
 autosub_tasks: Dict[int, asyncio.Task] = {}
@@ -675,7 +678,11 @@ class ParsingStates(StatesGroup):
 
 class JoinStates(StatesGroup):
     waiting_for_account = State()
+    waiting_for_source = State()
     waiting_for_file = State()
+    waiting_for_links = State()
+    waiting_for_keywords = State()
+    selecting_search_results = State()
     waiting_for_delay = State()
     preview = State()
 
@@ -5390,6 +5397,11 @@ async def get_chats_from_client(
             chat_info = {
                 'id': str(dialog.id),
                 'name': dialog.name if dialog.name else "Без названия",
+                'username': (
+                    getattr(getattr(dialog, 'entity', None), 'username', None)
+                    or ''
+                ),
+                'unread_count': int(getattr(dialog, 'unread_count', 0) or 0),
                 'type': (
                     'user' if dialog.is_user else 
                     'group' if dialog.is_group else 'channel'
@@ -5397,6 +5409,116 @@ async def get_chats_from_client(
             }
             chats.append(chat_info)
     return chats
+
+
+def parse_join_links(text: str, limit: int = 200) -> List[str]:
+    """Извлекает поддерживаемые публичные и приватные Telegram-ссылки."""
+    result: List[str] = []
+    seen = set()
+    for raw in re.split(r'[\s,;]+', text or ''):
+        value = raw.strip().strip('()[]{}<>"\'.,')
+        if not value:
+            continue
+        if value.startswith('@'):
+            username = value[1:]
+            if not re.fullmatch(r'[A-Za-z0-9_]{5,32}', username):
+                continue
+            normalized = '@' + username
+            dedupe_key = 'public:' + username.casefold()
+        else:
+            candidate = value if '://' in value else 'https://' + value
+            try:
+                parsed = urlparse(candidate)
+            except Exception:
+                continue
+            host = (parsed.hostname or '').lower().removeprefix('www.')
+            if host not in {'t.me', 'telegram.me'}:
+                continue
+            path = parsed.path.strip('/')
+            if not path:
+                continue
+            if path.startswith('+'):
+                if not re.fullmatch(r'\+[A-Za-z0-9_-]+', path):
+                    continue
+                dedupe_key = 'invite:' + path.casefold()
+            elif path.startswith('joinchat/'):
+                invite = path.split('/', 1)[1]
+                if not re.fullmatch(r'[A-Za-z0-9_-]+', invite):
+                    continue
+                dedupe_key = 'invite:+' + invite.casefold()
+            else:
+                username = path.split('/', 1)[0].lstrip('@')
+                if not re.fullmatch(r'[A-Za-z0-9_]{5,32}', username):
+                    continue
+                path = username
+                dedupe_key = 'public:' + username.casefold()
+            normalized = 'https://t.me/' + path
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        result.append(normalized)
+        if len(result) >= max(1, min(int(limit), 500)):
+            break
+    return result
+
+
+def parse_join_keywords(text: str, limit: int = 5) -> List[str]:
+    keywords = []
+    seen = set()
+    for raw in re.split(r'[,;\n]+', text or ''):
+        value = re.sub(r'\s+', ' ', raw).strip()
+        if len(value) < 2:
+            continue
+        key = value.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        keywords.append(value[:64])
+        if len(keywords) >= limit:
+            break
+    return keywords
+
+
+async def search_public_telegram_chats(
+    client: TelegramClient, account_id: int, keywords: List[str],
+) -> List[Dict[str, Any]]:
+    """Глобальный Telegram-поиск публичных каналов и групп."""
+    found: List[Dict[str, Any]] = []
+    seen = set()
+    await wait_for_flood_protection(account_id, 'global_search')
+    for keyword in keywords[:5]:
+        try:
+            response = await client(SearchContactsRequest(
+                q=keyword, limit=30,
+            ))
+        except FloodWaitError as ex:
+            await record_flood_wait(
+                account_id, 0, ex.seconds, source='global_search'
+            )
+            raise RuntimeError(
+                f'Telegram ограничил поиск на {int(ex.seconds)} сек.'
+            ) from ex
+        for chat in getattr(response, 'chats', None) or []:
+            username = str(getattr(chat, 'username', None) or '').strip()
+            if not username or username.casefold() in seen:
+                continue
+            seen.add(username.casefold())
+            is_group = bool(
+                getattr(chat, 'megagroup', False)
+                or type(chat).__name__.lower().startswith('chat')
+            )
+            found.append({
+                'username': username,
+                'title': str(getattr(chat, 'title', None) or '@' + username),
+                'type': 'group' if is_group else 'channel',
+                'participants_count': int(
+                    getattr(chat, 'participants_count', 0) or 0
+                ),
+                'keyword': keyword,
+            })
+            if len(found) >= 60:
+                return found
+    return found
 
 async def send_message_to_chat(
     client: TelegramClient, account_id: int, chat_id: str,
@@ -12198,6 +12320,12 @@ def get_account_actions_keyboard(
         icon_custom_emoji_id=get_icon("EYE")
     ))
     builder.row(InlineKeyboardButton(
+        text="Чаты аккаунта",
+        callback_data=f"account_chats_refresh:{account_id}",
+        style='primary',
+        icon_custom_emoji_id=get_icon("CHAT")
+    ))
+    builder.row(InlineKeyboardButton(
         text="📊 Дашборд здоровья",
         callback_data=f"account_dashboard_{account_id}",
         style='primary',
@@ -12301,6 +12429,114 @@ def get_join_preview_keyboard() -> InlineKeyboardMarkup:
         callback_data="functions",
         style='danger',
         icon_custom_emoji_id=get_icon("CROSS")
+    ))
+    return builder.as_markup()
+
+
+def get_join_source_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text='Ввести ссылки сообщением',
+        callback_data='join_source:links',
+        style='primary',
+        icon_custom_emoji_id=get_icon('LINK'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Загрузить TXT-файл',
+        callback_data='join_source:file',
+        style='default',
+        icon_custom_emoji_id=get_icon('FILE'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Глобальный поиск Telegram',
+        callback_data='join_source:search',
+        style='primary',
+        icon_custom_emoji_id=get_icon('GLOBE'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Отмена', callback_data='functions', style='danger',
+        icon_custom_emoji_id=get_icon('CROSS'),
+    ))
+    return builder.as_markup()
+
+
+def get_join_search_results_keyboard(
+    results: List[Dict[str, Any]], selected: List[int], page: int = 0,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    page_size = 8
+    pages = max(1, (len(results) + page_size - 1) // page_size)
+    page = max(0, min(int(page), pages - 1))
+    start = page * page_size
+    for index, item in enumerate(results[start:start + page_size], start=start):
+        checked = '✅' if index in selected else '▫️'
+        kind = 'Группа' if item.get('type') == 'group' else 'Канал'
+        title = str(item.get('title') or item.get('username') or 'Без названия')
+        if len(title) > 32:
+            title = title[:31] + '…'
+        builder.row(InlineKeyboardButton(
+            text=f"{checked} {title} · {kind}",
+            callback_data=f'join_search_toggle:{index}',
+            style='success' if index in selected else 'default',
+        ))
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            text='←', callback_data=f'join_search_page:{page - 1}',
+            style='default',
+        ))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(
+            text='→', callback_data=f'join_search_page:{page + 1}',
+            style='default',
+        ))
+    if nav:
+        builder.row(*nav)
+    builder.row(InlineKeyboardButton(
+        text=f'Продолжить · выбрано {len(selected)}',
+        callback_data='join_search_confirm',
+        style='primary',
+        icon_custom_emoji_id=get_icon('CHECK'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Новый поиск', callback_data='join_search_again',
+        style='default', icon_custom_emoji_id=get_icon('REFRESH'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Отмена', callback_data='functions', style='danger',
+        icon_custom_emoji_id=get_icon('CROSS'),
+    ))
+    return builder.as_markup()
+
+
+def get_account_chats_keyboard(
+    account_id: int, page: int, total_pages: int,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            text='← Назад',
+            callback_data=f'account_chats_page:{account_id}:{page - 1}',
+            style='default',
+        ))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(
+            text='Вперёд →',
+            callback_data=f'account_chats_page:{account_id}:{page + 1}',
+            style='default',
+        ))
+    if nav:
+        builder.row(*nav)
+    builder.row(InlineKeyboardButton(
+        text='Обновить список',
+        callback_data=f'account_chats_refresh:{account_id}',
+        style='primary', icon_custom_emoji_id=get_icon('REFRESH'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='Назад к аккаунту',
+        callback_data=f'manage_account_{account_id}',
+        style='default', icon_custom_emoji_id=get_icon('BACK'),
     ))
     return builder.as_markup()
 
@@ -14115,10 +14351,13 @@ async def help_join_handler(callback: CallbackQuery):
         f"<b>Как запустить:</b>\n"
         f"1. Главное меню → «Вступление в чаты».\n"
         f"2. Выберите аккаунт.\n"
-        f"3. Загрузите <code>.txt</code> со ссылками (по одной в строке):\n"
+        f"3. Выберите источник: сообщение со ссылками, TXT-файл или "
+        f"глобальный поиск Telegram по ключевым словам.\n"
+        f"Поддерживаемые ссылки:\n"
         f"   • <code>https://t.me/chat_name</code>\n"
         f"   • <code>@chat_name</code>\n"
         f"   • приватные <code>https://t.me/+invite_hash</code>\n"
+        f"При поиске отметьте нужные публичные каналы и группы.\n"
         f"4. Укажите задержку между вступлениями "
         f"(например <code>60-180</code> сек).\n"
         f"5. «Запустить» — воркер пойдёт по списку.\n\n"
@@ -17005,6 +17244,137 @@ async def manage_account(callback: CallbackQuery):
         )
     )
     await callback.answer()
+
+
+async def _get_account_chats_for_view(
+    account_id: int, *, refresh: bool = False,
+) -> List[Dict[str, Any]]:
+    cached = account_chats_view_cache.get(account_id)
+    if (
+        not refresh
+        and cached
+        and time.monotonic() - float(cached.get('loaded_at', 0)) < 300
+    ):
+        return list(cached.get('chats') or [])
+    client = await get_client_for_account(account_id)
+    if not client:
+        raise RuntimeError('Не удалось подключиться к Telegram-аккаунту')
+    await wait_for_flood_protection(account_id, 'account_chats')
+    try:
+        chats = await get_chats_from_client(client, limit=500)
+    except FloodWaitError as ex:
+        await record_flood_wait(
+            account_id, 0, ex.seconds, source='account_chats'
+        )
+        raise RuntimeError(
+            f'Telegram ограничил загрузку чатов на {int(ex.seconds)} сек.'
+        ) from ex
+    account_chats_view_cache[account_id] = {
+        'loaded_at': time.monotonic(),
+        'chats': chats,
+    }
+    return chats
+
+
+async def _render_account_chats(
+    message: Message, account: Dict[str, Any], page: int,
+    *, refresh: bool = False,
+) -> None:
+    chats = await _get_account_chats_for_view(
+        int(account['id']), refresh=refresh,
+    )
+    page_size = 12
+    total_pages = max(1, (len(chats) + page_size - 1) // page_size)
+    page = max(0, min(int(page), total_pages - 1))
+    start = page * page_size
+    type_icons = {'user': '👤', 'group': '👥', 'channel': '📢'}
+    lines = [
+        f"{emoji('CHAT')} <b>Чаты аккаунта</b>\n\n"
+        f"{emoji('PHONE')} <code>{escape(str(account.get('phone') or account['id']))}</code>\n"
+        f"Всего загружено: <b>{len(chats)}</b> · "
+        f"страница <b>{page + 1}/{total_pages}</b>\n"
+    ]
+    if not chats:
+        lines.append('\n<i>Диалоги не найдены.</i>')
+    else:
+        lines.append('\n')
+        for index, chat in enumerate(
+            chats[start:start + page_size], start=start + 1,
+        ):
+            kind = str(chat.get('type') or 'chat')
+            icon = type_icons.get(kind, '💬')
+            name = escape(str(chat.get('name') or 'Без названия')[:80])
+            username = str(chat.get('username') or '').strip()
+            username_text = f" · @{escape(username)}" if username else ''
+            unread = int(chat.get('unread_count') or 0)
+            unread_text = f" · непрочитано {unread}" if unread else ''
+            lines.append(
+                f"{index}. {icon} <b>{name}</b>{username_text}{unread_text}\n"
+            )
+    await message.edit_text(
+        ''.join(lines),
+        reply_markup=get_account_chats_keyboard(
+            int(account['id']), page, total_pages,
+        ),
+    )
+
+
+async def _owned_account_for_chats(
+    callback: CallbackQuery, account_id: int,
+) -> Optional[Dict[str, Any]]:
+    account = await get_account(account_id)
+    if not account or account.get('user_id') != callback.from_user.id:
+        await callback.answer('Аккаунт не найден', show_alert=True)
+        return None
+    return account
+
+
+@dp.callback_query(F.data.startswith('account_chats_refresh:'))
+async def account_chats_refresh(callback: CallbackQuery):
+    try:
+        account_id = int(callback.data.split(':', 1)[1])
+    except (ValueError, AttributeError):
+        await callback.answer('Некорректный аккаунт', show_alert=True)
+        return
+    account = await _owned_account_for_chats(callback, account_id)
+    if not account:
+        return
+    await callback.answer('Обновляю чаты...')
+    try:
+        await callback.message.edit_text(
+            f"{emoji('LOADING')} Загружаю диалоги аккаунта..."
+        )
+        await _render_account_chats(
+            callback.message, account, 0, refresh=True,
+        )
+    except Exception as ex:
+        await callback.message.edit_text(
+            f"{emoji('CROSS')} Не удалось загрузить чаты.\n\n"
+            f"<code>{escape(str(ex)[:500])}</code>",
+            reply_markup=get_account_actions_keyboard(
+                account_id, account.get('warming_enabled', False),
+                has_proxy=bool(account.get('proxy_id')),
+            ),
+        )
+
+
+@dp.callback_query(F.data.startswith('account_chats_page:'))
+async def account_chats_page(callback: CallbackQuery):
+    try:
+        _, raw_account_id, raw_page = callback.data.split(':', 2)
+        account_id, page = int(raw_account_id), int(raw_page)
+    except (ValueError, AttributeError):
+        await callback.answer('Некорректная страница', show_alert=True)
+        return
+    account = await _owned_account_for_chats(callback, account_id)
+    if not account:
+        return
+    try:
+        await _render_account_chats(callback.message, account, page)
+        await callback.answer()
+    except Exception as ex:
+        await callback.answer(str(ex)[:180], show_alert=True)
+
 
 @dp.callback_query(F.data.startswith("account_logs_"))
 async def account_logs(callback: CallbackQuery):
@@ -20485,72 +20855,286 @@ async def join_chats_menu(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("select_join_account_"))
 async def select_join_account(callback: CallbackQuery, state: FSMContext):
     account_id = int(callback.data.split("_")[3])
+    account = await get_account(account_id)
+    if (
+        not account
+        or account.get('user_id') != callback.from_user.id
+        or not account.get('is_active')
+    ):
+        await callback.answer('Аккаунт недоступен', show_alert=True)
+        return
     await state.update_data(account_id=account_id)
-    
+
     await callback.message.edit_text(
-        f"{emoji('FILE')} <b>Отправьте TXT файл со ссылками на чаты</b>\n\n"
-        f"Поддерживаются:\n"
-        f"• Публичные: <code>@chatname</code> или "
-        f"<code>https://t.me/chatname</code>\n"
-        f"• Приватные: <code>https://t.me/+hash</code>\n\n"
-        f"Каждая ссылка с новой строки.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text="Назад",
-                callback_data="functions",
-                style='default',
-                icon_custom_emoji_id=get_icon("BACK")
-            )
-        ]])
+        f"{emoji('JOIN')} <b>Как добавить чаты для вступления?</b>\n\n"
+        "Можно отправить ссылки обычным сообщением, загрузить TXT или "
+        "найти публичные каналы и группы через глобальный поиск Telegram.",
+        reply_markup=get_join_source_keyboard(),
     )
-    await state.set_state(JoinStates.waiting_for_file)
+    await state.set_state(JoinStates.waiting_for_source)
     await callback.answer()
+
+
+async def _join_store_links_and_request_delay(
+    message: Message, state: FSMContext, links: List[str], source_label: str,
+) -> None:
+    links = list(dict.fromkeys(links))[:200]
+    if not links:
+        await message.answer(
+            f"{emoji('CROSS')} Поддерживаемые ссылки не найдены."
+        )
+        return
+    await state.update_data(
+        links=links, links_count=len(links), links_source=source_label,
+    )
+    await message.answer(
+        f"{emoji('CHECK')} <b>Чаты добавлены</b>\n\n"
+        f"Источник: <b>{escape(source_label)}</b>\n"
+        f"Найдено ссылок: <b>{len(links)}</b>\n\n"
+        f"{emoji('CLOCK')} <b>Введите задержку между вступлениями</b>\n\n"
+        "Минимум 30 секунд:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[ 
+            InlineKeyboardButton(
+                text='Отмена', callback_data='functions', style='danger',
+                icon_custom_emoji_id=get_icon('CROSS'),
+            )
+        ]]),
+    )
+    await state.set_state(JoinStates.waiting_for_delay)
+
+
+@dp.callback_query(
+    F.data.startswith('join_source:'), JoinStates.waiting_for_source
+)
+async def join_choose_source(callback: CallbackQuery, state: FSMContext):
+    source = callback.data.split(':', 1)[1]
+    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text='Назад к выбору', callback_data='join_source_back',
+        style='default', icon_custom_emoji_id=get_icon('BACK'),
+    )]])
+    if source == 'links':
+        await callback.message.edit_text(
+            f"{emoji('LINK')} <b>Отправьте ссылки сообщением</b>\n\n"
+            "Можно по одной или несколько, разделяя переносами строк, "
+            "пробелами или запятыми.\n\n"
+            "Поддерживаются <code>@chatname</code>, "
+            "<code>https://t.me/chatname</code> и "
+            "<code>https://t.me/+hash</code>.",
+            reply_markup=markup,
+        )
+        await state.set_state(JoinStates.waiting_for_links)
+    elif source == 'file':
+        await callback.message.edit_text(
+            f"{emoji('FILE')} <b>Отправьте TXT-файл со ссылками</b>\n\n"
+            "Каждая ссылка может быть с новой строки.",
+            reply_markup=markup,
+        )
+        await state.set_state(JoinStates.waiting_for_file)
+    elif source == 'search':
+        await callback.message.edit_text(
+            f"{emoji('GLOBE')} <b>Глобальный поиск Telegram</b>\n\n"
+            "Введите до 5 ключевых фраз через запятую или с новой строки.\n"
+            "Например: <code>маркетинг, новости Москвы</code>",
+            reply_markup=markup,
+        )
+        await state.set_state(JoinStates.waiting_for_keywords)
+    else:
+        await callback.answer('Неизвестный способ', show_alert=True)
+        return
+    await callback.answer()
+
+
+@dp.callback_query(F.data == 'join_source_back')
+async def join_source_back(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        f"{emoji('JOIN')} <b>Как добавить чаты для вступления?</b>",
+        reply_markup=get_join_source_keyboard(),
+    )
+    await state.set_state(JoinStates.waiting_for_source)
+    await callback.answer()
+
+
+@dp.message(JoinStates.waiting_for_links)
+async def process_join_links_message(message: Message, state: FSMContext):
+    links = parse_join_links(message.text or '')
+    if not links:
+        await message.answer(
+            f"{emoji('CROSS')} Не нашёл корректных Telegram-ссылок. "
+            "Отправьте @username или ссылку t.me."
+        )
+        return
+    await _join_store_links_and_request_delay(
+        message, state, links, 'сообщение',
+    )
 
 @dp.message(JoinStates.waiting_for_file, F.document)
 async def process_join_file(message: Message, state: FSMContext):
+    file_path = f"media/{message.document.file_id}.txt"
     try:
-        file_path = f"media/{message.document.file_id}.txt"
         await message.bot.download(message.document, file_path)
         
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        links = [
-            line.strip() for line in content.split('\n') if line.strip()
-        ]
+        links = parse_join_links(content)
         
         if not links:
             await message.answer(f"{emoji('CROSS')} Файл пуст.")
-            os.remove(file_path)
             return
-        
-        await state.update_data(links=links, links_count=len(links))
-        os.remove(file_path)
-        
-        await message.answer(
-            f"{emoji('CHECK')} <b>Файл загружен!</b>\n\n"
-            f"Найдено ссылок: <b>{len(links)}</b>\n\n"
-            f"{emoji('CLOCK')} <b>Введите задержку между вступлениями</b>\n\n"
-            f"Минимум 30 секунд:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(
-                    text="Назад",
-                    callback_data="functions",
-                    style='default',
-                    icon_custom_emoji_id=get_icon("BACK")
-                )
-            ]])
+        await _join_store_links_and_request_delay(
+            message, state, links, 'TXT-файл',
         )
-        await state.set_state(JoinStates.waiting_for_delay)
-        
     except Exception as ex:
         await message.answer(f"{emoji('CROSS')} Ошибка: {str(ex)}")
+    finally:
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception:
+            pass
 
 @dp.message(JoinStates.waiting_for_file)
 async def process_join_file_invalid(message: Message):
     await message.answer(
-        f"{emoji('CROSS')} Пожалуйста, отправьте TXT файл."
+        f"{emoji('CROSS')} Пожалуйста, отправьте TXT-файл или вернитесь "
+        "к выбору способа."
     )
+
+
+async def _render_join_search_results(
+    message: Message, state: FSMContext, page: int = 0,
+) -> None:
+    data = await state.get_data()
+    results = list(data.get('search_results') or [])
+    selected = [int(x) for x in (data.get('selected_search_results') or [])]
+    page_size = 8
+    pages = max(1, (len(results) + page_size - 1) // page_size)
+    page = max(0, min(int(page), pages - 1))
+    await state.update_data(search_page=page)
+    await message.edit_text(
+        f"{emoji('GLOBE')} <b>Результаты глобального поиска</b>\n\n"
+        f"Найдено публичных чатов: <b>{len(results)}</b>\n"
+        f"Выбрано: <b>{len(selected)}</b>\n"
+        f"Страница: <b>{page + 1}/{pages}</b>\n\n"
+        "Отметьте каналы и группы для вступления:",
+        reply_markup=get_join_search_results_keyboard(
+            results, selected, page,
+        ),
+    )
+
+
+@dp.message(JoinStates.waiting_for_keywords)
+async def process_join_keywords(message: Message, state: FSMContext):
+    keywords = parse_join_keywords(message.text or '')
+    if not keywords:
+        await message.answer(
+            f"{emoji('CROSS')} Введите хотя бы одну ключевую фразу."
+        )
+        return
+    data = await state.get_data()
+    account_id = int(data.get('account_id') or 0)
+    account = await get_account(account_id)
+    if not account or account.get('user_id') != message.from_user.id:
+        await message.answer(f"{emoji('CROSS')} Аккаунт недоступен.")
+        await state.clear()
+        return
+    client = await get_client_for_account(account_id)
+    if not client:
+        await message.answer(f"{emoji('CROSS')} Не удалось подключить аккаунт.")
+        return
+    status = await message.answer(
+        f"{emoji('LOADING')} Ищу публичные каналы и группы..."
+    )
+    try:
+        results = await search_public_telegram_chats(
+            client, account_id, keywords,
+        )
+    except Exception as ex:
+        await status.edit_text(
+            f"{emoji('CROSS')} Ошибка поиска: {escape(str(ex)[:500])}"
+        )
+        return
+    if not results:
+        await status.edit_text(
+            f"{emoji('INFO')} По этим ключевым словам публичные чаты "
+            "не найдены. Попробуйте другой запрос.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                text='Новый поиск', callback_data='join_search_again',
+                style='primary', icon_custom_emoji_id=get_icon('REFRESH'),
+            )]]),
+        )
+        return
+    await state.update_data(
+        search_keywords=keywords,
+        search_results=results,
+        selected_search_results=[],
+        search_page=0,
+    )
+    await state.set_state(JoinStates.selecting_search_results)
+    await _render_join_search_results(status, state, 0)
+
+
+@dp.callback_query(F.data.startswith('join_search_toggle:'))
+async def join_search_toggle(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    results = list(data.get('search_results') or [])
+    try:
+        index = int(callback.data.split(':', 1)[1])
+    except (ValueError, AttributeError):
+        await callback.answer('Некорректный результат', show_alert=True)
+        return
+    if index < 0 or index >= len(results):
+        await callback.answer('Результат устарел', show_alert=True)
+        return
+    selected = [int(x) for x in (data.get('selected_search_results') or [])]
+    if index in selected:
+        selected.remove(index)
+    else:
+        selected.append(index)
+    await state.update_data(selected_search_results=selected)
+    await _render_join_search_results(
+        callback.message, state, int(data.get('search_page') or 0),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('join_search_page:'))
+async def join_search_page(callback: CallbackQuery, state: FSMContext):
+    try:
+        page = int(callback.data.split(':', 1)[1])
+    except (ValueError, AttributeError):
+        page = 0
+    await _render_join_search_results(callback.message, state, page)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == 'join_search_again')
+async def join_search_again(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        f"{emoji('GLOBE')} <b>Новый глобальный поиск</b>\n\n"
+        "Введите до 5 ключевых фраз через запятую или с новой строки.",
+    )
+    await state.set_state(JoinStates.waiting_for_keywords)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == 'join_search_confirm')
+async def join_search_confirm(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    results = list(data.get('search_results') or [])
+    selected = [int(x) for x in (data.get('selected_search_results') or [])]
+    links = [
+        f"https://t.me/{results[index]['username']}"
+        for index in selected
+        if 0 <= index < len(results) and results[index].get('username')
+    ]
+    if not links:
+        await callback.answer('Выберите хотя бы один чат', show_alert=True)
+        return
+    await _join_store_links_and_request_delay(
+        callback.message, state, links, 'глобальный поиск Telegram',
+    )
+    await callback.answer()
 
 @dp.message(JoinStates.waiting_for_delay)
 async def process_join_delay(message: Message, state: FSMContext):
