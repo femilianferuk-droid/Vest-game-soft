@@ -86,9 +86,16 @@ MSK_TZ = pytz.timezone('Europe/Moscow')
 # --- Платежи: СБП (Platega) ---
 # Данные магазина Platega прописаны в открытом виде по требованию заказчика.
 PLATEGA_API = "https://app.platega.io"
-PLATEGA_MERCHANT_ID = "39cd4a01-a435-4c17-bff2-19519d043d6b"
+PLATEGA_MERCHANT_ID = (
+    os.getenv('PLATEGA_MERCHANT_ID')
+    or "39cd4a01-a435-4c17-bff2-19519d043d6b"
+).strip()
 # Секрет хранится только в окружении развёртывания.
-PLATEGA_SECRET = os.getenv('PLATEGA_SECRET')
+PLATEGA_SECRET = (
+    os.getenv('PLATEGA_SECRET')
+    or os.getenv('PLATEGA_API_KEY')
+    or ''
+).strip()
 # СБП (QR-код) + Sberpay.
 PLATEGA_PAYMENT_METHOD_SBP = 2
 # Pro-подписка по СБП: 40₽/мес.
@@ -10435,8 +10442,10 @@ async def wallet_topup_amount_rub(message: Message, state: FSMContext):
     )
     if not result.get('ok'):
         await state.clear()
+        safe_error = escape(str(result.get('error') or 'Неизвестная ошибка'))
         await message.answer(
-            f"{emoji('CROSS')} Не удалось создать счёт СБП. Попробуйте позже.",
+            f"{emoji('CROSS')} Не удалось создать счёт СБП.\n\n"
+            f"<code>{safe_error[:500]}</code>",
             reply_markup=get_balance_keyboard()
         )
         return
@@ -10571,11 +10580,43 @@ async def _auto_check_sbp_topup(
 # Конфигурация (merchant id / api key) вынесена в начало файла.
 # ------------------------------------------------------------
 def _platega_headers() -> Dict[str, str]:
+    """Возвращает только строковые заголовки или понятную ошибку настройки.
+
+    aiohttp не умеет сериализовать None как значение HTTP-заголовка и
+    выдаёт неочевидное ``Cannot serialize non-str key None``. Поэтому
+    конфигурация проверяется до создания запроса.
+    """
+    merchant_id = str(PLATEGA_MERCHANT_ID or '').strip()
+    secret = str(PLATEGA_SECRET or '').strip()
+    if not merchant_id:
+        raise RuntimeError(
+            'СБП временно недоступно: не задан PLATEGA_MERCHANT_ID'
+        )
+    if not secret:
+        raise RuntimeError(
+            'СБП временно недоступно: не задан PLATEGA_SECRET '
+            '(также поддерживается PLATEGA_API_KEY)'
+        )
     return {
-        "X-MerchantId": PLATEGA_MERCHANT_ID,
-        "X-Secret": PLATEGA_SECRET,
+        "X-MerchantId": merchant_id,
+        "X-Secret": secret,
         "Content-Type": "application/json",
     }
+
+
+def _validate_json_string_keys(value: Any, path: str = 'body') -> None:
+    """Проверяет вложенный JSON до передачи в aiohttp."""
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                raise TypeError(
+                    f'Некорректный JSON Platega: ключ {path}.{key!r} '
+                    'должен быть строкой'
+                )
+            _validate_json_string_keys(nested, f'{path}.{key}')
+    elif isinstance(value, (list, tuple)):
+        for index, nested in enumerate(value):
+            _validate_json_string_keys(nested, f'{path}[{index}]')
 
 
 async def platega_create_transaction(
@@ -10608,9 +10649,11 @@ async def platega_create_transaction(
     }
     url = f"{PLATEGA_API}/transaction/process"
     try:
+        headers = _platega_headers()
+        _validate_json_string_keys(body)
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                url, json=body, headers=_platega_headers(),
+                url, json=body, headers=headers,
                 timeout=aiohttp.ClientTimeout(total=20)
             ) as resp:
                 data = await resp.json(content_type=None)
@@ -10626,9 +10669,10 @@ async def platega_get_transaction(transaction_id: str) -> Dict[str, Any]:
     """Проверяет статус СБП-транзакции в Platega."""
     url = f"{PLATEGA_API}/transaction/{transaction_id}"
     try:
+        headers = _platega_headers()
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                url, headers=_platega_headers(),
+                url, headers=headers,
                 timeout=aiohttp.ClientTimeout(total=20)
             ) as resp:
                 data = await resp.json(content_type=None)
