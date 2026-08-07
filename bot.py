@@ -8,6 +8,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import tempfile
 import time
 from datetime import datetime, timedelta
@@ -84,6 +85,7 @@ API_HASH = os.getenv('API_HASH')
 ADMIN_IDS = [7973988177]
 SUPPORT_USERNAME = "@VestGameSupport"
 MSK_TZ = pytz.timezone('Europe/Moscow')
+MINI_APP_URL = (os.getenv('MINI_APP_URL') or 'https://vestgamesoft.shop').rstrip('/')
 
 # --- Платежи: СБП (Platega) ---
 # Данные магазина Platega прописаны в открытом виде по требованию заказчика.
@@ -279,6 +281,7 @@ UI_TEXT = {
     'ru': {
         'settings': 'Настройки', 'notifications': 'Центр уведомлений',
         'language': 'Смена языка', 'promo': 'Активировать промокод',
+        'unique_links': 'Уникальные ссылки',
         'back_main': 'В главное меню', 'main_title': 'Главное меню',
         'choose_action': 'Выберите действие:', 'open_app': 'Открыть мини-апп',
         'accounts': 'Менеджер аккаунтов', 'functions': 'Функции',
@@ -292,6 +295,7 @@ UI_TEXT = {
     'en': {
         'settings': 'Settings', 'notifications': 'Notification center',
         'language': 'Change language', 'promo': 'Redeem promo code',
+        'unique_links': 'Unique links',
         'back_main': 'Main menu', 'main_title': 'Main menu',
         'choose_action': 'Choose an action:', 'open_app': 'Open mini app',
         'accounts': 'Account manager', 'functions': 'Features',
@@ -305,6 +309,7 @@ UI_TEXT = {
     'zh': {
         'settings': '设置', 'notifications': '通知中心',
         'language': '切换语言', 'promo': '兑换优惠码',
+        'unique_links': '专属链接',
         'back_main': '主菜单', 'main_title': '主菜单',
         'choose_action': '请选择操作：', 'open_app': '打开小程序',
         'accounts': '账号管理', 'functions': '功能',
@@ -1069,6 +1074,36 @@ async def init_db():
             )
         ''')
 
+        # Одноразовые Telegram deep links вида t.me/<bot>?start=dl_<token>.
+        # В БД хранится только SHA-256 токена: утечка таблицы не раскрывает
+        # рабочие ссылки. Ссылка атомарно закрепляется за первым пользователем.
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS bot_deep_links (
+                id BIGSERIAL PRIMARY KEY,
+                token_hash TEXT NOT NULL UNIQUE,
+                action TEXT NOT NULL,
+                created_by_user_id BIGINT REFERENCES users(user_id) ON DELETE SET NULL,
+                intended_user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                used_by_user_id BIGINT REFERENCES users(user_id) ON DELETE SET NULL,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                expires_at TIMESTAMP NOT NULL,
+                used_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW(),
+                CHECK (action IN ('miniapp_bind', 'subscription', 'balance_topup'))
+            )
+        ''')
+        try:
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_bot_deep_links_expiry '
+                'ON bot_deep_links (expires_at)'
+            )
+            await conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_bot_deep_links_user '
+                'ON bot_deep_links (intended_user_id, created_at DESC)'
+            )
+        except Exception:
+            pass
+
         # Сохранённые сценарии взаимодействия с Telegram-ботами.
         # Скрипт открывает бота через /start и нажимает одну выбранную
         # callback/text-кнопку. При каждом запуске меню загружается заново.
@@ -1431,6 +1466,22 @@ async def init_db():
             await conn.execute(
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS language_code TEXT "
                 "NOT NULL DEFAULT 'ru'"
+            )
+        except Exception:
+            pass
+        try:
+            await conn.execute(
+                'ALTER TABLE users ADD COLUMN IF NOT EXISTS '
+                'miniapp_link_token_hash TEXT'
+            )
+            await conn.execute(
+                'ALTER TABLE users ADD COLUMN IF NOT EXISTS '
+                'miniapp_linked_at TIMESTAMP'
+            )
+            await conn.execute(
+                'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_miniapp_link_token '
+                'ON users (miniapp_link_token_hash) '
+                'WHERE miniapp_link_token_hash IS NOT NULL'
             )
         except Exception:
             pass
@@ -10638,6 +10689,291 @@ async def get_promo_code(promo_id: int) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
+DEEP_LINK_ACTIONS = {
+    'miniapp_bind': {'ttl': 15 * 60, 'label': 'Привязка Mini App'},
+    'subscription': {'ttl': 24 * 60 * 60, 'label': 'Покупка подписки'},
+    'balance_topup': {'ttl': 24 * 60 * 60, 'label': 'Пополнение баланса'},
+}
+
+
+def deep_link_token_hash(token: str) -> str:
+    return hashlib.sha256(str(token).encode('utf-8')).hexdigest()
+
+
+def extract_start_payload(text: str) -> str:
+    parts = (text or '').strip().split(maxsplit=1)
+    return parts[1].strip()[:64] if len(parts) == 2 else ''
+
+
+async def create_bot_deep_link(
+    action: str,
+    *,
+    intended_user_id: Optional[int] = None,
+    created_by_user_id: Optional[int] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    lifetime_seconds: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Создаёт уникальную одноразовую ссылку /start без хранения токена."""
+    config = DEEP_LINK_ACTIONS.get(action)
+    if not config:
+        raise ValueError('Неизвестное назначение ссылки')
+    ttl = int(lifetime_seconds or config['ttl'])
+    ttl = max(60, min(ttl, 7 * 24 * 60 * 60))
+    expires_at = datetime.now(MSK_TZ).replace(tzinfo=None) + timedelta(seconds=ttl)
+    token = ''
+    async with db_pool.acquire() as conn:
+        for _ in range(4):
+            token = secrets.token_urlsafe(24)
+            try:
+                await conn.execute(
+                    '''INSERT INTO bot_deep_links
+                       (token_hash, action, created_by_user_id, intended_user_id,
+                        metadata, expires_at)
+                       VALUES ($1, $2, $3, $4, $5::jsonb, $6)''',
+                    deep_link_token_hash(token), action, created_by_user_id,
+                    intended_user_id, json.dumps(metadata or {}), expires_at,
+                )
+                break
+            except asyncpg.UniqueViolationError:
+                token = ''
+        if not token:
+            raise RuntimeError('Не удалось создать уникальный токен')
+    bot_info = await bot.get_me()
+    username = str(getattr(bot_info, 'username', '') or '').lstrip('@')
+    if not username:
+        raise RuntimeError('У бота не задан username')
+    start_payload = f'dl_{token}'
+    return {
+        'action': action,
+        'start_payload': start_payload,
+        'url': f'https://t.me/{username}?start={start_payload}',
+        'expires_at': expires_at,
+        'token': token,
+    }
+
+
+async def consume_bot_deep_link(
+    start_payload: str, user_id: int,
+) -> Dict[str, Any]:
+    """Атомарно погашает deep link; повторное использование невозможно."""
+    if not re.fullmatch(r'dl_[A-Za-z0-9_-]{20,60}', start_payload or ''):
+        return {'ok': False, 'reason': 'invalid'}
+    token = start_payload[3:]
+    now = datetime.now(MSK_TZ).replace(tzinfo=None)
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                'SELECT * FROM bot_deep_links WHERE token_hash = $1 FOR UPDATE',
+                deep_link_token_hash(token),
+            )
+            if not row:
+                return {'ok': False, 'reason': 'not_found'}
+            link = dict(row)
+            if link.get('used_at') is not None:
+                return {'ok': False, 'reason': 'used'}
+            if link.get('expires_at') is None or link['expires_at'] <= now:
+                return {'ok': False, 'reason': 'expired'}
+            intended = link.get('intended_user_id')
+            if intended is not None and int(intended) != int(user_id):
+                return {'ok': False, 'reason': 'wrong_user'}
+            changed = await conn.fetchval(
+                '''UPDATE bot_deep_links
+                   SET used_by_user_id = $1, used_at = NOW()
+                   WHERE id = $2 AND used_at IS NULL RETURNING id''',
+                user_id, link['id'],
+            )
+            if not changed:
+                return {'ok': False, 'reason': 'used'}
+            if link.get('action') == 'miniapp_bind':
+                await conn.execute(
+                    '''UPDATE users
+                       SET miniapp_link_token_hash = $1,
+                           miniapp_linked_at = NOW()
+                       WHERE user_id = $2''',
+                    deep_link_token_hash(token), user_id,
+                )
+    metadata = link.get('metadata') or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except Exception:
+            metadata = {}
+    return {
+        'ok': True,
+        'id': int(link['id']),
+        'action': link['action'],
+        'metadata': dict(metadata),
+        'token': token,
+    }
+
+
+def get_unique_links_keyboard(language: str = 'ru') -> InlineKeyboardMarkup:
+    language = normalize_language(language)
+    labels = {
+        'ru': {
+            'miniapp_bind': 'Привязать Mini App',
+            'subscription': 'Покупка подписки',
+            'balance_topup': 'Пополнение баланса',
+        },
+        'en': {
+            'miniapp_bind': 'Link Mini App',
+            'subscription': 'Buy subscription',
+            'balance_topup': 'Top up balance',
+        },
+        'zh': {
+            'miniapp_bind': '绑定 Mini App',
+            'subscription': '购买订阅',
+            'balance_topup': '充值余额',
+        },
+    }.get(language)
+    builder = InlineKeyboardBuilder()
+    for action in DEEP_LINK_ACTIONS:
+        builder.row(InlineKeyboardButton(
+            text=labels[action], callback_data=f'deep_link_create:{action}',
+            style='primary' if action == 'miniapp_bind' else 'default',
+            icon_custom_emoji_id=(
+                get_icon('LINK') if action == 'miniapp_bind'
+                else get_icon('MONEY_SEND')
+            ),
+        ))
+    builder.row(InlineKeyboardButton(
+        text=ui_text(language, 'balance'), callback_data='wallet',
+        style='default', icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    return builder.as_markup()
+
+
+def get_wallet_topup_method_keyboard(
+    language: str = 'ru',
+) -> InlineKeyboardMarkup:
+    language = normalize_language(language)
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text='Crypto Pay (USDT)', callback_data='topup_method:crypto',
+        style='primary', icon_custom_emoji_id=get_icon('MONEY_SEND'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text='СБП (₽)', callback_data='topup_method:sbp',
+        style='primary', icon_custom_emoji_id=get_icon('MONEY_SEND'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text=ui_text(language, 'balance'), callback_data='wallet',
+        style='default', icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    return builder.as_markup()
+
+
+async def handle_start_deep_link(
+    message: Message, state: FSMContext, start_payload: str,
+) -> bool:
+    """Обрабатывает наши уникальные /start-ссылки. False — обычный /start."""
+    if not (start_payload or '').startswith('dl_'):
+        return False
+    language = await get_user_language(message.from_user.id)
+    result = await consume_bot_deep_link(start_payload, message.from_user.id)
+    if not result.get('ok'):
+        messages = {
+            'ru': {
+                'used': 'Эта ссылка уже была использована.',
+                'expired': 'Срок действия ссылки истёк.',
+                'wrong_user': 'Эта ссылка создана для другого пользователя.',
+                'not_found': 'Ссылка не найдена.',
+                'invalid': 'Некорректная ссылка.',
+            },
+            'en': {
+                'used': 'This link has already been used.',
+                'expired': 'This link has expired.',
+                'wrong_user': 'This link belongs to another user.',
+                'not_found': 'Link not found.', 'invalid': 'Invalid link.',
+            },
+            'zh': {
+                'used': '此链接已被使用。', 'expired': '此链接已过期。',
+                'wrong_user': '此链接属于其他用户。',
+                'not_found': '未找到链接。', 'invalid': '链接无效。',
+            },
+        }
+        reason = result.get('reason', 'invalid')
+        localized = messages.get(language, messages['ru'])
+        await message.answer(
+            f"{emoji('CROSS')} {localized.get(reason, localized['invalid'])}",
+            reply_markup=get_main_menu_keyboard(language),
+        )
+        return True
+
+    await state.clear()
+    action = result['action']
+    if action == 'miniapp_bind':
+        separator = '&' if '?' in MINI_APP_URL else '?'
+        app_url = f"{MINI_APP_URL}{separator}link_token={result['token']}"
+        titles = {
+            'ru': (
+                f"{emoji('CHECK')} <b>Telegram-аккаунт подтверждён</b>\n\n"
+                "Откройте Mini App кнопкой ниже, чтобы завершить привязку. "
+                "Ссылка уже закреплена за вашим Telegram ID."
+            ),
+            'en': (
+                f"{emoji('CHECK')} <b>Telegram account confirmed</b>\n\n"
+                "Open the Mini App below to complete linking. The link is now "
+                "bound to your Telegram ID."
+            ),
+            'zh': (
+                f"{emoji('CHECK')} <b>Telegram 账号已确认</b>\n\n"
+                "请点击下方按钮打开 Mini App 并完成绑定。链接已绑定到您的 Telegram ID。"
+            ),
+        }
+        open_labels = {'ru': 'Открыть Mini App', 'en': 'Open Mini App', 'zh': '打开 Mini App'}
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(
+            text=open_labels.get(language, open_labels['ru']),
+            web_app=WebAppInfo(url=app_url), style='primary',
+            icon_custom_emoji_id=get_icon('APPS'),
+        ))
+        builder.row(InlineKeyboardButton(
+            text=ui_text(language, 'balance'), callback_data='wallet',
+            style='default', icon_custom_emoji_id=get_icon('BACK'),
+        ))
+        await message.answer(
+            titles.get(language, titles['ru']), reply_markup=builder.as_markup()
+        )
+        return True
+
+    if action == 'subscription':
+        subscription = await get_subscription(message.from_user.id)
+        limits = await format_limits_text(message.from_user.id)
+        headings = {
+            'ru': 'Ссылка открыла раздел покупки подписки.',
+            'en': 'The subscription purchase page is ready.',
+            'zh': '订阅购买页面已打开。',
+        }
+        await message.answer(
+            f"{emoji('LINK')} <i>{headings.get(language, headings['ru'])}</i>\n\n"
+            + _format_sub_text_sync(subscription, limits),
+            reply_markup=get_subscription_keyboard(
+                subscription.get('tier', 'free')
+            ),
+        )
+        return True
+
+    if action == 'balance_topup':
+        await state.set_state(BalanceStates.waiting_for_method)
+        prompts = {
+            'ru': f"{emoji('MONEY_SEND')} <b>Пополнение баланса</b>\n\nВыберите способ пополнения:",
+            'en': f"{emoji('MONEY_SEND')} <b>Top up balance</b>\n\nChoose a payment method:",
+            'zh': f"{emoji('MONEY_SEND')} <b>充值余额</b>\n\n请选择付款方式：",
+        }
+        await message.answer(
+            prompts.get(language, prompts['ru']),
+            reply_markup=get_wallet_topup_method_keyboard(language),
+        )
+        return True
+
+    await message.answer(
+        f"{emoji('CROSS')} Неизвестное назначение ссылки.",
+        reply_markup=get_main_menu_keyboard(language),
+    )
+    return True
+
+
 def get_balance_keyboard(language: str = 'ru') -> InlineKeyboardMarkup:
     language = normalize_language(language)
     builder = InlineKeyboardBuilder()
@@ -10648,6 +10984,10 @@ def get_balance_keyboard(language: str = 'ru') -> InlineKeyboardMarkup:
     builder.row(InlineKeyboardButton(
         text=ui_text(language, 'promo'), callback_data='promo_redeem',
         style='success', icon_custom_emoji_id=get_icon('STAR')
+    ))
+    builder.row(InlineKeyboardButton(
+        text=ui_text(language, 'unique_links'), callback_data='unique_links',
+        style='default', icon_custom_emoji_id=get_icon('LINK')
     ))
     builder.row(InlineKeyboardButton(
         text=ui_text(language, 'subscription'), callback_data='my_subscription',
@@ -10701,29 +11041,106 @@ async def wallet_screen(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data == 'unique_links')
+async def unique_links_menu(callback: CallbackQuery):
+    language = await get_user_language(callback.from_user.id)
+    texts = {
+        'ru': (
+            f"{emoji('LINK')} <b>Уникальные ссылки</b>\n\n"
+            "Создайте одноразовую ссылку на бота. После перехода Telegram "
+            "автоматически отправит команду <code>/start</code> с уникальным "
+            "значением.\n\nПривязка Mini App действует 15 минут, ссылки оплаты — 24 часа."
+        ),
+        'en': (
+            f"{emoji('LINK')} <b>Unique links</b>\n\n"
+            "Create a one-time bot link. Telegram will automatically send "
+            "<code>/start</code> with a unique value.\n\nMini App links last "
+            "15 minutes; payment links last 24 hours."
+        ),
+        'zh': (
+            f"{emoji('LINK')} <b>专属链接</b>\n\n"
+            "创建一次性机器人链接。打开后，Telegram 会自动发送带有唯一值的 "
+            "<code>/start</code>。\n\nMini App 链接有效期为 15 分钟，付款链接为 24 小时。"
+        ),
+    }
+    await callback.message.edit_text(
+        texts.get(language, texts['ru']),
+        reply_markup=get_unique_links_keyboard(language),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith('deep_link_create:'))
+async def deep_link_create(callback: CallbackQuery):
+    action = callback.data.split(':', 1)[1]
+    if action not in DEEP_LINK_ACTIONS:
+        await callback.answer('Неизвестный тип ссылки', show_alert=True)
+        return
+    language = await get_user_language(callback.from_user.id)
+    try:
+        link = await create_bot_deep_link(
+            action,
+            intended_user_id=callback.from_user.id,
+            created_by_user_id=callback.from_user.id,
+        )
+    except Exception as ex:
+        logger.exception('Could not create bot deep link: %s', ex)
+        await callback.answer('Не удалось создать ссылку', show_alert=True)
+        return
+    labels = {
+        'ru': {
+            'miniapp_bind': 'Привязка аккаунта к Mini App',
+            'subscription': 'Покупка подписки',
+            'balance_topup': 'Пополнение баланса',
+            'open': 'Открыть уникальную ссылку', 'again': 'Создать другую',
+        },
+        'en': {
+            'miniapp_bind': 'Link account to Mini App',
+            'subscription': 'Buy subscription',
+            'balance_topup': 'Top up balance',
+            'open': 'Open unique link', 'again': 'Create another',
+        },
+        'zh': {
+            'miniapp_bind': '绑定账号到 Mini App',
+            'subscription': '购买订阅', 'balance_topup': '充值余额',
+            'open': '打开专属链接', 'again': '创建其他链接',
+        },
+    }.get(language, {})
+    expires = _format_msk_datetime(link['expires_at'], '—')
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text=labels['open'], url=link['url'], style='primary',
+        icon_custom_emoji_id=get_icon('LINK'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text=labels['again'], callback_data='unique_links', style='default',
+        icon_custom_emoji_id=get_icon('REFRESH'),
+    ))
+    builder.row(InlineKeyboardButton(
+        text=ui_text(language, 'balance'), callback_data='wallet',
+        style='default', icon_custom_emoji_id=get_icon('BACK'),
+    ))
+    await callback.message.edit_text(
+        f"{emoji('CHECK')} <b>{escape(labels[action])}</b>\n\n"
+        f"<code>{escape(link['url'])}</code>\n\n"
+        f"Действует до: <b>{escape(str(expires))}</b>\n"
+        "Ссылка одноразовая и предназначена только для вашего аккаунта.",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer('Уникальная ссылка создана')
+
+
 # ---- Выбор способа пополнения ----
 
 @dp.callback_query(F.data == 'wallet_topup')
 async def wallet_topup_start(callback: CallbackQuery, state: FSMContext):
     """Экран выбора метода пополнения: Crypto Pay (USDT) или СБП (₽)."""
+    language = await get_user_language(callback.from_user.id)
     await state.set_state(BalanceStates.waiting_for_method)
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(
-        text='Crypto Pay (USDT)', callback_data='topup_method:crypto',
-        style='primary', icon_custom_emoji_id=get_icon('MONEY_SEND')
-    ))
-    builder.row(InlineKeyboardButton(
-        text='СБП (₽)', callback_data='topup_method:sbp',
-        style='primary', icon_custom_emoji_id=get_icon('MONEY_SEND')
-    ))
-    builder.row(InlineKeyboardButton(
-        text='Отмена', callback_data='wallet',
-        style='default', icon_custom_emoji_id=get_icon('BACK')
-    ))
     await callback.message.edit_text(
         f"{emoji('MONEY_SEND')} <b>Пополнение баланса</b>\n\n"
         f"Выберите способ пополнения:",
-        reply_markup=builder.as_markup()
+        reply_markup=get_wallet_topup_method_keyboard(language)
     )
     await callback.answer()
 
@@ -11556,7 +11973,7 @@ def get_main_menu_keyboard(language: str = 'ru') -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(
         text=ui_text(language, 'open_app'),
-        web_app=WebAppInfo(url="https://vestgamesoft.shop"),
+        web_app=WebAppInfo(url=MINI_APP_URL),
         style='primary',
         icon_custom_emoji_id=get_icon("APPS")
     ))
@@ -13328,7 +13745,7 @@ def format_neurocomment_config(config: Dict[str, Any]) -> str:
 
 # --- Хендлеры команд ---
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
     user = message.from_user
     # Регистрация пользователя — критична. Если упадёт, всё равно
     # пробуем показать меню, но логируем реальную причину.
@@ -13336,6 +13753,11 @@ async def cmd_start(message: Message):
         await register_user(user.id, user.username, user.first_name)
     except Exception as ex:
         logger.error(f"register_user failed for {user.id}: {ex}")
+    start_payload = extract_start_payload(message.text or '')
+    if start_payload and await handle_start_deep_link(
+        message, state, start_payload
+    ):
+        return
     # Блок лимитов — косметический. Его сбой НЕ должен мешать
     # новому пользователю получить приветствие и меню.
     try:
